@@ -41,7 +41,22 @@ test("the structural coast has meaningful perimeter without fragmenting the worl
   assert.ok(world.stats.frameClearance >= 4.4, `frame clearance was ${world.stats.frameClearance}%`);
 });
 
-test("fixed-seed suite preserves terrane complexity and an ocean frame", () => {
+test("the equirectangular texture joins cleanly at the longitude seam", () => {
+  const world = generateWorld(base);
+  let totalDifference = 0;
+  for (let y = 0; y < base.height; y += 1) {
+    const left = y * base.width * 4;
+    const right = (y * base.width + base.width - 1) * 4;
+    for (let channel = 0; channel < 3; channel += 1) {
+      totalDifference += Math.abs(world.pixels[left + channel] - world.pixels[right + channel]);
+    }
+  }
+  const meanDifference = totalDifference / (base.height * 3);
+  assert.ok(meanDifference < 6, `longitude seam difference was ${meanDifference}`);
+  assert.ok(world.stats.focusLongitude >= -Math.PI && world.stats.focusLongitude <= Math.PI);
+});
+
+test("fixed-seed suite preserves terrane complexity and oceanic polar caps", () => {
   for (const seed of [
     "VERDANT-047", "SABLE-908", "AURELIA-311", "THORN-782",
     "EMBER-164", "MISTRAL-529", "HALCYON-846", "BRAMBLE-203",

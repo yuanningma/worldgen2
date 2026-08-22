@@ -14,14 +14,16 @@ Atlas Forge now keeps those representations separate:
 
 1. **An irregular graph organizes the planet.** Deterministic Poisson-disc sites become a Delaunay adjacency graph. Well-separated weighted Voronoi seeds receive plate ownership, motion vectors, and continental or oceanic crust.
 2. **A terrane network replaces compact plate-shaped blobs.** Connected continental plate clusters seed a constructive field of narrow cores, bent links, long hooked branches, and detached fragments. Tapered negative fields then cut deep gulfs, rifts, straits, and inland basins through that skeleton. Plate type contributes a smaller bias, while rotated gradient fields supply broad variation. Five candidates are scored before dense work begins.
-3. **Relative plate motion organizes relief.** Convergent and divergent graph edges become multi-source distance fields. They control mountain envelopes and rifts without deciding every shoreline point.
-4. **Graph Priority-Flood guarantees drainage.** Depression conditioning assigns receivers, moisture-weighted contributing area selects river paths, and river vertices carve the structural elevation.
-5. **A dense signed-distance coast breaks free of the mesh.** The selected crust potential is rasterized into a macro mask and converted to a chamfer signed-distance field. Domain warping displaces that field in pixel space.
-6. **Coastal detail has a scale hierarchy.** Broad, regional, and fine rotated-gradient fields are confined to a coastal envelope. A small independently implemented Donjon-inspired spherical fault atlas adds long correlated cuts. Deterministic elongated positive and negative coastal features deliberately create peninsulas, bays, and straits.
-7. **Sea level remains controllable.** A dense histogram quantile restores the requested land fraction after coastal displacement, and a hard ocean margin prevents cropped continents.
-8. **Visible relief is synthesized at output resolution.** Smoothed graph elevation supplies the macro surface. Continuous hills and folded ridged detail are modulated by convergent-boundary strength, so mountain chains remain geological but no longer reveal Delaunay triangles.
-9. **Rendering is coverage-aware.** A local signed-field gradient estimates subpixel land coverage. Sea, beach, and land colors blend through that coverage; mountain color thresholds come from land-height quantiles, and broad plus fine hillshade makes ranges legible.
-10. **Rivers are curves, not pixel stamps.** Complete receiver chains are smoothed twice, then rasterized as variable-width antialiased capsules and clipped to the refined coast.
+3. **Longitude is periodic throughout the model.** Plate ownership, graph distance, seam adjacency, terrane strokes, climate fields, signed coastal distance, relief sampling, and river drawing all wrap horizontally. A continent can cross the equirectangular seam without becoming two unrelated islands.
+4. **Relative plate motion organizes relief.** Convergent and divergent graph edges become multi-source distance fields. They control mountain envelopes and rifts without deciding every shoreline point.
+5. **Graph Priority-Flood guarantees drainage.** Depression conditioning assigns receivers, moisture-weighted contributing area selects river paths, and river vertices carve the structural elevation.
+6. **A dense signed-distance coast breaks free of the mesh.** The selected crust potential is rasterized into a macro mask and converted to a horizontally wrapped chamfer signed-distance field. Domain warping displaces that field in pixel space.
+7. **Coastal detail has a scale hierarchy.** Broad, regional, and fine periodic-gradient fields are confined to a coastal envelope. A small independently implemented Donjon-inspired spherical fault atlas adds long correlated cuts. Deterministic elongated positive and negative coastal features deliberately create peninsulas, bays, and straits.
+8. **Sea level remains controllable.** A dense histogram quantile restores the requested land fraction after coastal displacement, while oceanic polar caps keep the projection readable without imposing an artificial longitude frame.
+9. **Visible relief is synthesized at output resolution.** A denser graph and additional broad smoothing supply the macro surface. Continuous hills and folded ridged detail are modulated by convergent-boundary strength, so mountain chains remain geological without exposing Delaunay triangles.
+10. **Rendering is coverage-aware.** A local signed-field gradient estimates subpixel land coverage. Sea, beach, and land colors blend through that coverage; mountain color thresholds come from land-height quantiles, and broad-dominant hillshade keeps ranges legible without making them chunky.
+11. **Rivers are curves, not pixel stamps.** Complete receiver chains are unwrapped across the seam, smoothed twice, then rasterized as variable-width antialiased capsules and clipped to the refined coast.
+12. **The same texture supports two projections.** Atlas mode shows the complete 2:1 equirectangular world without cropping. Globe mode bilinearly projects it onto a shaded orthographic sphere that supports pointer, touch, and keyboard rotation.
 
 ## Generation pipeline
 
@@ -29,6 +31,7 @@ Atlas Forge now keeps those representations separate:
 seed + controls
   → Poisson-disc sites and Delaunay adjacency
   → weighted Voronoi plates and motion
+  → periodic seam adjacency and wrapped plate distance
   → directional terrane skeletons and bent links
   → subtractive gulfs, rifts, straits, and inland basins
   → candidate scoring and sea-level cut
@@ -38,10 +41,11 @@ seed + controls
   → explicit capes, bays, straits, and near-coast islands
   → dense folded relief and quantile-based mountain classes
   → antialiased coasts, curved rivers, and multiscale hillshade
-  → satellite or field-ink pixels
+  → seamless satellite or field-ink texture
+  → equirectangular atlas or interactive orthographic globe
 ```
 
-The pipeline is deterministic. The UI sends a serializable recipe to a dedicated Web Worker, which transfers the finished pixel buffer without copying it. The default 1008 × 630 map uses up to roughly 15,500 graph sites; the more expensive coastal and surface work occurs only for the chosen candidate. A default generation takes roughly three seconds on the development machine while interaction remains responsive.
+The pipeline is deterministic. The UI sends a serializable recipe to a dedicated Web Worker, which transfers the finished pixel buffer without copying it. The default 1024 × 512 planet uses roughly 20,000 graph sites—about forty percent more structural samples than the previous default—and performs the expensive coastal and surface work only for the chosen candidate. Generation remains off the interaction thread; globe rotation reprojects the completed texture without regenerating geography.
 
 ## Aesthetic safeguards
 
@@ -52,7 +56,7 @@ The pipeline is deterministic. The UI sends a serializable recipe to a dedicated
 - Constructive branches and subtractive cuts create silhouette hierarchy before any fractal detail is applied.
 - Continental tips remain rounded and tapered; complexity comes from composition rather than uniformly jagged shores.
 - Donjon-like random faults are a minority residual; the tectonic/terrane field remains the constraint.
-- A hard ocean frame and a dense land-area quantile keep composition stable.
+- A dense land-area quantile and oceanic polar caps keep composition stable while longitude remains seamless.
 - Mountain folds inherit convergent-boundary envelopes and use seed-independent height quantiles for reliable visual emphasis.
 - White pixel grain and square river brushes are deliberately avoided.
 - The fixed twelve-seed visual suite checks repeated silhouettes, speck islands, clipped land, overexposed ranges, and weak coast hierarchy.
@@ -72,7 +76,7 @@ These sources reinforce a practical division of labor: plates and flow provide b
 
 ## Architecture
 
-- `app/MapStudio.tsx` owns controls, Worker orchestration, canvas display, zoom, and PNG export.
+- `app/MapStudio.tsx` owns controls, Worker orchestration, atlas display, orthographic globe projection, rotation, zoom, and PNG export.
 - `lib/world.ts` owns mesh construction, plate fields, candidate selection, graph hydrology, dense coastline synthesis, relief, and rendering.
 - `workers/world.worker.ts` isolates generation from interaction and transfers the final raster.
 - `types/d3-delaunay.d.ts` types the small triangulation surface used by the engine.
@@ -82,7 +86,7 @@ No server data, account, or external API is required. There is intentionally no 
 
 ## Deliberate constraints
 
-- The map is an equirectangular framed world, not yet a horizontally wrapped globe.
+- Longitude is genuinely periodic, but the simulation graph remains cylindrical with oceanic caps rather than using a fully spherical polar topology.
 - Plates are conceptual ownership and stress regions, not a time-stepped model of crust age, subduction, or mass conservation.
 - Coast features are seeded constructive fields rather than a simulation of sediment transport or glaciation.
 - Climate color currently uses latitude, height, coherent moisture, and the moisture control; directional precipitation remains deferred.
@@ -95,7 +99,7 @@ No server data, account, or external API is required. There is intentionally no 
 ### Next landform milestone
 
 - Raster-preview candidate scoring with multiscale perimeter, bay, cape, and island metrics
-- Horizontally wrapped or spherical graph topology
+- True spherical graph topology with polar stitching and latitude-aware cell area
 - Tectonic island arcs and landward-offset subduction ranges
 - Coast-aware erosion, sediment fans, persistent lakes, and deltas
 - Directional climate with orographic precipitation and rain shadows

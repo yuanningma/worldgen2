@@ -66,11 +66,18 @@ input[type="range"] { width: 100%; margin: 12px 0 0; accent-color: var(--accent)
 .generate-button { width: 100%; display: flex; justify-content: space-between; margin-top: 21px; padding: 15px 16px; border: 0; border-radius: 2px; background: var(--accent); color: white; font: 700 10px/1 var(--font-geist-mono), monospace; letter-spacing: 0.08em; cursor: pointer; }
 .generation-note { margin: 11px 0 0; text-align: center; color: var(--muted); font: 500 8px/1.3 var(--font-geist-mono), monospace; }
 
-.map-stage { position: relative; min-width: 0; overflow: hidden; background: #0b2933; }
-.world-canvas { width: 100%; height: 100%; display: block; object-fit: cover; image-rendering: auto; transform-origin: center; transition: transform 280ms ease; }
+.map-stage { position: relative; min-width: 0; overflow: hidden; background: #061720; }
+.world-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; object-fit: contain; image-rendering: auto; transform-origin: center; transition: transform 280ms ease; }
+.world-canvas.globe-view { cursor: grab; touch-action: none; }
+.world-canvas.globe-view:active { cursor: grabbing; }
+.world-canvas:focus-visible { outline: 2px solid rgba(213, 102, 60, 0.9); outline-offset: -4px; }
 .map-vignette { position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 120px rgba(2, 12, 15, 0.46); background: linear-gradient(180deg, rgba(9, 19, 21, 0.08), transparent 30%, transparent 75%, rgba(8, 19, 21, 0.22)); }
 .coordinates { position: absolute; top: 20px; left: 22px; padding: 7px 9px; background: rgba(8, 23, 27, 0.62); color: #d7d7c9; font: 500 9px/1 var(--font-geist-mono), monospace; letter-spacing: 0.08em; backdrop-filter: blur(8px); }
 .coordinates span { color: #91a5a0; margin: 0 6px; }
+.view-switcher { position: absolute; top: 20px; left: 248px; display: grid; grid-template-columns: repeat(2, 1fr); height: 31px; border: 1px solid rgba(229, 228, 217, 0.28); background: rgba(8, 23, 27, 0.62); color: #c4cfcb; backdrop-filter: blur(8px); }
+.view-switcher button { min-width: 62px; border: 0; border-right: 1px solid rgba(229, 228, 217, 0.18); padding: 0 12px; background: transparent; color: inherit; cursor: pointer; font: 600 8px/1 var(--font-geist-mono), monospace; letter-spacing: 0.08em; }
+.view-switcher button:last-child { border-right: 0; }
+.view-switcher button.active { background: rgba(213, 102, 60, 0.92); color: white; }
 .map-toolbar { position: absolute; top: 20px; right: 22px; display: grid; grid-template-columns: 31px 54px 31px; height: 31px; border: 1px solid rgba(229, 228, 217, 0.28); background: rgba(8, 23, 27, 0.62); color: #e5e4d9; backdrop-filter: blur(8px); }
 .map-toolbar button { border: 0; background: transparent; color: inherit; cursor: pointer; font: 400 16px/1 var(--font-geist-mono), monospace; }
 .map-toolbar output { display: grid; place-items: center; border-inline: 1px solid rgba(229, 228, 217, 0.18); font: 600 8px/1 var(--font-geist-mono), monospace; }
@@ -106,6 +113,7 @@ input[type="range"] { width: 100%; margin: 12px 0 0; accent-color: var(--accent)
   .map-stage { height: 62vh; min-height: 440px; grid-row: 1; }
   .survey-strip { display: none; }
   .coordinates { top: 15px; left: 15px; }
+  .view-switcher { top: 54px; left: 15px; }
   .map-toolbar { top: 15px; right: 15px; }
 }
 

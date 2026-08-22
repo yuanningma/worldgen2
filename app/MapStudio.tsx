@@ -6,8 +6,8 @@ import WorldWorker from "../workers/world.worker?worker";
 
 const DEFAULTS: WorldSettings = {
   seed: "VERDANT-047",
-  width: 1008,
-  height: 630,
+  width: 1024,
+  height: 512,
   continentSize: 56,
   coastDetail: 76,
   tectonics: 58,
@@ -23,6 +23,7 @@ const EMPTY_STATS: WorldStats = {
   riverCount: 0,
   coastlineIndex: 0,
   frameClearance: 0,
+  focusLongitude: 0,
   generationMs: 0,
 };
 
@@ -31,10 +32,122 @@ type WorkerMessage =
   | { type: "complete"; id: number; width: number; height: number; pixels: ArrayBuffer; stats: WorldStats }
   | { type: "error"; id: number; message: string };
 
+type ViewMode = "globe" | "atlas";
+
+interface WorldTexture {
+  pixels: Uint8ClampedArray;
+  width: number;
+  height: number;
+}
+
 function freshSeed() {
   const words = ["AURELIA", "BRAMBLE", "CERULEAN", "EMBER", "HALCYON", "MISTRAL", "SABLE", "THORN", "VESPER"];
   const word = words[Math.floor(Math.random() * words.length)];
   return `${word}-${Math.floor(100 + Math.random() * 900)}`;
+}
+
+function wrap(value: number, period: number) {
+  return ((value % period) + period) % period;
+}
+
+function drawAtlas(canvas: HTMLCanvasElement, texture: WorldTexture) {
+  canvas.width = texture.width;
+  canvas.height = texture.height;
+  const context = canvas.getContext("2d");
+  context?.putImageData(new ImageData(new Uint8ClampedArray(texture.pixels), texture.width, texture.height), 0, 0);
+}
+
+function drawGlobe(
+  canvas: HTMLCanvasElement,
+  texture: WorldTexture,
+  longitude: number,
+  latitude: number,
+  zoom: number,
+  sphereCanvas: HTMLCanvasElement,
+) {
+  canvas.width = texture.width;
+  canvas.height = texture.height;
+  const context = canvas.getContext("2d");
+  if (!context) return;
+
+  context.clearRect(0, 0, canvas.width, canvas.height);
+  const background = context.createRadialGradient(
+    canvas.width * 0.5,
+    canvas.height * 0.46,
+    0,
+    canvas.width * 0.5,
+    canvas.height * 0.5,
+    canvas.width * 0.62,
+  );
+  background.addColorStop(0, "#102d36");
+  background.addColorStop(0.48, "#071b25");
+  background.addColorStop(1, "#031018");
+  context.fillStyle = background;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  const baseRadius = Math.min(canvas.height * 0.435, canvas.width * 0.255);
+  const radius = Math.min(baseRadius * zoom, Math.min(canvas.width, canvas.height) * 0.49);
+  const diameter = Math.max(2, Math.ceil(radius * 2 + 4));
+  sphereCanvas.width = diameter;
+  sphereCanvas.height = diameter;
+  const sphereContext = sphereCanvas.getContext("2d");
+  if (!sphereContext) return;
+  const image = sphereContext.createImageData(diameter, diameter);
+  const destination = image.data;
+  const cosLongitude = Math.cos(longitude);
+  const sinLongitude = Math.sin(longitude);
+  const cosLatitude = Math.cos(latitude);
+  const sinLatitude = Math.sin(latitude);
+  const source = texture.pixels;
+  const sourceWidth = texture.width;
+  const sourceHeight = texture.height;
+
+  for (let py = 0; py < diameter; py += 1) {
+    const screenY = (radius + 2 - (py + 0.5)) / radius;
+    for (let px = 0; px < diameter; px += 1) {
+      const screenX = (px + 0.5 - radius - 2) / radius;
+      const radiusSquared = screenX * screenX + screenY * screenY;
+      if (radiusSquared > 1) continue;
+      const screenZ = Math.sqrt(1 - radiusSquared);
+      const pitchedY = screenY * cosLatitude + screenZ * sinLatitude;
+      const pitchedZ = -screenY * sinLatitude + screenZ * cosLatitude;
+      const worldX = screenX * cosLongitude + pitchedZ * sinLongitude;
+      const worldZ = -screenX * sinLongitude + pitchedZ * cosLongitude;
+      const worldLongitude = Math.atan2(worldX, worldZ);
+      const worldLatitude = Math.asin(Math.max(-1, Math.min(1, pitchedY)));
+      const sourceX = wrap((worldLongitude / (Math.PI * 2) + 0.5) * sourceWidth, sourceWidth);
+      const sourceY = Math.max(0, Math.min(sourceHeight - 1, (0.5 - worldLatitude / Math.PI) * (sourceHeight - 1)));
+      const x0 = Math.floor(sourceX);
+      const y0 = Math.floor(sourceY);
+      const x1 = (x0 + 1) % sourceWidth;
+      const y1 = Math.min(sourceHeight - 1, y0 + 1);
+      const fx = sourceX - x0;
+      const fy = sourceY - y0;
+      const topLeft = (y0 * sourceWidth + x0) * 4;
+      const topRight = (y0 * sourceWidth + x1) * 4;
+      const bottomLeft = (y1 * sourceWidth + x0) * 4;
+      const bottomRight = (y1 * sourceWidth + x1) * 4;
+      const light = Math.max(0, screenX * -0.34 + screenY * 0.3 + screenZ * 0.88);
+      const shade = 0.68 + light * 0.34;
+      const edge = Math.min(1, (1 - radiusSquared) * radius * 0.78);
+      const target = (py * diameter + px) * 4;
+      for (let channel = 0; channel < 3; channel += 1) {
+        const top = source[topLeft + channel] * (1 - fx) + source[topRight + channel] * fx;
+        const bottom = source[bottomLeft + channel] * (1 - fx) + source[bottomRight + channel] * fx;
+        const sampled = (top * (1 - fy) + bottom * fy) * shade;
+        const atmosphere = channel === 0 ? 32 : channel === 1 ? 78 : 96;
+        destination[target + channel] = sampled * edge + atmosphere * (1 - edge);
+      }
+      destination[target + 3] = Math.round(edge * 255);
+    }
+  }
+  sphereContext.putImageData(image, 0, 0);
+  context.save();
+  context.shadowColor = "rgba(0, 12, 19, 0.9)";
+  context.shadowBlur = 34;
+  context.shadowOffsetY = 14;
+  context.drawImage(sphereCanvas, canvas.width * 0.5 - diameter * 0.5, canvas.height * 0.5 - diameter * 0.5 - 2);
+  context.restore();
 }
 
 function SettingSlider({
@@ -58,6 +171,13 @@ export function MapStudio() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestRef = useRef(0);
+  const textureRef = useRef<WorldTexture | null>(null);
+  const sphereCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const viewModeRef = useRef<ViewMode>("globe");
+  const zoomRef = useRef(1);
+  const rotationRef = useRef({ longitude: -0.38, latitude: -0.12 });
+  const dragRef = useRef({ active: false, x: 0, y: 0 });
+  const animationRef = useRef<number | null>(null);
   const [settings, setSettings] = useState(DEFAULTS);
   const [stats, setStats] = useState(EMPTY_STATS);
   const [isGenerating, setIsGenerating] = useState(true);
@@ -65,6 +185,27 @@ export function MapStudio() {
   const [progress, setProgress] = useState(6);
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
+  const [viewMode, setViewMode] = useState<ViewMode>("globe");
+
+  const renderCurrentView = useCallback(() => {
+    const canvas = canvasRef.current;
+    const texture = textureRef.current;
+    if (!canvas || !texture) return;
+    if (viewModeRef.current === "globe") {
+      sphereCanvasRef.current ??= document.createElement("canvas");
+      drawGlobe(canvas, texture, rotationRef.current.longitude, rotationRef.current.latitude, zoomRef.current, sphereCanvasRef.current);
+    } else {
+      drawAtlas(canvas, texture);
+    }
+  }, []);
+
+  const scheduleRender = useCallback(() => {
+    if (animationRef.current !== null) return;
+    animationRef.current = requestAnimationFrame(() => {
+      animationRef.current = null;
+      renderCurrentView();
+    });
+  }, [renderCurrentView]);
 
   const requestWorld = useCallback((nextSettings: WorldSettings) => {
     if (!workerRef.current) return;
@@ -86,14 +227,9 @@ export function MapStudio() {
         setGenerationStage(message.stage);
         setProgress(message.progress);
       } else if (message.type === "complete") {
-        const canvas = canvasRef.current;
-        const context = canvas?.getContext("2d");
-        if (canvas && context) {
-          canvas.width = message.width;
-          canvas.height = message.height;
-          const data = new Uint8ClampedArray(message.pixels);
-          context.putImageData(new ImageData(data, message.width, message.height), 0, 0);
-        }
+        textureRef.current = { pixels: new Uint8ClampedArray(message.pixels), width: message.width, height: message.height };
+        rotationRef.current.longitude = message.stats.focusLongitude;
+        renderCurrentView();
         setStats(message.stats);
         setProgress(100);
         setIsGenerating(false);
@@ -107,8 +243,66 @@ export function MapStudio() {
       setIsGenerating(false);
     };
     requestWorld(DEFAULTS);
-    return () => worker.terminate();
-  }, [requestWorld]);
+    return () => {
+      worker.terminate();
+      if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
+    };
+  }, [renderCurrentView, requestWorld]);
+
+  const changeViewMode = (mode: ViewMode) => {
+    viewModeRef.current = mode;
+    setViewMode(mode);
+    setZoom(1);
+    zoomRef.current = 1;
+    scheduleRender();
+  };
+
+  const changeZoom = (direction: number) => {
+    const next = Math.max(1, Math.min(viewModeRef.current === "globe" ? 1.35 : 2.2, zoomRef.current + direction * 0.2));
+    zoomRef.current = next;
+    setZoom(next);
+    scheduleRender();
+  };
+
+  const rotateGlobe = (deltaX: number, deltaY: number) => {
+    if (viewModeRef.current !== "globe") return;
+    rotationRef.current.longitude += deltaX * 0.0065;
+    rotationRef.current.latitude = Math.max(-1.18, Math.min(1.18, rotationRef.current.latitude - deltaY * 0.0065));
+    scheduleRender();
+  };
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (viewMode !== "globe") return;
+    dragRef.current = { active: true, x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    if (!dragRef.current.active) return;
+    const deltaX = event.clientX - dragRef.current.x;
+    const deltaY = event.clientY - dragRef.current.y;
+    dragRef.current = { active: true, x: event.clientX, y: event.clientY };
+    rotateGlobe(deltaX, deltaY);
+  };
+
+  const handlePointerUp = (event: React.PointerEvent<HTMLCanvasElement>) => {
+    dragRef.current.active = false;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
+  const handleMapKey = (event: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (viewMode !== "globe") return;
+    const directions: Record<string, [number, number]> = {
+      ArrowLeft: [-18, 0],
+      ArrowRight: [18, 0],
+      ArrowUp: [0, -18],
+      ArrowDown: [0, 18],
+    };
+    const direction = directions[event.key];
+    if (!direction) return;
+    event.preventDefault();
+    rotateGlobe(...direction);
+  };
 
   const updateSetting = <K extends keyof WorldSettings>(key: K, value: WorldSettings[K]) => {
     setSettings((current) => ({ ...current, [key]: value }));
@@ -154,7 +348,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 03</span>
+            <span className="version">ALPHA 04</span>
           </div>
 
           <label className="seed-field">
@@ -181,23 +375,33 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isGenerating}>
             <span>{isGenerating ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isGenerating ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">Terrane networks · rifted coasts · carved relief</p>
+          <p className="generation-note">Wrapped planet · denser terrain · carved relief</p>
         </aside>
 
         <div className="map-stage">
           <canvas
             ref={canvasRef}
-            className="world-canvas"
-            style={{ transform: `scale(${zoom})` }}
-            aria-label="Procedurally generated satellite-style fantasy world"
+            className={`world-canvas ${viewMode === "globe" ? "globe-view" : "atlas-view"}`}
+            style={{ transform: viewMode === "atlas" ? `scale(${zoom})` : undefined }}
+            aria-label={viewMode === "globe" ? "Rotatable procedural fantasy planet" : "Seamless equirectangular fantasy world atlas"}
+            tabIndex={viewMode === "globe" ? 0 : -1}
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerUp}
+            onKeyDown={handleMapKey}
           />
           <div className="map-vignette" />
 
-          <div className="coordinates">34° N · 118° E <span>—</span> 1:42M</div>
+          <div className="coordinates">{viewMode === "globe" ? "DRAG TO ROTATE" : "EQUIRECTANGULAR"} <span>—</span> SEAMLESS 360°</div>
+          <div className="view-switcher" aria-label="Map projection">
+            <button type="button" className={viewMode === "globe" ? "active" : ""} onClick={() => changeViewMode("globe")} aria-pressed={viewMode === "globe"}>GLOBE</button>
+            <button type="button" className={viewMode === "atlas" ? "active" : ""} onClick={() => changeViewMode("atlas")} aria-pressed={viewMode === "atlas"}>ATLAS</button>
+          </div>
           <div className="map-toolbar" aria-label="Map view controls">
-            <button type="button" onClick={() => setZoom((value) => Math.max(1, value - 0.2))} aria-label="Zoom out">−</button>
+            <button type="button" onClick={() => changeZoom(-1)} aria-label="Zoom out">−</button>
             <output>{Math.round(zoom * 100)}%</output>
-            <button type="button" onClick={() => setZoom((value) => Math.min(2.2, value + 0.2))} aria-label="Zoom in">+</button>
+            <button type="button" onClick={() => changeZoom(1)} aria-label="Zoom in">+</button>
           </div>
 
           <div className="survey-strip" aria-label="World survey">
