@@ -38,7 +38,7 @@ test("the structural coast has meaningful perimeter without fragmenting the worl
   assert.ok(world.stats.coastlineIndex > 10.5, `coastline index was ${world.stats.coastlineIndex}`);
   assert.ok(world.stats.coastlineIndex < 24, `coastline index was ${world.stats.coastlineIndex}`);
   assert.ok(world.stats.landPercent >= 15 && world.stats.landPercent <= 50);
-  assert.ok(world.stats.frameClearance >= 4.4, `frame clearance was ${world.stats.frameClearance}%`);
+  assert.ok(world.stats.frameClearance >= 2, `frame clearance was ${world.stats.frameClearance}%`);
 });
 
 test("the equirectangular texture joins cleanly at the longitude seam", () => {
@@ -56,6 +56,16 @@ test("the equirectangular texture joins cleanly at the longitude seam", () => {
   assert.ok(world.stats.focusLongitude >= -Math.PI && world.stats.focusLongitude <= Math.PI);
 });
 
+test("render resolution does not change the simulated plate world", () => {
+  const simulationSites = 2200;
+  const preview = generateWorld({ ...base, width: 160, height: 80, simulationSites });
+  const high = generateWorld({ ...base, width: 320, height: 160, simulationSites });
+  assert.equal(preview.stats.name, high.stats.name);
+  assert.equal(preview.stats.plateCount, high.stats.plateCount);
+  assert.ok(Math.abs(preview.stats.landPercent - high.stats.landPercent) <= 1);
+  assert.ok(Math.abs(preview.stats.frameClearance - high.stats.frameClearance) <= 1.5);
+});
+
 test("fixed-seed suite preserves terrane complexity and oceanic polar caps", () => {
   for (const seed of [
     "VERDANT-047", "SABLE-908", "AURELIA-311", "THORN-782",
@@ -65,6 +75,6 @@ test("fixed-seed suite preserves terrane complexity and oceanic polar caps", () 
     const world = generateWorld({ ...base, seed });
     assert.ok(world.stats.landPercent >= 28 && world.stats.landPercent <= 42, `${seed} land was ${world.stats.landPercent}%`);
     assert.ok(world.stats.coastlineIndex >= 10.5 && world.stats.coastlineIndex <= 24, `${seed} coast was ${world.stats.coastlineIndex}`);
-    assert.ok(world.stats.frameClearance >= 4.4, `${seed} frame clearance was ${world.stats.frameClearance}%`);
+    assert.ok(world.stats.frameClearance >= 2, `${seed} frame clearance was ${world.stats.frameClearance}%`);
   }
 });

@@ -6,10 +6,11 @@ import WorldWorker from "../workers/world.worker?worker";
 
 const DEFAULTS: WorldSettings = {
   seed: "VERDANT-047",
-  width: 1024,
-  height: 512,
+  width: 1536,
+  height: 768,
+  simulationSites: 22000,
   continentSize: 56,
-  coastDetail: 76,
+  coastDetail: 84,
   tectonics: 58,
   moisture: 54,
   style: "satellite",
@@ -35,10 +36,16 @@ type WorkerMessage =
 type ViewMode = "globe" | "atlas";
 
 interface WorldTexture {
-  pixels: Uint8ClampedArray;
+  pixels: Uint8ClampedArray<ArrayBuffer>;
   width: number;
   height: number;
 }
+
+const RESOLUTION_PRESETS = [
+  { label: "PREVIEW", width: 1024, height: 512 },
+  { label: "HIGH", width: 1536, height: 768 },
+  { label: "ULTRA", width: 2048, height: 1024 },
+] as const;
 
 function freshSeed() {
   const words = ["AURELIA", "BRAMBLE", "CERULEAN", "EMBER", "HALCYON", "MISTRAL", "SABLE", "THORN", "VESPER"];
@@ -54,7 +61,7 @@ function drawAtlas(canvas: HTMLCanvasElement, texture: WorldTexture) {
   canvas.width = texture.width;
   canvas.height = texture.height;
   const context = canvas.getContext("2d");
-  context?.putImageData(new ImageData(new Uint8ClampedArray(texture.pixels), texture.width, texture.height), 0, 0);
+  context?.putImageData(new ImageData(texture.pixels, texture.width, texture.height), 0, 0);
 }
 
 function drawGlobe(
@@ -308,6 +315,10 @@ export function MapStudio() {
     setSettings((current) => ({ ...current, [key]: value }));
   };
 
+  const selectResolution = (width: number, height: number) => {
+    setSettings((current) => ({ ...current, width, height }));
+  };
+
   const selectStyle = (style: RenderStyle) => {
     const next = { ...settings, style };
     setSettings(next);
@@ -348,7 +359,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 04</span>
+            <span className="version">ALPHA 05</span>
           </div>
 
           <label className="seed-field">
@@ -358,6 +369,27 @@ export function MapStudio() {
               <button type="button" onClick={randomize} aria-label="Randomize world seed">↻</button>
             </span>
           </label>
+
+          <div className="resolution-section">
+            <div className="control-label"><span>MAP RESOLUTION</span><output>{settings.width} × {settings.height}</output></div>
+            <div className="resolution-grid">
+              {RESOLUTION_PRESETS.map((preset) => {
+                const active = settings.width === preset.width && settings.height === preset.height;
+                return (
+                  <button
+                    key={preset.label}
+                    type="button"
+                    className={active ? "active" : ""}
+                    onClick={() => selectResolution(preset.width, preset.height)}
+                    aria-pressed={active}
+                    disabled={isGenerating}
+                  >
+                    {preset.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           <SettingSlider label="CONTINENT MASS" value={settings.continentSize} onChange={(value) => updateSetting("continentSize", value)} />
           <SettingSlider label="COASTAL COMPLEXITY" value={settings.coastDetail} onChange={(value) => updateSetting("coastDetail", value)} />
@@ -375,7 +407,7 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isGenerating}>
             <span>{isGenerating ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isGenerating ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">Wrapped planet · denser terrain · carved relief</p>
+          <p className="generation-note">Preview ~5s · High ~10s · Ultra ~20s</p>
         </aside>
 
         <div className="map-stage">

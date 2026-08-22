@@ -52,6 +52,11 @@ button:disabled { cursor: wait; opacity: 0.62; }
 .seed-entry { display: flex; align-items: center; min-width: 0; }
 .seed-entry input { width: 126px; border: 0; border-bottom: 1px solid rgba(213, 102, 60, 0.35); padding: 3px 2px; background: transparent; color: var(--accent); text-align: right; font: 600 10px/1 var(--font-geist-mono), monospace; }
 .seed-entry button { border: 0; padding: 5px 0 5px 7px; background: transparent; color: var(--accent); cursor: pointer; }
+.resolution-section { margin-top: 18px; }
+.resolution-grid { display: grid; grid-template-columns: repeat(3, 1fr); margin-top: 10px; border: 1px solid var(--line); }
+.resolution-grid button { border: 0; border-right: 1px solid var(--line); padding: 9px 4px; background: transparent; color: var(--muted); cursor: pointer; font: 600 8px/1 var(--font-geist-mono), monospace; letter-spacing: 0.06em; }
+.resolution-grid button:last-child { border-right: 0; }
+.resolution-grid button.active { background: var(--ink); color: #f4f0e5; }
 .control-group { margin-top: 19px; }
 .control-label { display: flex; justify-content: space-between; font: 600 9px/1 var(--font-geist-mono), monospace; letter-spacing: 0.1em; }
 .control-label output { color: var(--muted); }
