@@ -42,7 +42,11 @@ test("the structural coast has meaningful perimeter without fragmenting the worl
 });
 
 test("fixed-seed suite preserves composition and an ocean frame", () => {
-  for (const seed of ["VERDANT-047", "SABLE-908", "AURELIA-311", "THORN-782"]) {
+  for (const seed of [
+    "VERDANT-047", "SABLE-908", "AURELIA-311", "THORN-782",
+    "EMBER-164", "MISTRAL-529", "HALCYON-846", "BRAMBLE-203",
+    "VESPER-675", "CERULEAN-418", "IVORY-991", "STORM-357",
+  ]) {
     const world = generateWorld({ ...base, seed });
     assert.ok(world.stats.landPercent >= 28 && world.stats.landPercent <= 42, `${seed} land was ${world.stats.landPercent}%`);
     assert.ok(world.stats.coastlineIndex >= 7.5 && world.stats.coastlineIndex <= 24, `${seed} coast was ${world.stats.coastlineIndex}`);

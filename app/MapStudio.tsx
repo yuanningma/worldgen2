@@ -154,7 +154,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 01</span>
+            <span className="version">ALPHA 02</span>
           </div>
 
           <label className="seed-field">
@@ -181,7 +181,7 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isGenerating}>
             <span>{isGenerating ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isGenerating ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">Voronoi plates · elevation · watersheds · biomes</p>
+          <p className="generation-note">Tectonic graph · fractal coasts · carved relief</p>
         </aside>
 
         <div className="map-stage">
