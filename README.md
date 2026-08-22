@@ -1,0 +1,35 @@
+# Atlas Forge
+
+Atlas Forge is a deterministic, browser-based fantasy world generator focused on beautiful continent silhouettes and convincing satellite-style terrain. Each seed produces tectonic regions, continental shelves, mountain systems, climate zones, and drainage networks entirely on the user's machine.
+
+## Current milestone
+
+- Domain-warped, multi-craton continent construction
+- Voronoi-style tectonic plates with convergent-boundary uplift
+- Priority-flood watershed routing and river accumulation
+- Latitude, elevation, moisture, and rain-shadow biome assignment
+- Satellite and hand-ink rendering from the same world model
+- Reproducible seeds, terrain controls, map zoom, and PNG export
+- Generation runs in a Web Worker to keep the interface responsive
+
+## Run locally
+
+```bash
+npm install
+npm run dev
+```
+
+Open `http://localhost:3000`.
+
+## Validate
+
+```bash
+npm run build
+npm run lint
+```
+
+The implementation and product decisions are documented in [DESIGN.md](./DESIGN.md).
+
+## Project status
+
+This is the first continent-and-satellite milestone. Political borders, settlements, labels, authored regional editing, and full hydraulic erosion are intentionally deferred until the base geography is consistently attractive.
