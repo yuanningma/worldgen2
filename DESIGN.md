@@ -13,7 +13,7 @@ Two earlier approaches exposed opposite weaknesses. Raster crust growth produced
 Atlas Forge now keeps those representations separate:
 
 1. **An irregular graph organizes the planet.** Deterministic Poisson-disc sites become a Delaunay adjacency graph. Well-separated weighted Voronoi seeds receive plate ownership, motion vectors, and continental or oceanic crust.
-2. **Continuous cratons replace categorical plate-shaped continents.** Connected continental plate clusters seed overlapping anisotropic crust lobes. Plate type contributes a smaller bias, while rotated gradient fields supply broad variation. Five candidates are scored before dense work begins.
+2. **A terrane network replaces compact plate-shaped blobs.** Connected continental plate clusters seed a constructive field of narrow cores, bent links, long hooked branches, and detached fragments. Tapered negative fields then cut deep gulfs, rifts, straits, and inland basins through that skeleton. Plate type contributes a smaller bias, while rotated gradient fields supply broad variation. Five candidates are scored before dense work begins.
 3. **Relative plate motion organizes relief.** Convergent and divergent graph edges become multi-source distance fields. They control mountain envelopes and rifts without deciding every shoreline point.
 4. **Graph Priority-Flood guarantees drainage.** Depression conditioning assigns receivers, moisture-weighted contributing area selects river paths, and river vertices carve the structural elevation.
 5. **A dense signed-distance coast breaks free of the mesh.** The selected crust potential is rasterized into a macro mask and converted to a chamfer signed-distance field. Domain warping displaces that field in pixel space.
@@ -29,7 +29,8 @@ Atlas Forge now keeps those representations separate:
 seed + controls
   → Poisson-disc sites and Delaunay adjacency
   → weighted Voronoi plates and motion
-  → connected anisotropic cratons
+  → directional terrane skeletons and bent links
+  → subtractive gulfs, rifts, straits, and inland basins
   → candidate scoring and sea-level cut
   → convergent/rift fields and graph Priority-Flood
   → macro mask and signed coastal distance
@@ -48,7 +49,9 @@ The pipeline is deterministic. The UI sends a serializable recipe to a dedicated
 - Tectonic cells guide continents but never become visible polygons.
 - Coastal displacement is measured in pixels and fades to zero inland and offshore.
 - Explicit features add medium-scale geography so complexity is not merely uniform edge noise.
-- Donjon-like random faults are a minority residual; the tectonic/craton field remains the constraint.
+- Constructive branches and subtractive cuts create silhouette hierarchy before any fractal detail is applied.
+- Continental tips remain rounded and tapered; complexity comes from composition rather than uniformly jagged shores.
+- Donjon-like random faults are a minority residual; the tectonic/terrane field remains the constraint.
 - A hard ocean frame and a dense land-area quantile keep composition stable.
 - Mountain folds inherit convergent-boundary envelopes and use seed-independent height quantiles for reliable visual emphasis.
 - White pixel grain and square river brushes are deliberately avoided.

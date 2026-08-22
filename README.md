@@ -5,7 +5,8 @@ Atlas Forge is a deterministic browser-based fantasy world generator focused on 
 ## Current milestone
 
 - Poisson-disc sampling, Delaunay graph simulation, and weighted Voronoi plates
-- Connected anisotropic cratons that keep continents from tracing plate polygons
+- Directional terrane networks with hooked continental arms and narrow isthmuses
+- Subtractive rifts, deep gulfs, inland basins, detached fragments, and island chains
 - Five-candidate composition scoring and controllable sea-level quantiles
 - Dense signed-distance coastlines with domain warp and multiscale fractal detail
 - A bounded Donjon-inspired spherical fault residual near the coast
@@ -38,4 +39,4 @@ The implementation and research-informed product decisions are documented in [DE
 
 ## Project status
 
-This is the second continent-and-satellite checkpoint. Political borders, settlements, labels, authored regional editing, spherical wrapping, and full hydraulic erosion remain intentionally deferred until the base geography is consistently attractive.
+This is the third continent-and-satellite checkpoint. It replaces compact craton blobs with composed continental skeletons inspired by the large-scale variety of hand-authored fantasy atlases. Political borders, settlements, labels, authored regional editing, spherical wrapping, and full hydraulic erosion remain intentionally deferred until the base geography is consistently attractive.
