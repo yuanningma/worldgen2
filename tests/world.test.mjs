@@ -36,6 +36,16 @@ test("continent mass increases land coverage for a fixed seed", () => {
 test("the structural coast has meaningful perimeter without fragmenting the world", () => {
   const world = generateWorld(base);
   assert.ok(world.stats.coastlineIndex > 7.5, `coastline index was ${world.stats.coastlineIndex}`);
-  assert.ok(world.stats.coastlineIndex < 18, `coastline index was ${world.stats.coastlineIndex}`);
+  assert.ok(world.stats.coastlineIndex < 24, `coastline index was ${world.stats.coastlineIndex}`);
   assert.ok(world.stats.landPercent >= 15 && world.stats.landPercent <= 50);
+  assert.ok(world.stats.frameClearance >= 4.4, `frame clearance was ${world.stats.frameClearance}%`);
+});
+
+test("fixed-seed suite preserves composition and an ocean frame", () => {
+  for (const seed of ["VERDANT-047", "SABLE-908", "AURELIA-311", "THORN-782"]) {
+    const world = generateWorld({ ...base, seed });
+    assert.ok(world.stats.landPercent >= 28 && world.stats.landPercent <= 42, `${seed} land was ${world.stats.landPercent}%`);
+    assert.ok(world.stats.coastlineIndex >= 7.5 && world.stats.coastlineIndex <= 24, `${seed} coast was ${world.stats.coastlineIndex}`);
+    assert.ok(world.stats.frameClearance >= 4.4, `${seed} frame clearance was ${world.stats.frameClearance}%`);
+  }
 });

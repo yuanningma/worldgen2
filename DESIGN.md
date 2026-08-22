@@ -2,87 +2,94 @@
 
 ## Product direction
 
-Atlas Forge is a map-making instrument, not a realism simulator with a map attached. Its first obligation is to produce continents that feel intentional: recognizable large-scale masses, varied silhouettes, peninsulas, inland texture, plausible mountain arcs, and river systems that visually belong to the terrain.
+Atlas Forge is a map-making instrument, not a geology simulator with a map attached. Its first obligation is to produce continents that feel intentional: recognizable large-scale masses, varied silhouettes, peninsulas and gulfs, coherent mountain belts, and rivers that belong to the relief.
 
-The interface follows the same principle. The world occupies nearly the entire workspace while a narrow instrument panel exposes only controls that materially change geography. The warm paper, field-survey typography, restrained vermilion accent, and dark ocean palette are meant to sit between a natural-history folio and a modern remote-sensing workstation.
+The interface follows the same principle. The world occupies nearly the entire workspace while a narrow instrument panel exposes only controls that materially change geography. The warm paper, field-survey typography, restrained vermilion accent, and dark ocean palette sit between a natural-history folio and a modern remote-sensing workstation.
 
-## Why a hybrid generator
+## Why an irregular graph
 
-A complete plate-tectonic history is expensive, difficult to steer, and does not guarantee attractive land shapes. Pure fractal noise is fast but commonly produces amorphous blobs, noisy coastlines at every scale, and mountain ranges unrelated to the continents.
+The first Atlas Forge prototype grew crust on a regular raster. Although fast, that representation encouraged inflated noise masks: coastlines acquired detail without acquiring structure, rivers revealed grid directions, and mountains did not share a useful topology with drainage.
 
-Atlas Forge therefore uses a hybrid of established procedural terrain patterns:
+The current engine instead uses one irregular graph for composition, terrain, tectonics, and hydrology:
 
-1. **Cost-weighted crust growth defines composition.** Each candidate starts with spaced, curved crustal spines and separate peninsula branches. Multi-source Dijkstra growth expands across a warped resistance field. Varying source weights create broad shields, narrow isthmuses, and tapered capes instead of a constant-radius union of blobs.
-2. **Shape selection rejects weak candidates.** Three inexpensive structural candidates are measured for land coverage, connected components, edge collisions, and scale-normalized coastline length. The strongest candidate is retained before expensive pixel work begins.
-3. **A signed distance coast preserves scale hierarchy.** A chamfer distance transform converts the selected binary crust into a continuous land/sea field. Domain warping and several noise bands are attenuated with distance from the shoreline, so small coves do not turn continental interiors into undifferentiated noise. Subtractive coastal ellipses supply broad gulfs; branch growth supplies peninsulas.
-4. **Tectonic structure and range distance fields supply relief.** Moving Voronoi-style plate sites raise convergent boundaries. Curved ranges attached to the crustal skeleton add reliable interior mountain systems. Ridged texture modulates those belts, while low hills remain a separate, lower-amplitude field.
-5. **Weathering connects topography to drainage.** A bounded thermal erosion pass redistributes slopes above a talus threshold. Wind-order humidity produces orographic precipitation and rain shadows. Priority-Flood fills drainage depressions, assigns receivers, and accumulates spatial rainfall; rendered channels then carve shallow valleys into the final elevation field.
-6. **A renderer interprets one world model.** Horn-style 3 × 3 surface normals, continuous biome blends, ocean depth, shelves, and river masks produce the satellite view. Field ink recolors the same elevation, climate, and water data, so style changes do not invent another planet.
+1. **Poisson-disc sites establish an even but non-grid sampling.** A deterministic Bridson-style sampler supplies interior sites, while a narrow boundary ring closes the rectangular domain.
+2. **Delaunay edges become the simulation graph.** The triangulation supplies compact adjacency for terrain propagation, connected-component tests, erosion, and drainage. The dual Voronoi interpretation is used for plate ownership; visible terrain is not rendered as flat Voronoi polygons.
+3. **Conceptual plates create continent-scale organization.** Well-separated plate seeds receive weighted Voronoi regions and motion vectors. Connected plate clusters are marked as continental crust, then combined with low-frequency fields into a continuous crust potential.
+4. **Sea level cuts a continuous field.** The requested continent mass determines a quantile rather than a magic elevation constant. Five deterministic candidates are scored for major landmasses, dominance, tiny-island debris, coast complexity, and map-frame clearance before expensive rendering proceeds.
+5. **Plate-boundary distance fields organize relief.** Relative motion classifies convergent and divergent graph edges. Multi-source Dijkstra propagation turns those sparse boundaries into narrow mountain and rift influence fields; graph thermal erosion softens only excessive slopes.
+6. **Graph hydrology guarantees an outlet.** A Priority-Flood pass raises graph depressions just enough to assign drainage receivers. Moisture-weighted contributing area selects channels, and those same graph paths are carved into the elevation before raster rendering.
+7. **Delaunay triangles produce a continuous image.** Barycentric interpolation converts graph elevation to pixels. Raster hillshade, ocean depth, shelves, climate tint, and river masks interpret that shared world model as either satellite relief or field ink.
 
-This approach deliberately spends realism where a viewer can see it—continental composition, mountain continuity, drainage, shelves, and biome transitions—while avoiding a long physical simulation whose output would still need aesthetic filtering.
+This is intentionally a hybrid. Plate concepts provide useful large-scale structure, but a long geological history is not used as the silhouette generator. Aesthetic candidate selection remains explicit because physical plausibility alone does not guarantee an attractive map.
 
 ## Generation pipeline
 
 ```text
 seed + controls
-  → three weighted crust-growth candidates
-  → shape scoring and signed coastal distance
-  → plate boundaries and curved mountain belts
-  → thermal erosion and wind-order climate
+  → Poisson-disc sites and Delaunay adjacency
+  → weighted Voronoi plate ownership
+  → connected continental plate clusters
+  → continuous crust potential and sea-level quantile
+  → five-candidate structural scoring
+  → convergent/rift distance fields and graph erosion
   → Priority-Flood drainage and valley carving
-  → continuous biomes and normal-based hillshade
-  → satellite or ink pixels
+  → barycentric triangle rasterization
+  → satellite or field-ink pixels
 ```
 
-The whole pipeline is deterministic. The UI sends a serializable settings object to a dedicated Web Worker, which transfers the finished pixel buffer back without copying it. The current 1008 × 630 working resolution is detailed enough for screen use and PNG export while remaining practical for rapid iteration.
+The pipeline is deterministic. The UI sends a serializable settings object to a dedicated Web Worker, which transfers the completed pixel buffer back without copying it. At the default 1008 × 630 working resolution, the graph is capped near 15,500 sites and generation remains comfortably sub-second on the development machine.
 
 ## Aesthetic safeguards
 
-- Macro shape is constructed and scored before any high-frequency detail.
-- Continent anchors are kept apart and structural growth is strongly penalized near the map boundary.
-- Noise is strongest at the shoreline and decays inland and offshore.
-- Mountains are narrow ridges, not a second layer of blob noise.
-- Rivers require rainfall-weighted upstream area and guaranteed drainage, preventing uniform blue scratches.
-- Ocean shelves track elevation immediately below sea level.
-- Satellite colors blend continuously and hillshade is bounded so relief reads without looking embossed.
+- Macro composition is generated and scored before hydrology or pixel work.
+- Plate seeds are spatially separated, while continental ownership grows through connected plate neighbors.
+- A hard ocean margin and a softer edge penalty prevent cropped continents at the framed map boundary.
+- Coast detail perturbs a continuous crust potential; it does not displace every coast point independently.
+- Mountains propagate away from convergent plate edges as narrow fields instead of appearing as isolated noise peaks.
+- Rivers require moisture-weighted upstream area and use guaranteed graph drainage.
+- Ocean shelves use elevation immediately below sea level.
+- Satellite colors blend continuously, and bounded hillshade keeps relief legible without an embossed look.
 
 ## Research basis
 
-The implementation is original, but the pipeline deliberately follows lessons from established open-source generators and terrain literature:
+The implementation is original, but its structure follows lessons from established open-source generators and terrain literature:
 
-- [Mapgen4](https://github.com/redblobgames/mapgen4) separates irregular mesh construction, mountain-distance elevation, wind-order rainfall, downslope flow, and GPU relief rendering. Its most important coastline lesson for Atlas Forge is to weight perturbation near the coast instead of applying equal noise everywhere.
-- [WorldEngine](https://github.com/Mindwerks/worldengine) demonstrates that plate simulation is useful for mountain placement but still needs separate passes for noise, precipitation, erosion, humidity, and biomes. Atlas Forge keeps the structurally useful boundary uplift without treating a full geological history as the silhouette generator.
-- [Terrain Erosion in 3 Ways](https://github.com/dandrino/terrain-erosion-3-ways) shows why fractional noise alone looks homogeneous, and compares hydraulic simulation with a faster river-network-first construction. Atlas Forge uses the same practical principle: the drainage graph must influence visible terrain.
-- [FantasyMapGenerator](https://github.com/rlguy/FantasyMapGenerator) combines an irregular Delaunay/Voronoi grid, depression filling, flux-derived rivers, and erosion. Its documented Planchon–Darboux pipeline reinforced the choice to guarantee drainage before drawing channels.
-- Barnes et al.'s [Priority-Flood paper](https://rbarnes.org/sci/2014_depressions.pdf) provides the depression-filling basis used by the watershed pass. The browser implementation uses a reduced-resolution raster heap rather than copying any project source.
+- [Mapgen4](https://github.com/redblobgames/mapgen4) demonstrates a clean irregular-mesh pipeline in which elevation, wind order, downslope flow, and rendering exchange structure. Atlas Forge adopts the central graph-first lesson while using automatic continent composition rather than a paint workflow.
+- [Mapgen2](https://github.com/redblobgames/mapgen2) shows the practical value of separating polygonal regions from corner-based elevation and river flow. Atlas Forge likewise simulates on graph vertices and renders a continuous field instead of exposing cell polygons.
+- [D3 Delaunay](https://d3js.org/d3-delaunay) supplies the robust Delaunay triangulation used to construct adjacency and the dual Voronoi interpretation.
+- [WorldEngine](https://github.com/Mindwerks/worldengine) demonstrates that plate simulation is useful for mountain placement but still needs distinct elevation, precipitation, erosion, and biome passes. Atlas Forge keeps structurally useful boundary uplift without treating a full geological history as the coast generator.
+- [FantasyMapGenerator](https://github.com/rlguy/FantasyMapGenerator) combines an irregular Delaunay/Voronoi grid, depression filling, flux-derived rivers, and erosion. Its pipeline reinforced the decision to guarantee drainage before drawing channels.
+- Barnes et al.'s [Priority-Flood paper](https://rbarnes.org/sci/2014_depressions.pdf) provides the depression-filling basis used by the watershed pass.
 
-These sources agree on a useful product decision: simulation passes should exchange structure—relief affects rain, rain affects flow, and flow affects valleys—but attractive continent composition needs explicit constraints and selection rather than an assumption that physical simulation will automatically produce a good map.
+The common design lesson is that simulation passes should exchange structure—relief affects drainage and drainage affects visible valleys—but attractive continental composition still benefits from explicit constraints and candidate rejection.
 
 ## Architecture
 
-- `app/MapStudio.tsx` owns controls, worker orchestration, canvas display, and PNG export.
-- `lib/world.ts` contains the deterministic terrain, plate, climate, hydrology, and rendering pipeline.
-- `workers/world.worker.ts` isolates expensive generation from interaction and transfers the final raster.
+- `app/MapStudio.tsx` owns controls, Worker orchestration, canvas display, zoom, and PNG export.
+- `lib/world.ts` owns deterministic mesh construction, plate fields, terrain selection, graph hydrology, interpolation, and rendering.
+- `workers/world.worker.ts` isolates generation from interaction and transfers the final raster.
+- `types/d3-delaunay.d.ts` keeps the small triangulation surface typed without pulling extra runtime code.
 - `app/globals.css` defines the responsive field-instrument interface.
 
-No server data, account, or external API is required. A generated world never leaves the browser.
+No server data, account, or external API is required. There is intentionally no authentication during this iteration, and generated worlds never leave the browser.
 
-## Deliberate constraints in milestone one
+## Deliberate constraints in this milestone
 
-- The map is an equirectangular framed world, not yet a seamless globe.
-- Tectonics model boundary uplift rather than geological time, crust age, subduction, and mass conservation.
-- Hydrology uses a reduced-resolution drainage graph and does not yet retain lakes or sediment fans.
-- Ink mode is an alternate renderer, not yet a full label-and-symbol cartographic system.
-- PNG export uses working resolution; tiled high-resolution export is the next performance milestone.
+- The map is an equirectangular framed world, not yet a horizontally wrapped globe.
+- Plates are conceptual Voronoi ownership regions, not a time-stepped model of crust age, subduction, or mass conservation.
+- Climate tint currently uses latitude, height, coherent moisture noise, and the moisture control; full wind-order precipitation is deferred.
+- Hydrology retains river paths but not lakes, sediment fans, deltas, or endorheic basins.
+- Field-ink mode is an alternate renderer, not yet a complete label-and-symbol cartographic system.
+- PNG export uses working resolution; tiled high-resolution export is a later performance milestone.
 
 ## Roadmap
 
 ### Milestone two — better landforms
 
-- Spherical or horizontally wrapped topology
-- Coast-aware thermal erosion and sediment fans
-- Persistent lakes, deltas, and endorheic basins
-- Continent quality scoring with automatic rejection of weak seeds
+- Horizontally wrapped or spherical graph topology
+- Coast-aware erosion, sediment fans, persistent lakes, and deltas
+- Directional climate with orographic precipitation and rain shadows
+- More composition archetypes and stricter automatic seed rejection
 - Tiled 4K–8K generation with progressive preview
 
 ### Milestone three — authored worlds

@@ -1,19 +1,19 @@
 # Atlas Forge
 
-Atlas Forge is a deterministic, browser-based fantasy world generator focused on beautiful continent silhouettes and convincing satellite-style terrain. Each seed produces tectonic regions, continental shelves, mountain systems, climate zones, and drainage networks entirely on the user's machine.
+Atlas Forge is a deterministic, browser-based fantasy world generator focused on strong continent silhouettes and convincing satellite-style relief. It runs entirely on the user's machine and currently requires no account or server API.
 
 ## Current milestone
 
-- Cost-weighted crust growth on a high-resolution structural lattice
-- Candidate scoring for land coverage, connectedness, and coastline complexity
-- Coast-localized, multi-scale perturbation with bays and peninsula branches
-- Voronoi-style tectonic plates with convergent-boundary uplift
-- Curved mountain belts, thermal erosion, and flow-carved valleys
-- Priority-Flood watershed routing, rainfall-weighted accumulation, and rivers
-- Latitude, elevation, wind-order rainfall, and rain-shadow biome assignment
-- Satellite and hand-ink rendering from the same world model
-- Reproducible seeds, terrain controls, map zoom, and PNG export
-- Generation runs in a Web Worker to keep the interface responsive
+- Deterministic Poisson-disc sampling and Delaunay graph construction
+- Weighted Voronoi plate ownership with connected continental plate clusters
+- Continuous crust potential with sea-level quantile control
+- Five-candidate scoring for landmass balance, coastline structure, islands, and frame clearance
+- Convergent-boundary mountain fields, rifts, graph thermal erosion, and flow-carved valleys
+- Graph Priority-Flood drainage, moisture-weighted accumulation, and rivers
+- Barycentric triangle interpolation for smooth, cell-free relief
+- Satellite and field-ink rendering from the same terrain model
+- Reproducible seeds, terrain controls, zoom, and PNG export
+- Web Worker generation to keep the interface responsive
 
 ## Run locally
 
@@ -27,12 +27,13 @@ Open `http://localhost:3000`.
 ## Validate
 
 ```bash
-npm run build
+npm run typecheck
+npm test
 npm run lint
 ```
 
-The implementation and product decisions are documented in [DESIGN.md](./DESIGN.md).
+The implementation and research-informed product decisions are documented in [DESIGN.md](./DESIGN.md).
 
 ## Project status
 
-This is the first continent-and-satellite milestone. Political borders, settlements, labels, authored regional editing, and full hydraulic erosion are intentionally deferred until the base geography is consistently attractive.
+This is the first Voronoi continent-and-satellite checkpoint. Political borders, settlements, labels, authored regional editing, spherical wrapping, and full hydraulic erosion are intentionally deferred until the base geography is consistently attractive.

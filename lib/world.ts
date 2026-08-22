@@ -1,3 +1,5 @@
+import { Delaunay } from "d3-delaunay";
+
 export type RenderStyle = "satellite" | "ink";
 
 export interface WorldSettings {
@@ -18,6 +20,7 @@ export interface WorldStats {
   plateCount: number;
   riverCount: number;
   coastlineIndex: number;
+  frameClearance: number;
   generationMs: number;
 }
 
@@ -28,26 +31,43 @@ export interface WorldResult {
   stats: WorldStats;
 }
 
-type Point = { x: number; y: number };
-type CrustNode = Point & { growth: number };
-type RangeArc = { points: Point[]; width: number; strength: number };
-type CoastBite = Point & { rx: number; ry: number; angle: number };
-type ContinentPlan = { spine: Point[]; crustArcs: CrustNode[][]; ranges: RangeArc[]; bites: CoastBite[] };
-type Plate = Point & { vx: number; vy: number; oceanic: boolean };
-type CoastModel = {
-  width: number;
-  height: number;
-  signedDistance: Float32Array;
-  continents: ContinentPlan[];
+interface GraphMesh {
+  cellCount: number;
+  aspect: number;
+  x: Float32Array;
+  y: Float32Array;
+  neighborOffsets: Uint32Array;
+  neighbors: Uint32Array;
+  triangles: Uint32Array;
+  boundary: Uint8Array;
+}
+
+interface Plate {
+  id: number;
+  siteCell: number;
+  x: number;
+  y: number;
+  weight: number;
+  vx: number;
+  vy: number;
+  continental: boolean;
+  crustBias: number;
+}
+
+interface TerrainCandidate {
+  plates: Plate[];
+  plateId: Int16Array;
+  potential: Float32Array;
+  elevation: Float32Array;
+  landMask: Uint8Array;
+  ridge: Float32Array;
+  score: number;
   coastlineIndex: number;
-};
+  frameClearance: number;
+}
 
 const TAU = Math.PI * 2;
-const NEIGHBORS = [
-  [-1, -1], [0, -1], [1, -1],
-  [-1, 0], [1, 0],
-  [-1, 1], [0, 1], [1, 1],
-] as const;
+const FRAME_OCEAN_MARGIN = 0.045;
 
 function clamp(value: number, low = 0, high = 1) {
   return Math.max(low, Math.min(high, value));
@@ -57,9 +77,9 @@ function mix(a: number, b: number, t: number) {
   return a + (b - a) * t;
 }
 
-function smoothstep(t: number) {
-  const value = clamp(t);
-  return value * value * (3 - 2 * value);
+function smoothstep(value: number) {
+  const t = clamp(value);
+  return t * t * (3 - 2 * t);
 }
 
 function seedToInt(seed: string) {
@@ -116,24 +136,17 @@ function ridgedNoise(x: number, y: number, seed: number) {
   return 1 - Math.abs(fbm(x, y, seed, 4) * 2 - 1);
 }
 
-function pointSegmentDistance(px: number, py: number, a: Point, b: Point) {
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const lengthSquared = dx * dx + dy * dy || 1;
-  const t = clamp(((px - a.x) * dx + (py - a.y) * dy) / lengthSquared);
-  return Math.hypot(px - (a.x + dx * t), py - (a.y + dy * t));
-}
-
 class MinHeap {
-  private values: { index: number; priority: number; owner?: number }[] = [];
+  private values: { index: number; priority: number; source?: number }[] = [];
 
-  push(item: { index: number; priority: number; owner?: number }) {
+  push(item: { index: number; priority: number; source?: number }) {
     this.values.push(item);
     let child = this.values.length - 1;
     while (child > 0) {
       const parent = (child - 1) >> 1;
-      if (this.values[parent].priority <= item.priority) break;
-      this.values[child] = this.values[parent];
+      const parentValue = this.values[parent];
+      if (parentValue.priority < item.priority || (parentValue.priority === item.priority && parentValue.index <= item.index)) break;
+      this.values[child] = parentValue;
       child = parent;
     }
     this.values[child] = item;
@@ -149,9 +162,15 @@ class MinHeap {
         const left = parent * 2 + 1;
         if (left >= this.values.length) break;
         const right = left + 1;
-        const child = right < this.values.length && this.values[right].priority < this.values[left].priority ? right : left;
-        if (this.values[child].priority >= tail.priority) break;
-        this.values[parent] = this.values[child];
+        let child = left;
+        if (right < this.values.length) {
+          const a = this.values[left];
+          const b = this.values[right];
+          if (b.priority < a.priority || (b.priority === a.priority && b.index < a.index)) child = right;
+        }
+        const childValue = this.values[child];
+        if (childValue.priority > tail.priority || (childValue.priority === tail.priority && childValue.index >= tail.index)) break;
+        this.values[parent] = childValue;
         parent = child;
       }
       this.values[parent] = tail;
@@ -162,615 +181,646 @@ class MinHeap {
   get size() { return this.values.length; }
 }
 
-function createContinentPlans(random: () => number) {
-  const count = 3 + Math.floor(random() * 2);
-  const anchors: Point[] = [];
-  const continents: ContinentPlan[] = [];
+function poissonAttempt(random: () => number, aspect: number, radius: number) {
+  const cellSize = radius / Math.SQRT2;
+  const gridWidth = Math.ceil(aspect / cellSize);
+  const gridHeight = Math.ceil(1 / cellSize);
+  const grid = new Int32Array(gridWidth * gridHeight).fill(-1);
+  const points: [number, number][] = [];
+  const active: number[] = [];
+  const margin = radius * 0.58;
 
-  for (let continentIndex = 0; continentIndex < count; continentIndex += 1) {
-    let anchor = { x: 0.18 + random() * 0.64, y: 0.18 + random() * 0.64 };
-    for (let attempt = 0; attempt < 60; attempt += 1) {
-      const candidate = { x: 0.13 + random() * 0.74, y: 0.15 + random() * 0.7 };
-      if (anchors.every((other) => Math.hypot(candidate.x - other.x, candidate.y - other.y) > 0.24)) {
-        anchor = candidate;
-        break;
-      }
-    }
-    anchors.push(anchor);
+  const add = (x: number, y: number) => {
+    const index = points.length;
+    points.push([x, y]);
+    active.push(index);
+    grid[Math.floor(y / cellSize) * gridWidth + Math.floor(x / cellSize)] = index;
+  };
+  add(margin + random() * (aspect - margin * 2), margin + random() * (1 - margin * 2));
 
-    const nodeCount = 4 + Math.floor(random() * 3);
-    const axis = random() * TAU;
-    const step = 0.048 + random() * 0.018;
-    const mainArc: CrustNode[] = [];
-    let heading = axis + (random() - 0.5) * 0.42;
-    let point: CrustNode = {
-      x: clamp(anchor.x - Math.cos(axis) * step * nodeCount * 0.44, 0.08, 0.92),
-      y: clamp(anchor.y - Math.sin(axis) * step * nodeCount * 0.44, 0.1, 0.9),
-      growth: 0.48 + random() * 0.42,
-    };
-    mainArc.push(point);
-    for (let node = 1; node < nodeCount; node += 1) {
-      const targetHeading = axis + Math.sin((node / (nodeCount - 1)) * Math.PI) * (random() - 0.5) * 0.92;
-      heading = mix(heading, targetHeading, 0.48) + (random() - 0.5) * 0.34;
-      point = {
-        x: clamp(point.x + Math.cos(heading) * step * (0.78 + random() * 0.48), 0.07, 0.93),
-        y: clamp(point.y + Math.sin(heading) * step * (0.88 + random() * 0.52), 0.09, 0.91),
-        growth: clamp(0.26 + random() * 0.82),
-      };
-      mainArc.push(point);
-    }
-
-    const crustArcs: CrustNode[][] = [mainArc];
-    const branchCount = 1 + (random() > 0.54 ? 1 : 0);
-    for (let branch = 0; branch < branchCount; branch += 1) {
-      const sourceIndex = 1 + Math.floor(random() * Math.max(1, mainArc.length - 2));
-      const source = mainArc[Math.min(mainArc.length - 1, sourceIndex)];
-      const branchHeading = axis + (random() > 0.5 ? 1 : -1) * (0.78 + random() * 0.62);
-      const branchLength = 2 + (random() > 0.58 ? 1 : 0);
-      const branchArc: CrustNode[] = [{ ...source, growth: Math.max(0.5, source.growth) }];
-      let branchPoint = source;
-      for (let branchNode = 1; branchNode <= branchLength; branchNode += 1) {
-        const bend = (branchNode / branchLength) * (random() - 0.5) * 0.72;
-        branchPoint = {
-          x: clamp(branchPoint.x + Math.cos(branchHeading + bend) * step * (0.72 + random() * 0.38), 0.07, 0.93),
-          y: clamp(branchPoint.y + Math.sin(branchHeading + bend) * step * (0.8 + random() * 0.42), 0.09, 0.91),
-          growth: clamp(0.76 - branchNode * 0.18 + random() * 0.22, 0.2, 0.86),
-        };
-        branchArc.push(branchPoint);
-      }
-      crustArcs.push(branchArc);
-    }
-
-    const spine: Point[] = mainArc.map(({ x, y }) => ({ x, y }));
-
-    const ranges: RangeArc[] = [];
-    const normal = axis + Math.PI / 2;
-    const offset = (random() > 0.5 ? 1 : -1) * (0.014 + random() * 0.027);
-    const mainRange = spine.slice(1, -1).map((spinePoint, index, points) => ({
-      x: clamp(spinePoint.x + Math.cos(normal) * offset * Math.sin(((index + 1) / (points.length + 1)) * Math.PI), 0.04, 0.96),
-      y: clamp(spinePoint.y + Math.sin(normal) * offset * Math.sin(((index + 1) / (points.length + 1)) * Math.PI), 0.04, 0.96),
-    }));
-    if (mainRange.length >= 2) ranges.push({ points: mainRange, width: 0.013 + random() * 0.009, strength: 0.82 + random() * 0.36 });
-
-    for (let arcIndex = 1; arcIndex < crustArcs.length; arcIndex += 1) {
-      const branch = crustArcs[arcIndex];
-      if (branch.length >= 3 && random() > 0.35) {
-        ranges.push({
-          points: branch.map(({ x, y }) => ({ x, y })),
-          width: 0.01 + random() * 0.007,
-          strength: 0.5 + random() * 0.32,
-        });
-      }
-    }
-
-    if (spine.length > 5 && random() > 0.42) {
-      const center = spine[Math.floor(spine.length / 2)];
-      const branchAngle = axis + (random() > 0.5 ? 1 : -1) * (0.7 + random() * 0.45);
-      ranges.push({
-        points: [
-          center,
-          { x: clamp(center.x + Math.cos(branchAngle) * 0.055, 0.04, 0.96), y: clamp(center.y + Math.sin(branchAngle) * 0.065, 0.04, 0.96) },
-          { x: clamp(center.x + Math.cos(branchAngle + 0.24) * 0.12, 0.04, 0.96), y: clamp(center.y + Math.sin(branchAngle + 0.24) * 0.13, 0.04, 0.96) },
-        ],
-        width: 0.014 + random() * 0.009,
-        strength: 0.48 + random() * 0.28,
-      });
-    }
-    const bites: CoastBite[] = [];
-    const biteCount = 2 + (random() > 0.56 ? 1 : 0);
-    for (let bite = 0; bite < biteCount; bite += 1) {
-      const source = spine[1 + Math.floor(random() * Math.max(1, spine.length - 2))];
-      const side = random() > 0.5 ? 1 : -1;
-      const biteAngle = normal + (side < 0 ? Math.PI : 0) + (random() - 0.5) * 0.54;
-      bites.push({
-        x: source.x + Math.cos(biteAngle) * (0.092 + random() * 0.035),
-        y: source.y + Math.sin(biteAngle) * (0.092 + random() * 0.035),
-        rx: 0.043 + random() * 0.032,
-        ry: 0.022 + random() * 0.024,
-        angle: biteAngle + Math.PI / 2 + (random() - 0.5) * 0.4,
-      });
-    }
-    continents.push({ spine, crustArcs, ranges, bites });
-  }
-  return continents;
-}
-
-function chamferDistance(mask: Uint8Array, target: number, width: number, height: number) {
-  const distance = new Float32Array(mask.length);
-  distance.fill(1e6);
-  for (let index = 0; index < mask.length; index += 1) if (mask[index] === target) distance[index] = 0;
-  const diagonal = Math.SQRT2;
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      let value = distance[index];
-      if (x > 0) value = Math.min(value, distance[index - 1] + 1);
-      if (y > 0) value = Math.min(value, distance[index - width] + 1);
-      if (x > 0 && y > 0) value = Math.min(value, distance[index - width - 1] + diagonal);
-      if (x + 1 < width && y > 0) value = Math.min(value, distance[index - width + 1] + diagonal);
-      distance[index] = value;
-    }
-  }
-  for (let y = height - 1; y >= 0; y -= 1) {
-    for (let x = width - 1; x >= 0; x -= 1) {
-      const index = y * width + x;
-      let value = distance[index];
-      if (x + 1 < width) value = Math.min(value, distance[index + 1] + 1);
-      if (y + 1 < height) value = Math.min(value, distance[index + width] + 1);
-      if (x + 1 < width && y + 1 < height) value = Math.min(value, distance[index + width + 1] + diagonal);
-      if (x > 0 && y + 1 < height) value = Math.min(value, distance[index + width - 1] + diagonal);
-      distance[index] = value;
-    }
-  }
-  return distance;
-}
-
-function measureMask(mask: Uint8Array, width: number, height: number, targetCoverage: number, detail: number) {
-  let area = 0;
-  let perimeter = 0;
-  let edgeContacts = 0;
-  const visited = new Uint8Array(mask.length);
-  const queue = new Int32Array(mask.length);
-  let components = 0;
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      if (!mask[index]) continue;
-      area += 1;
-      if (x === 0 || y === 0 || x === width - 1 || y === height - 1) edgeContacts += 1;
-      if (x === 0 || !mask[index - 1]) perimeter += 1;
-      if (x === width - 1 || !mask[index + 1]) perimeter += 1;
-      if (y === 0 || !mask[index - width]) perimeter += 1;
-      if (y === height - 1 || !mask[index + width]) perimeter += 1;
-      if (visited[index]) continue;
-      components += 1;
-      let head = 0;
-      let tail = 0;
-      queue[tail++] = index;
-      visited[index] = 1;
-      while (head < tail) {
-        const current = queue[head++];
-        const cx = current % width;
-        const cy = Math.floor(current / width);
-        for (const [dx, dy] of NEIGHBORS) {
-          const nx = cx + dx;
-          const ny = cy + dy;
-          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-          const next = ny * width + nx;
-          if (mask[next] && !visited[next]) {
-            visited[next] = 1;
-            queue[tail++] = next;
+  while (active.length) {
+    const activeSlot = Math.floor(random() * active.length);
+    const origin = points[active[activeSlot]];
+    let placed = false;
+    for (let attempt = 0; attempt < 28; attempt += 1) {
+      const angle = random() * TAU;
+      const distance = radius * (1 + random());
+      const x = origin[0] + Math.cos(angle) * distance;
+      const y = origin[1] + Math.sin(angle) * distance;
+      if (x < margin || x > aspect - margin || y < margin || y > 1 - margin) continue;
+      const gx = Math.floor(x / cellSize);
+      const gy = Math.floor(y / cellSize);
+      let valid = true;
+      for (let oy = -2; oy <= 2 && valid; oy += 1) {
+        const py = gy + oy;
+        if (py < 0 || py >= gridHeight) continue;
+        for (let ox = -2; ox <= 2; ox += 1) {
+          const px = gx + ox;
+          if (px < 0 || px >= gridWidth) continue;
+          const pointIndex = grid[py * gridWidth + px];
+          if (pointIndex < 0) continue;
+          const point = points[pointIndex];
+          if (Math.hypot(x - point[0], y - point[1]) < radius) {
+            valid = false;
+            break;
           }
         }
       }
+      if (!valid) continue;
+      add(x, y);
+      placed = true;
+      break;
+    }
+    if (!placed) {
+      active[activeSlot] = active[active.length - 1];
+      active.pop();
     }
   }
-
-  const coverage = area / mask.length;
-  const coastlineIndex = area ? perimeter / Math.sqrt(area) : 0;
-  const desiredIndex = mix(8.8, 12.8, detail / 100);
-  const score = 18
-    - Math.abs(coverage - targetCoverage) * 72
-    - Math.abs(coastlineIndex - desiredIndex) * 0.75
-    - Math.abs(components - 4) * 1.2
-    - edgeContacts * 0.08;
-  return { score, coastlineIndex };
+  return points;
 }
 
-function buildCoastCandidate(seed: number, attempt: number, size: number, detail: number, aspect: number): CoastModel & { score: number } {
-  const random = makeRandom(seed + Math.imul(attempt + 1, 0x9e3779b1));
-  const width = 320;
-  const height = Math.max(168, Math.round(width / aspect));
-  const length = width * height;
-  const continents = createContinentPlans(random);
-  const traversalCost = new Float32Array(length);
-  const bestCost = new Float32Array(length);
-  const owner = new Int16Array(length).fill(-1);
-  const heap = new MinHeap();
-  bestCost.fill(Number.POSITIVE_INFINITY);
-
-  for (let y = 0; y < height; y += 1) {
-    const ny = y / Math.max(1, height - 1);
-    for (let x = 0; x < width; x += 1) {
-      const nx = x / Math.max(1, width - 1);
-      const warpX = (fbm(nx * 2.5 + 17, ny * 2.5, seed + attempt * 97 + 31, 3) - 0.5) * 0.12;
-      const warpY = (fbm(nx * 2.5, ny * 2.5 - 11, seed + attempt * 97 + 53, 3) - 0.5) * 0.12;
-      const fabric = fbm((nx + warpX) * 7.2, (ny + warpY) * 7.2, seed + attempt * 131 + 71, 4);
-      const fracture = ridgedNoise(nx * 13.5 - 3, ny * 13.5 + 8, seed + attempt * 151 + 89);
-      const edge = Math.min(nx, 1 - nx, ny, 1 - ny);
-      const edgePenalty = edge < 0.055 ? Math.pow((0.055 - edge) / 0.055, 2) * 9 : 0;
-      traversalCost[y * width + x] = 0.63 + (1 - fabric) * 0.58 + Math.pow(fracture, 4) * 0.46 + edgePenalty;
-    }
+function generatePoissonPoints(random: () => number, targetCount: number, aspect: number) {
+  let radius = Math.sqrt(aspect / targetCount) * 0.9;
+  let points: [number, number][] = [];
+  for (let pass = 0; pass < 3; pass += 1) {
+    points = poissonAttempt(random, aspect, radius);
+    if (points.length >= targetCount * 0.78) break;
+    radius *= 0.9;
   }
 
-  const gridScale = width / 196;
-  const addSeed = (x: number, y: number, continentIndex: number, initialCost: number) => {
-    const px = clamp(Math.round(x * (width - 1)), 1, width - 2);
-    const py = clamp(Math.round(y * (height - 1)), 1, height - 2);
-    const index = py * width + px;
-    if (bestCost[index] > initialCost) {
-      bestCost[index] = initialCost;
-      owner[index] = continentIndex;
-      heap.push({ index, priority: initialCost, owner: continentIndex });
-    }
-  };
+  const boundarySpacing = radius * 0.88;
+  const boundaryPoints: [number, number][] = [];
+  const horizontalCount = Math.max(2, Math.ceil(aspect / boundarySpacing));
+  const verticalCount = Math.max(2, Math.ceil(1 / boundarySpacing));
+  for (let i = 0; i <= horizontalCount; i += 1) {
+    const x = (i / horizontalCount) * aspect;
+    boundaryPoints.push([x, 0], [x, 1]);
+  }
+  for (let i = 1; i < verticalCount; i += 1) {
+    const y = i / verticalCount;
+    boundaryPoints.push([0, y], [aspect, y]);
+  }
+  return boundaryPoints.concat(points);
+}
 
-  continents.forEach((continent, continentIndex) => {
-    for (const arc of continent.crustArcs) {
-      for (let segment = 1; segment < arc.length; segment += 1) {
-        const a = arc[segment - 1];
-        const b = arc[segment];
-        const steps = Math.max(2, Math.ceil(Math.hypot((b.x - a.x) * width, (b.y - a.y) * height) * 1.35));
-        for (let step = 0; step <= steps; step += 1) {
-          const t = step / steps;
-          const growth = mix(a.growth, b.growth, smoothstep(t));
-          const lobeBias = -growth * mix(2.4, 5.8, size / 100) * gridScale;
-          const neckBias = Math.sin(t * Math.PI) * mix(2.2, 5.1, 1 - Math.min(a.growth, b.growth)) * gridScale;
-          addSeed(mix(a.x, b.x, t), mix(a.y, b.y, t), continentIndex, lobeBias + neckBias);
+function buildGraphMesh(seed: number, width: number, height: number) {
+  const aspect = width / height;
+  const targetCount = Math.round(clamp((width * height) / 45, 1400, 15500));
+  const random = makeRandom(seed ^ 0x51f15e);
+  const points = generatePoissonPoints(random, targetCount, aspect);
+  const delaunay = Delaunay.from(points);
+  const cellCount = points.length;
+  const x = new Float32Array(cellCount);
+  const y = new Float32Array(cellCount);
+  const boundary = new Uint8Array(cellCount);
+  for (let index = 0; index < cellCount; index += 1) {
+    x[index] = points[index][0];
+    y[index] = points[index][1];
+    if (points[index][0] === 0 || points[index][0] === aspect || points[index][1] === 0 || points[index][1] === 1) boundary[index] = 1;
+  }
+
+  const neighborLists: number[][] = [];
+  let neighborCount = 0;
+  for (let index = 0; index < cellCount; index += 1) {
+    const neighbors = Array.from(delaunay.neighbors(index)).sort((a, b) => a - b);
+    neighborLists.push(neighbors);
+    neighborCount += neighbors.length;
+  }
+  const neighborOffsets = new Uint32Array(cellCount + 1);
+  const neighbors = new Uint32Array(neighborCount);
+  let cursor = 0;
+  for (let index = 0; index < cellCount; index += 1) {
+    neighborOffsets[index] = cursor;
+    for (const neighbor of neighborLists[index]) neighbors[cursor++] = neighbor;
+  }
+  neighborOffsets[cellCount] = cursor;
+
+  return {
+    cellCount,
+    aspect,
+    x,
+    y,
+    neighborOffsets,
+    neighbors,
+    triangles: new Uint32Array(delaunay.triangles),
+    boundary,
+  } satisfies GraphMesh;
+}
+
+function graphDistance(mesh: GraphMesh, a: number, b: number) {
+  return Math.hypot(mesh.x[a] - mesh.x[b], mesh.y[a] - mesh.y[b]);
+}
+
+function choosePlateSites(mesh: GraphMesh, random: () => number, count: number) {
+  const sites: number[] = [];
+  let first = Math.floor(random() * mesh.cellCount);
+  while (mesh.boundary[first]) first = (first + 1) % mesh.cellCount;
+  sites.push(first);
+  const nearest = new Float32Array(mesh.cellCount).fill(Number.POSITIVE_INFINITY);
+  while (sites.length < count) {
+    const last = sites[sites.length - 1];
+    let best = 0;
+    let bestScore = -1;
+    for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+      if (mesh.boundary[cell]) continue;
+      nearest[cell] = Math.min(nearest[cell], graphDistance(mesh, cell, last));
+      const score = nearest[cell] * (0.86 + hash(cell, sites.length, 911) * 0.24);
+      if (score > bestScore) {
+        best = cell;
+        bestScore = score;
+      }
+    }
+    sites.push(best);
+  }
+  return sites;
+}
+
+function assignPlateOwnership(mesh: GraphMesh, plates: Plate[]) {
+  const plateId = new Int16Array(mesh.cellCount);
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    let bestPlate = 0;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const plate of plates) {
+      const dx = mesh.x[cell] - plate.x;
+      const dy = mesh.y[cell] - plate.y;
+      const score = (dx * dx + dy * dy) / (plate.weight * plate.weight);
+      if (score < bestScore || (score === bestScore && plate.id < bestPlate)) {
+        bestPlate = plate.id;
+        bestScore = score;
+      }
+    }
+    plateId[cell] = bestPlate;
+  }
+  return plateId;
+}
+
+function buildPlateAdjacency(mesh: GraphMesh, plateId: Int16Array, plateCount: number) {
+  const adjacency = Array.from({ length: plateCount }, () => new Set<number>());
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const plate = plateId[cell];
+    for (let cursor = mesh.neighborOffsets[cell]; cursor < mesh.neighborOffsets[cell + 1]; cursor += 1) {
+      const other = plateId[mesh.neighbors[cursor]];
+      if (plate !== other) adjacency[plate].add(other);
+    }
+  }
+  return adjacency;
+}
+
+function assignContinentalClusters(plates: Plate[], adjacency: Set<number>[], random: () => number, targetLand: number) {
+  const desired = Math.round(plates.length * clamp(targetLand * 1.06, 0.26, 0.62));
+  const rootCount = Math.min(desired, 3 + Math.floor(random() * 2));
+  const roots: number[] = [];
+  const nearest = new Float32Array(plates.length).fill(Number.POSITIVE_INFINITY);
+  const first = Math.floor(random() * plates.length);
+  roots.push(first);
+  while (roots.length < rootCount) {
+    const last = roots[roots.length - 1];
+    let best = 0;
+    let bestDistance = -1;
+    for (const plate of plates) {
+      const distance = Math.hypot(plate.x - plates[last].x, plate.y - plates[last].y);
+      nearest[plate.id] = Math.min(nearest[plate.id], distance);
+      if (nearest[plate.id] > bestDistance && !roots.includes(plate.id)) {
+        bestDistance = nearest[plate.id];
+        best = plate.id;
+      }
+    }
+    roots.push(best);
+  }
+
+  const continental = new Uint8Array(plates.length);
+  const cluster = new Int16Array(plates.length).fill(-1);
+  roots.forEach((root, index) => {
+    continental[root] = 1;
+    cluster[root] = index;
+  });
+  let assigned = roots.length;
+  let roundsWithoutGrowth = 0;
+  while (assigned < desired && roundsWithoutGrowth < roots.length * 3) {
+    let grew = false;
+    for (let clusterId = 0; clusterId < roots.length && assigned < desired; clusterId += 1) {
+      const frontier: { plate: number; score: number }[] = [];
+      for (const plate of plates) {
+        if (cluster[plate.id] !== clusterId) continue;
+        for (const neighbor of adjacency[plate.id]) {
+          if (continental[neighbor]) continue;
+          const candidate = plates[neighbor];
+          const latitudePenalty = Math.abs(candidate.y - 0.5) * 0.25;
+          frontier.push({ plate: neighbor, score: random() + latitudePenalty });
+        }
+      }
+      frontier.sort((a, b) => a.score - b.score || a.plate - b.plate);
+      if (frontier.length) {
+        const selected = frontier[0].plate;
+        continental[selected] = 1;
+        cluster[selected] = clusterId;
+        assigned += 1;
+        grew = true;
+      }
+    }
+    roundsWithoutGrowth = grew ? 0 : roundsWithoutGrowth + 1;
+  }
+  plates.forEach((plate) => { plate.continental = Boolean(continental[plate.id]); });
+}
+
+function propagateBoundaryField(
+  mesh: GraphMesh,
+  plateId: Int16Array,
+  plates: Plate[],
+  convergent: boolean,
+) {
+  const distance = new Float32Array(mesh.cellCount).fill(Number.POSITIVE_INFINITY);
+  const strength = new Float32Array(mesh.cellCount);
+  const heap = new MinHeap();
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    for (let cursor = mesh.neighborOffsets[cell]; cursor < mesh.neighborOffsets[cell + 1]; cursor += 1) {
+      const neighbor = mesh.neighbors[cursor];
+      if (cell >= neighbor || plateId[cell] === plateId[neighbor]) continue;
+      const a = plates[plateId[cell]];
+      const b = plates[plateId[neighbor]];
+      const dx = mesh.x[neighbor] - mesh.x[cell];
+      const dy = mesh.y[neighbor] - mesh.y[cell];
+      const length = Math.hypot(dx, dy) || 1;
+      const relative = (b.vx - a.vx) * (dx / length) + (b.vy - a.vy) * (dy / length);
+      const matches = convergent ? relative < -0.11 : relative > 0.15;
+      if (!matches) continue;
+      const typeBoost = a.continental && b.continental ? 1.2 : a.continental || b.continental ? 0.86 : 0.56;
+      const sourceStrength = clamp(Math.abs(relative) * 0.72 * typeBoost, 0.15, 1.4);
+      for (const source of [cell, neighbor]) {
+        if (sourceStrength > strength[source] || distance[source] > 0) {
+          distance[source] = 0;
+          strength[source] = sourceStrength;
+          heap.push({ index: source, priority: 0, source });
         }
       }
     }
-  });
+  }
 
-  const growthBudget = mix(7.3, 19.2, size / 100) * gridScale;
+  const maxDistance = convergent ? 0.105 : 0.065;
   while (heap.size) {
     const current = heap.pop()!;
-    if (current.priority > bestCost[current.index] + 1e-6 || current.priority > growthBudget + 2) continue;
-    const cx = current.index % width;
-    const cy = Math.floor(current.index / width);
-    for (const [dx, dy] of NEIGHBORS) {
-      const nx = cx + dx;
-      const ny = cy + dy;
-      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
-      const next = ny * width + nx;
-      const diagonal = dx && dy ? Math.SQRT2 : 1;
-      const directionalGrain = 1 + Math.abs(dx * 0.42 + dy * 0.18) * (hash(nx, ny, seed + 197) - 0.5) * 0.3;
-      const nextCost = current.priority + traversalCost[next] * diagonal * directionalGrain;
-      if (nextCost < bestCost[next]) {
-        bestCost[next] = nextCost;
-        owner[next] = current.owner ?? -1;
-        heap.push({ index: next, priority: nextCost, owner: current.owner });
+    if (current.priority > distance[current.index] + 1e-7 || current.priority > maxDistance) continue;
+    for (let cursor = mesh.neighborOffsets[current.index]; cursor < mesh.neighborOffsets[current.index + 1]; cursor += 1) {
+      const neighbor = mesh.neighbors[cursor];
+      const next = current.priority + graphDistance(mesh, current.index, neighbor);
+      if (next < distance[neighbor] && next <= maxDistance) {
+        distance[neighbor] = next;
+        strength[neighbor] = strength[current.index];
+        heap.push({ index: neighbor, priority: next, source: current.source });
       }
     }
   }
+  return { distance, strength };
+}
 
-  const mask = new Uint8Array(length);
-  for (let index = 0; index < length; index += 1) {
-    if (bestCost[index] <= growthBudget && owner[index] >= 0) mask[index] = 1;
+function smoothGraphField(mesh: GraphMesh, source: Float32Array, passes: number, centerWeight = 0.56) {
+  let current = source.slice();
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = current.slice();
+    for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+      if (mesh.boundary[cell]) continue;
+      let sum = 0;
+      let weight = 0;
+      for (let cursor = mesh.neighborOffsets[cell]; cursor < mesh.neighborOffsets[cell + 1]; cursor += 1) {
+        const neighbor = mesh.neighbors[cursor];
+        const edgeWeight = 1 / Math.max(0.002, graphDistance(mesh, cell, neighbor));
+        sum += current[neighbor] * edgeWeight;
+        weight += edgeWeight;
+      }
+      next[cell] = current[cell] * centerWeight + (sum / Math.max(weight, 1e-6)) * (1 - centerWeight);
+    }
+    current = next;
   }
+  return current;
+}
 
-  // Subtractive coastal ellipses create broad gulfs and scalloped bays.
-  for (const continent of continents) {
-    for (const bite of continent.bites) {
-      const cosine = Math.cos(bite.angle);
-      const sine = Math.sin(bite.angle);
-      for (let y = 0; y < height; y += 1) {
-        const ny = y / Math.max(1, height - 1);
-        for (let x = 0; x < width; x += 1) {
-          const index = y * width + x;
-          if (!mask[index]) continue;
-          const nx = x / Math.max(1, width - 1);
-          const dx = nx - bite.x;
-          const dy = ny - bite.y;
-          const bx = dx * cosine + dy * sine;
-          const by = -dx * sine + dy * cosine;
-          if ((bx * bx) / (bite.rx * bite.rx) + (by * by) / (bite.ry * bite.ry) < 1) mask[index] = 0;
+function selectThreshold(values: Float32Array, targetFraction: number) {
+  const sorted = Array.from(values).sort((a, b) => a - b);
+  const landCells = Math.round(clamp(targetFraction) * sorted.length);
+  if (landCells <= 0) return sorted[sorted.length - 1];
+  if (landCells >= sorted.length) return sorted[0] - 1e-6;
+  return sorted[sorted.length - landCells] - 1e-6;
+}
+
+function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, targetComponents: number) {
+  const visited = new Uint8Array(mesh.cellCount);
+  const componentSizes: number[] = [];
+  let coastEdges = 0;
+  let landCells = 0;
+  let minimumEdgeDistance = 0.5;
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    if (!landMask[cell]) continue;
+    landCells += 1;
+    const nx = mesh.x[cell] / mesh.aspect;
+    const edgeDistance = Math.min(nx, 1 - nx, mesh.y[cell], 1 - mesh.y[cell]);
+    minimumEdgeDistance = Math.min(minimumEdgeDistance, edgeDistance);
+    for (let cursor = mesh.neighborOffsets[cell]; cursor < mesh.neighborOffsets[cell + 1]; cursor += 1) {
+      if (!landMask[mesh.neighbors[cursor]]) coastEdges += 1;
+    }
+    if (visited[cell]) continue;
+    let size = 0;
+    const queue = [cell];
+    visited[cell] = 1;
+    for (let head = 0; head < queue.length; head += 1) {
+      const current = queue[head];
+      size += 1;
+      for (let cursor = mesh.neighborOffsets[current]; cursor < mesh.neighborOffsets[current + 1]; cursor += 1) {
+        const neighbor = mesh.neighbors[cursor];
+        if (landMask[neighbor] && !visited[neighbor]) {
+          visited[neighbor] = 1;
+          queue.push(neighbor);
         }
       }
     }
+    componentSizes.push(size);
   }
-
-  const targetCoverage = mix(0.14, 0.45, size / 100);
-  const measured = measureMask(mask, width, height, targetCoverage, detail);
-  const distanceToWater = chamferDistance(mask, 0, width, height);
-  const distanceToLand = chamferDistance(mask, 1, width, height);
-  let signedDistance = new Float32Array(length);
-  for (let index = 0; index < length; index += 1) signedDistance[index] = mask[index] ? distanceToWater[index] : -distanceToLand[index];
-  for (let pass = 0; pass < 2; pass += 1) {
-    const smoothed = signedDistance.slice();
-    for (let y = 1; y < height - 1; y += 1) {
-      for (let x = 1; x < width - 1; x += 1) {
-        const index = y * width + x;
-        smoothed[index] = (signedDistance[index] * 4 + signedDistance[index - 1] + signedDistance[index + 1] + signedDistance[index - width] + signedDistance[index + width]) / 8;
-      }
-    }
-    signedDistance = smoothed;
-  }
-
-  return { width, height, signedDistance, continents, coastlineIndex: measured.coastlineIndex, score: measured.score };
+  componentSizes.sort((a, b) => b - a);
+  const meaningful = componentSizes.filter((size) => size >= Math.max(5, landCells * 0.006));
+  const largestShare = landCells ? (componentSizes[0] ?? 0) / landCells : 1;
+  const coastlineIndex = landCells ? coastEdges / Math.sqrt(landCells) : 0;
+  const tinyCells = componentSizes.filter((size) => size < Math.max(5, landCells * 0.003)).reduce((sum, size) => sum + size, 0);
+  const desiredCoast = 11.5;
+  const clearancePenalty = Math.max(0, 0.072 - minimumEdgeDistance) * 115;
+  const score = 26
+    - Math.abs(meaningful.length - targetComponents) * 4.2
+    - Math.max(0, largestShare - 0.68) * 25
+    - Math.abs(coastlineIndex - desiredCoast) * 0.65
+    - (tinyCells / Math.max(1, landCells)) * 35
+    - clearancePenalty;
+  return { score, coastlineIndex, meaningfulComponents: meaningful.length, frameClearance: minimumEdgeDistance };
 }
 
-function createCoastModel(seed: number, size: number, detail: number, aspect: number) {
-  let best = buildCoastCandidate(seed, 0, size, detail, aspect);
-  for (let attempt = 1; attempt < 3; attempt += 1) {
-    const candidate = buildCoastCandidate(seed, attempt, size, detail, aspect);
+function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, settings: WorldSettings): TerrainCandidate {
+  const random = makeRandom(seed ^ Math.imul(attempt + 1, 0x9e3779b1));
+  const plateCount = 20 + Math.floor(random() * 7);
+  const sites = choosePlateSites(mesh, random, plateCount);
+  const plates: Plate[] = sites.map((siteCell, id) => {
+    const angle = random() * TAU;
+    return {
+      id,
+      siteCell,
+      x: mesh.x[siteCell],
+      y: mesh.y[siteCell],
+      weight: 0.86 + random() * 0.28,
+      vx: Math.cos(angle) * (0.35 + random() * 0.65),
+      vy: Math.sin(angle) * (0.35 + random() * 0.65),
+      continental: false,
+      crustBias: 0,
+    };
+  });
+  const plateId = assignPlateOwnership(mesh, plates);
+  const adjacency = buildPlateAdjacency(mesh, plateId, plateCount);
+  const targetLand = mix(0.16, 0.47, settings.continentSize / 100);
+  assignContinentalClusters(plates, adjacency, random, targetLand);
+  for (const plate of plates) {
+    plate.crustBias = plate.continental ? 0.62 + random() * 0.25 : -0.62 - random() * 0.2;
+  }
+
+  const base = new Float32Array(mesh.cellCount);
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const plate = plates[plateId[cell]];
+    const distance = Math.hypot(mesh.x[cell] - plate.x, mesh.y[cell] - plate.y);
+    const interior = clamp(1 - distance / 0.34);
+    const nx = mesh.x[cell] / mesh.aspect;
+    const ny = mesh.y[cell];
+    const macro = fbm(nx * 2.7 + attempt * 9, ny * 2.7 - attempt * 7, seed + 101, 4) - 0.5;
+    const regional = fbm(nx * 7.6 - 4, ny * 7.6 + 3, seed + 149, 4) - 0.5;
+    const coastAmplitude = mix(0.08, 0.23, settings.coastDetail / 100);
+    const edge = Math.min(nx, 1 - nx, ny, 1 - ny);
+    const edgePenalty = edge < 0.13 ? Math.pow((0.13 - edge) / 0.13, 1.55) * 1.85 : 0;
+    base[cell] = plate.crustBias
+      + (plate.continental ? interior * 0.14 : -interior * 0.08)
+      + macro * 0.34
+      + regional * coastAmplitude
+      - edgePenalty;
+    if (edge <= FRAME_OCEAN_MARGIN || mesh.boundary[cell]) base[cell] = -3.5;
+  }
+  const potential = smoothGraphField(mesh, base, 5, 0.64);
+  const eligiblePotential: number[] = [];
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const nx = mesh.x[cell] / mesh.aspect;
+    const edge = Math.min(nx, 1 - nx, mesh.y[cell], 1 - mesh.y[cell]);
+    if (edge > FRAME_OCEAN_MARGIN && !mesh.boundary[cell]) eligiblePotential.push(potential[cell]);
+  }
+  const targetEligibleFraction = clamp((targetLand * mesh.cellCount) / Math.max(1, eligiblePotential.length), 0, 0.92);
+  const seaLevel = selectThreshold(Float32Array.from(eligiblePotential), targetEligibleFraction);
+  const landMask = new Uint8Array(mesh.cellCount);
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const nx = mesh.x[cell] / mesh.aspect;
+    const edge = Math.min(nx, 1 - nx, mesh.y[cell], 1 - mesh.y[cell]);
+    landMask[cell] = potential[cell] > seaLevel && edge > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] ? 1 : 0;
+  }
+
+  const convergence = propagateBoundaryField(mesh, plateId, plates, true);
+  const divergence = propagateBoundaryField(mesh, plateId, plates, false);
+  const ridge = new Float32Array(mesh.cellCount);
+  const elevation = new Float32Array(mesh.cellCount);
+  let minPotential = Number.POSITIVE_INFINITY;
+  let maxPotential = Number.NEGATIVE_INFINITY;
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    minPotential = Math.min(minPotential, potential[cell]);
+    maxPotential = Math.max(maxPotential, potential[cell]);
+  }
+  const tectonicAmount = mix(0.25, 0.9, settings.tectonics / 100);
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const nx = mesh.x[cell] / mesh.aspect;
+    const ny = mesh.y[cell];
+    const convergentInfluence = Number.isFinite(convergence.distance[cell])
+      ? Math.exp(-convergence.distance[cell] / 0.034) * convergence.strength[cell]
+      : 0;
+    const divergentInfluence = Number.isFinite(divergence.distance[cell])
+      ? Math.exp(-divergence.distance[cell] / 0.025) * divergence.strength[cell]
+      : 0;
+    ridge[cell] = convergentInfluence * mix(0.48, 1, ridgedNoise(nx * 21, ny * 21, seed + 241));
+    if (landMask[cell]) {
+      const relative = clamp((potential[cell] - seaLevel) / Math.max(0.001, maxPotential - seaLevel));
+      const hills = (fbm(nx * 12 + 8, ny * 12 - 5, seed + 269, 5) - 0.5) * 0.105;
+      const fractured = Math.max(0, ridgedNoise(nx * 27, ny * 27, seed + 293) - 0.62) * 0.065;
+      elevation[cell] = 0.008 + Math.pow(relative, 0.68) * 0.38 + hills + fractured
+        + ridge[cell] * tectonicAmount * 0.72
+        - divergentInfluence * tectonicAmount * 0.12;
+      elevation[cell] = Math.max(0.003, elevation[cell]);
+    } else {
+      const relative = clamp((seaLevel - potential[cell]) / Math.max(0.001, seaLevel - minPotential));
+      elevation[cell] = -0.012 - Math.pow(relative, 0.72) * 0.64 - divergentInfluence * tectonicAmount * 0.08;
+    }
+  }
+
+  const measured = measureTerrain(mesh, landMask, 4);
+  return {
+    plates,
+    plateId,
+    potential,
+    elevation,
+    landMask,
+    ridge,
+    score: measured.score,
+    coastlineIndex: measured.coastlineIndex,
+    frameClearance: measured.frameClearance,
+  };
+}
+
+function thermalErodeGraph(mesh: GraphMesh, elevation: Float32Array, landMask: Uint8Array, passes: number) {
+  const delta = new Float32Array(mesh.cellCount);
+  for (let pass = 0; pass < passes; pass += 1) {
+    delta.fill(0);
+    for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+      if (!landMask[cell]) continue;
+      let lowest = -1;
+      let lowestHeight = elevation[cell];
+      for (let cursor = mesh.neighborOffsets[cell]; cursor < mesh.neighborOffsets[cell + 1]; cursor += 1) {
+        const neighbor = mesh.neighbors[cursor];
+        if (landMask[neighbor] && elevation[neighbor] < lowestHeight) {
+          lowest = neighbor;
+          lowestHeight = elevation[neighbor];
+        }
+      }
+      const difference = elevation[cell] - lowestHeight;
+      if (lowest >= 0 && difference > 0.075) {
+        const transfer = (difference - 0.075) * 0.16;
+        delta[cell] -= transfer;
+        delta[lowest] += transfer;
+      }
+    }
+    for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+      if (landMask[cell]) elevation[cell] = Math.max(0.003, elevation[cell] + delta[cell]);
+    }
+  }
+}
+
+function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettings) {
+  let best = buildTerrainCandidate(mesh, seed, 0, settings);
+  for (let attempt = 1; attempt < 5; attempt += 1) {
+    const candidate = buildTerrainCandidate(mesh, seed, attempt, settings);
     if (candidate.score > best.score) best = candidate;
   }
+  thermalErodeGraph(mesh, best.elevation, best.landMask, 2);
   return best;
 }
 
-function sampleGrid(field: Float32Array, width: number, height: number, x: number, y: number) {
-  const px = clamp(x) * (width - 1);
-  const py = clamp(y) * (height - 1);
-  const x0 = Math.floor(px);
-  const y0 = Math.floor(py);
-  const x1 = Math.min(width - 1, x0 + 1);
-  const y1 = Math.min(height - 1, y0 + 1);
-  const fx = smoothstep(px - x0);
-  const fy = smoothstep(py - y0);
-  return mix(mix(field[y0 * width + x0], field[y0 * width + x1], fx), mix(field[y1 * width + x0], field[y1 * width + x1], fx), fy);
-}
-
-function coastField(x: number, y: number, model: CoastModel, detail: number, seed: number) {
-  const warpStrength = mix(0.003, 0.018, detail / 100);
-  const warpedX = x + (fbm(x * 2.8 + 29, y * 2.8, seed + 193, 3) - 0.5) * warpStrength * 2;
-  const warpedY = y + (fbm(x * 2.8, y * 2.8 - 29, seed + 199, 3) - 0.5) * warpStrength * 2;
-  const base = sampleGrid(model.signedDistance, model.width, model.height, warpedX, warpedY);
-  const macro = fbm(x * 5.4 + 13, y * 5.4 - 9, seed + 211, 4) - 0.5;
-  const coves = fbm(x * 18.5 - 5, y * 18.5 + 7, seed + 239, 3) - 0.5;
-  const grain = ridgedNoise(x * 31, y * 31, seed + 251) - 0.5;
-  const amplitude = mix(1.15, 4.2, detail / 100) * (model.width / 196);
-  const coastalEnvelope = Math.exp(-Math.abs(base) * 0.24);
-  return base + (macro * amplitude + coves * amplitude * 0.62 + grain * amplitude * 0.24) * coastalEnvelope;
-}
-
-function createPlates(random: () => number, count: number) {
-  const plates: Plate[] = [];
-  for (let index = 0; index < count; index += 1) {
-    const angle = random() * TAU;
-    const speed = 0.25 + random() * 0.75;
-    plates.push({
-      x: random(),
-      y: random(),
-      vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
-      oceanic: random() > 0.46,
-    });
-  }
-  return plates;
-}
-
-function plateUplift(x: number, y: number, plates: Plate[], amount: number, seed: number) {
-  const warpX = (fbm(x * 2.1 + 17, y * 2.1, seed + 281, 3) - 0.5) * 0.13;
-  const warpY = (fbm(x * 2.1, y * 2.1 + 17, seed + 307, 3) - 0.5) * 0.13;
-  const px = x + warpX;
-  const py = y + warpY;
-  let first = 0;
-  let second = 1;
-  let firstDistance = Number.POSITIVE_INFINITY;
-  let secondDistance = Number.POSITIVE_INFINITY;
-  for (let index = 0; index < plates.length; index += 1) {
-    const dx = px - plates[index].x;
-    const dy = py - plates[index].y;
-    const distance = dx * dx + dy * dy;
-    if (distance < firstDistance) {
-      secondDistance = firstDistance;
-      second = first;
-      firstDistance = distance;
-      first = index;
-    } else if (distance < secondDistance) {
-      secondDistance = distance;
-      second = index;
-    }
-  }
-  const a = plates[first];
-  const b = plates[second];
-  const length = Math.hypot(b.x - a.x, b.y - a.y) || 1;
-  const nx = (b.x - a.x) / length;
-  const ny = (b.y - a.y) / length;
-  const convergence = Math.max(0, (a.vx - b.vx) * nx + (a.vy - b.vy) * ny);
-  const boundary = Math.exp(-Math.abs(Math.sqrt(secondDistance) - Math.sqrt(firstDistance)) * 62);
-  const ridge = ridgedNoise(x * 16, y * 16, seed + 331);
-  const continentalCollision = a.oceanic === b.oceanic ? 0.76 : 1.08;
-  return boundary * convergence * ridge * continentalCollision * amount;
-}
-
-function rangeUplift(x: number, y: number, continents: ContinentPlan[], amount: number, seed: number) {
-  const warpX = (fbm(x * 8.5 + 4, y * 8.5, seed + 353, 3) - 0.5) * 0.028;
-  const warpY = (fbm(x * 8.5, y * 8.5 - 4, seed + 379, 3) - 0.5) * 0.028;
-  let strongest = 0;
-  for (const continent of continents) {
-    for (const range of continent.ranges) {
-      let distance = Number.POSITIVE_INFINITY;
-      for (let index = 1; index < range.points.length; index += 1) {
-        distance = Math.min(distance, pointSegmentDistance(x + warpX, y + warpY, range.points[index - 1], range.points[index]));
-      }
-      const profile = Math.exp(-Math.pow(distance / range.width, 1.38) * 1.7);
-      strongest = Math.max(strongest, profile * range.strength);
-    }
-  }
-  const ridgeTexture = mix(0.46, 1, ridgedNoise(x * 27, y * 27, seed + 401));
-  const peakBreakup = mix(0.72, 1.08, fbm(x * 43, y * 43, seed + 419, 3));
-  return strongest * ridgeTexture * peakBreakup * amount;
-}
-
-function thermalErode(heightMap: Float32Array, width: number, height: number, iterations: number) {
-  const delta = new Float32Array(heightMap.length);
-  for (let iteration = 0; iteration < iterations; iteration += 1) {
-    delta.fill(0);
-    for (let y = 1; y < height - 1; y += 1) {
-      for (let x = 1; x < width - 1; x += 1) {
-        const index = y * width + x;
-        const elevation = heightMap[index];
-        if (elevation <= 0.006) continue;
-        let lowest = index;
-        let lowestHeight = elevation;
-        for (const [dx, dy] of NEIGHBORS) {
-          const next = (y + dy) * width + x + dx;
-          const nextHeight = heightMap[next];
-          if (nextHeight > 0.004 && nextHeight < lowestHeight) {
-            lowest = next;
-            lowestHeight = nextHeight;
-          }
-        }
-        const difference = elevation - lowestHeight;
-        const talus = 0.018;
-        if (lowest !== index && difference > talus) {
-          const transfer = (difference - talus) * 0.16;
-          delta[index] -= transfer;
-          delta[lowest] += transfer;
-        }
-      }
-    }
-    for (let index = 0; index < heightMap.length; index += 1) {
-      if (heightMap[index] > 0) heightMap[index] = Math.max(0.002, heightMap[index] + delta[index]);
-    }
-  }
-}
-
-function createClimate(heightMap: Float32Array, width: number, height: number, moistureSetting: number, seed: number) {
-  const moistureMap = new Float32Array(heightMap.length);
-  const temperatureMap = new Float32Array(heightMap.length);
-  const globalWetness = (moistureSetting - 50) / 115;
-  const eastward = (seed & 1) === 0;
-
-  for (let y = 0; y < height; y += 1) {
-    const ny = y / Math.max(1, height - 1);
-    const latitude = Math.abs(ny - 0.5) * 2;
-    let humidity = clamp(0.62 + globalWetness + (hash(y, seed & 1023, seed + 431) - 0.5) * 0.18);
-    let previousElevation = 0;
-    for (let step = 0; step < width; step += 1) {
-      const x = eastward ? step : width - 1 - step;
-      const nx = x / Math.max(1, width - 1);
-      const index = y * width + x;
-      const elevation = heightMap[index];
-      temperatureMap[index] = clamp(1 - latitude * 0.9 - Math.max(0, elevation) * 0.64 + (fbm(nx * 3.2, ny * 3.2, seed + 449, 3) - 0.5) * 0.12);
-      if (elevation <= 0) {
-        humidity = Math.max(humidity, 0.78 - latitude * 0.08);
-        moistureMap[index] = 1;
-        previousElevation = 0;
-        continue;
-      }
-      const rise = Math.max(0, elevation - previousElevation);
-      const orographicRain = humidity * clamp(0.12 + rise * 4.8, 0.12, 0.88);
-      const convection = (0.035 + (1 - latitude) * 0.055) * humidity;
-      const wetTexture = fbm(nx * 6.2 + 20, ny * 6.2 - 8, seed + 467, 4);
-      moistureMap[index] = clamp(orographicRain * 1.55 + convection + wetTexture * 0.31 + globalWetness);
-      humidity = clamp(humidity - orographicRain * 0.32 - Math.max(0, previousElevation - elevation) * 0.08 + 0.008);
-      previousElevation = elevation;
-    }
-  }
-  return { moistureMap, temperatureMap };
-}
-
-function routeRivers(heightMap: Float32Array, moistureMap: Float32Array, width: number, height: number, moisture: number) {
-  const stride = 3;
-  const hydroWidth = Math.ceil(width / stride);
-  const hydroHeight = Math.ceil(height / stride);
-  const length = hydroWidth * hydroHeight;
-  const terrain = new Float32Array(length);
-  const filled = new Float32Array(length);
-  const receiver = new Int32Array(length).fill(-1);
-  const visited = new Uint8Array(length);
-  const accumulation = new Float32Array(length);
+function routeGraphRivers(mesh: GraphMesh, terrain: TerrainCandidate, settings: WorldSettings, seed: number) {
+  const filled = terrain.elevation.slice();
+  const receiver = new Int32Array(mesh.cellCount).fill(-1);
+  const visited = new Uint8Array(mesh.cellCount);
+  const accumulation = new Float32Array(mesh.cellCount);
   const heap = new MinHeap();
-
-  for (let y = 0; y < hydroHeight; y += 1) {
-    for (let x = 0; x < hydroWidth; x += 1) {
-      const index = y * hydroWidth + x;
-      const sourceX = Math.min(width - 1, x * stride + 2);
-      const sourceY = Math.min(height - 1, y * stride + 2);
-      const sourceIndex = sourceY * width + sourceX;
-      terrain[index] = heightMap[sourceIndex];
-      filled[index] = terrain[index];
-      accumulation[index] = terrain[index] > 0 ? 0.38 + moistureMap[sourceIndex] * 1.42 : 0;
-      if (terrain[index] <= 0 || x === 0 || y === 0 || x === hydroWidth - 1 || y === hydroHeight - 1) {
-        visited[index] = 1;
-        heap.push({ index, priority: terrain[index] });
-      }
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const nx = mesh.x[cell] / mesh.aspect;
+    const ny = mesh.y[cell];
+    accumulation[cell] = terrain.landMask[cell]
+      ? 0.42 + clamp(fbm(nx * 5.3 + 17, ny * 5.3 - 11, seed + 347, 4) + (settings.moisture - 50) / 90) * 1.35
+      : 0;
+    if (!terrain.landMask[cell] || mesh.boundary[cell]) {
+      visited[cell] = 1;
+      heap.push({ index: cell, priority: terrain.elevation[cell] });
     }
   }
-
   while (heap.size) {
     const current = heap.pop()!;
-    const cx = current.index % hydroWidth;
-    const cy = Math.floor(current.index / hydroWidth);
-    for (const [dx, dy] of NEIGHBORS) {
-      const nx = cx + dx;
-      const ny = cy + dy;
-      if (nx < 0 || ny < 0 || nx >= hydroWidth || ny >= hydroHeight) continue;
-      const next = ny * hydroWidth + nx;
-      if (visited[next]) continue;
-      visited[next] = 1;
-      receiver[next] = current.index;
-      filled[next] = Math.max(terrain[next], current.priority + 0.00001);
-      heap.push({ index: next, priority: filled[next] });
+    for (let cursor = mesh.neighborOffsets[current.index]; cursor < mesh.neighborOffsets[current.index + 1]; cursor += 1) {
+      const neighbor = mesh.neighbors[cursor];
+      if (visited[neighbor]) continue;
+      visited[neighbor] = 1;
+      receiver[neighbor] = current.index;
+      filled[neighbor] = Math.max(terrain.elevation[neighbor], current.priority + 1e-6);
+      heap.push({ index: neighbor, priority: filled[neighbor] });
     }
   }
-
-  const land = Array.from({ length }, (_, index) => index)
-    .filter((index) => terrain[index] > 0)
-    .sort((a, b) => filled[b] - filled[a]);
-  for (const index of land) {
-    const target = receiver[index];
-    if (target >= 0) accumulation[target] += accumulation[index];
+  const order = Array.from({ length: mesh.cellCount }, (_, index) => index)
+    .filter((cell) => terrain.landMask[cell])
+    .sort((a, b) => filled[b] - filled[a] || b - a);
+  for (const cell of order) {
+    const target = receiver[cell];
+    if (target >= 0) accumulation[target] += accumulation[cell];
   }
-
-  const mask = new Uint8Array(width * height);
+  const threshold = mesh.cellCount * mix(0.0052, 0.0024, settings.moisture / 100);
+  const river = new Uint8Array(mesh.cellCount);
+  for (const cell of order) {
+    if (accumulation[cell] >= threshold && terrain.elevation[cell] > 0.012) river[cell] = 1;
+  }
   let riverCount = 0;
-  const threshold = mix(158, 68, moisture / 100);
-  const cellPoint = (x: number, y: number) => ({
-    x: x * stride + stride / 2 + (hash(x, y, 701) - 0.5) * stride * 0.72,
-    y: y * stride + stride / 2 + (hash(x, y, 733) - 0.5) * stride * 0.72,
-  });
-  const drawLine = (x0: number, y0: number, x1: number, y1: number, strength: number) => {
-    const steps = Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0), 1);
-    const radius = strength > 820 ? 2 : strength > 290 ? 1 : 0;
+  for (const cell of order) {
+    if (!river[cell]) continue;
+    let hasRiverInflow = false;
+    for (let cursor = mesh.neighborOffsets[cell]; cursor < mesh.neighborOffsets[cell + 1]; cursor += 1) {
+      const neighbor = mesh.neighbors[cursor];
+      if (receiver[neighbor] === cell && river[neighbor]) {
+        hasRiverInflow = true;
+        break;
+      }
+    }
+    if (!hasRiverInflow) riverCount += 1;
+    terrain.elevation[cell] = Math.max(0.003, terrain.elevation[cell] - clamp(Math.log2(accumulation[cell] / threshold + 1) * 0.012, 0.004, 0.035));
+  }
+  return { receiver, accumulation, river, threshold, riverCount };
+}
+
+function rasterizeTriangles(mesh: GraphMesh, values: Float32Array, width: number, height: number) {
+  const output = new Float32Array(width * height);
+  output.fill(Number.NaN);
+  for (let triangle = 0; triangle < mesh.triangles.length; triangle += 3) {
+    const ia = mesh.triangles[triangle];
+    const ib = mesh.triangles[triangle + 1];
+    const ic = mesh.triangles[triangle + 2];
+    const ax = (mesh.x[ia] / mesh.aspect) * (width - 1);
+    const ay = mesh.y[ia] * (height - 1);
+    const bx = (mesh.x[ib] / mesh.aspect) * (width - 1);
+    const by = mesh.y[ib] * (height - 1);
+    const cx = (mesh.x[ic] / mesh.aspect) * (width - 1);
+    const cy = mesh.y[ic] * (height - 1);
+    const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)));
+    const maxX = Math.min(width - 1, Math.ceil(Math.max(ax, bx, cx)));
+    const minY = Math.max(0, Math.floor(Math.min(ay, by, cy)));
+    const maxY = Math.min(height - 1, Math.ceil(Math.max(ay, by, cy)));
+    const denominator = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if (Math.abs(denominator) < 1e-9) continue;
+    for (let y = minY; y <= maxY; y += 1) {
+      for (let x = minX; x <= maxX; x += 1) {
+        const wa = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / denominator;
+        const wb = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / denominator;
+        const wc = 1 - wa - wb;
+        if (wa < -1e-5 || wb < -1e-5 || wc < -1e-5) continue;
+        output[y * width + x] = values[ia] * wa + values[ib] * wb + values[ic] * wc;
+      }
+    }
+  }
+  for (let index = 0; index < output.length; index += 1) if (!Number.isFinite(output[index])) output[index] = -0.7;
+  return output;
+}
+
+function drawRiverMask(
+  mesh: GraphMesh,
+  routing: ReturnType<typeof routeGraphRivers>,
+  width: number,
+  height: number,
+) {
+  const mask = new Uint8Array(width * height);
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    if (!routing.river[cell]) continue;
+    const target = routing.receiver[cell];
+    if (target < 0) continue;
+    const x0 = (mesh.x[cell] / mesh.aspect) * (width - 1);
+    const y0 = mesh.y[cell] * (height - 1);
+    const x1 = (mesh.x[target] / mesh.aspect) * (width - 1);
+    const y1 = mesh.y[target] * (height - 1);
+    const steps = Math.max(1, Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))));
+    const strength = routing.accumulation[cell] / routing.threshold;
+    const radius = strength > 7 ? 2 : strength > 2.4 ? 1 : 0;
+    const alpha = Math.min(220, 75 + Math.log2(strength + 1) * 42);
     for (let step = 0; step <= steps; step += 1) {
-      const x = Math.round(mix(x0, x1, step / steps));
-      const y = Math.round(mix(y0, y1, step / steps));
+      const t = step / steps;
+      const x = Math.round(mix(x0, x1, t));
+      const y = Math.round(mix(y0, y1, t));
       for (let oy = -radius; oy <= radius; oy += 1) {
         for (let ox = -radius; ox <= radius; ox += 1) {
           const px = x + ox;
           const py = y + oy;
-          if (px >= 0 && py >= 0 && px < width && py < height) {
-            const value = Math.min(218, 42 + Math.log2(strength) * 14);
-            mask[py * width + px] = Math.max(mask[py * width + px], value);
-          }
-        }
-      }
-    }
-  };
-
-  for (const index of land) {
-    const target = receiver[index];
-    if (target < 0 || accumulation[index] < threshold || terrain[index] < 0.012) continue;
-    const x = index % hydroWidth;
-    const y = Math.floor(index / hydroWidth);
-    const tx = target % hydroWidth;
-    const ty = Math.floor(target / hydroWidth);
-    const sourcePoint = cellPoint(x, y);
-    const targetPoint = cellPoint(tx, ty);
-    drawLine(sourcePoint.x, sourcePoint.y, targetPoint.x, targetPoint.y, accumulation[index]);
-    if (accumulation[index] < threshold * 1.28) riverCount += 1;
-  }
-  return { mask, riverCount: Math.max(0, Math.round(riverCount / 2.25)) };
-}
-
-function carveRiverValleys(heightMap: Float32Array, riverMask: Uint8Array, width: number, height: number) {
-  const original = heightMap.slice();
-  for (let y = 1; y < height - 1; y += 1) {
-    for (let x = 1; x < width - 1; x += 1) {
-      const index = y * width + x;
-      if (!riverMask[index] || original[index] <= 0.006) continue;
-      const depth = (riverMask[index] / 255) * 0.026;
-      for (let oy = -2; oy <= 2; oy += 1) {
-        for (let ox = -2; ox <= 2; ox += 1) {
-          const distance = Math.hypot(ox, oy);
-          if (distance > 2.25) continue;
-          const target = (y + oy) * width + x + ox;
-          if (original[target] > 0) heightMap[target] = Math.max(0.002, heightMap[target] - depth * (1 - distance / 2.5));
+          if (px >= 0 && py >= 0 && px < width && py < height) mask[py * width + px] = Math.max(mask[py * width + px], alpha);
         }
       }
     }
   }
-}
-
-function chooseWorldName(random: () => number) {
-  const first = ["Verdant", "Aurelian", "Sable", "Stormward", "Elder", "Thorn", "Ivory", "Cerulean", "Ashen", "Ember"];
-  const second = ["Reach", "Expanse", "Marches", "Wilds", "Dominion", "Coast", "Crown", "Basin", "Isles", "Meridian"];
-  return `The ${first[Math.floor(random() * first.length)]} ${second[Math.floor(random() * second.length)]}`;
+  return mask;
 }
 
 function hillshade(heightMap: Float32Array, width: number, height: number, x: number, y: number) {
@@ -788,118 +838,78 @@ function hillshade(heightMap: Float32Array, width: number, height: number, x: nu
   const br = heightMap[y1 * width + x1];
   const dzdx = (tr + right * 2 + br - tl - left * 2 - bl) / 8;
   const dzdy = (bl + bottom * 2 + br - tl - top * 2 - tr) / 8;
-  const nx = -dzdx * 27;
-  const ny = -dzdy * 27;
-  const nz = 1;
-  const normalLength = Math.hypot(nx, ny, nz);
-  const light = (nx * -0.48 + ny * -0.42 + nz * 0.77) / normalLength;
-  const slope = Math.hypot(dzdx, dzdy) * 8;
-  return clamp(0.52 + light * 0.62 - slope * 0.22, 0.3, 1.34);
+  const nx = -dzdx * 24;
+  const ny = -dzdy * 24;
+  const normalLength = Math.hypot(nx, ny, 1);
+  const light = (nx * -0.48 + ny * -0.42 + 0.77) / normalLength;
+  return clamp(0.54 + light * 0.58 - Math.hypot(dzdx, dzdy) * 1.2, 0.3, 1.32);
 }
 
 function satelliteLandColor(elevation: number, temperature: number, moisture: number): [number, number, number] {
-  const green = smoothstep((moisture - 0.27) / 0.48);
-  const cool = smoothstep((0.42 - temperature) / 0.38);
-  const dry: [number, number, number] = temperature > 0.58 ? [164, 139, 86] : [132, 122, 88];
-  const forest: [number, number, number] = temperature > 0.5 ? [37, 79, 45] : [55, 82, 53];
-  let color: [number, number, number] = [
-    mix(dry[0], forest[0], green),
-    mix(dry[1], forest[1], green),
-    mix(dry[2], forest[2], green),
-  ];
-  color = [mix(color[0], 108, cool * 0.55), mix(color[1], 115, cool * 0.55), mix(color[2], 91, cool * 0.55)];
-  const rock = smoothstep((elevation - 0.42) / 0.3);
+  const green = smoothstep((moisture - 0.26) / 0.5);
+  const cool = smoothstep((0.38 - temperature) / 0.36);
+  const dry: [number, number, number] = temperature > 0.58 ? [162, 139, 88] : [129, 121, 89];
+  const forest: [number, number, number] = temperature > 0.5 ? [36, 78, 44] : [54, 82, 54];
+  let color: [number, number, number] = [mix(dry[0], forest[0], green), mix(dry[1], forest[1], green), mix(dry[2], forest[2], green)];
+  color = [mix(color[0], 108, cool * 0.5), mix(color[1], 115, cool * 0.5), mix(color[2], 92, cool * 0.5)];
+  const rock = smoothstep((elevation - 0.43) / 0.28);
   color = [mix(color[0], 122, rock), mix(color[1], 118, rock), mix(color[2], 104, rock)];
-  const snow = smoothstep((elevation - mix(0.72, 0.45, cool)) / 0.11) * smoothstep((0.38 - temperature) / 0.28);
-  return [mix(color[0], 207, snow), mix(color[1], 212, snow), mix(color[2], 205, snow)];
+  const snow = smoothstep((elevation - mix(0.76, 0.48, cool)) / 0.11) * smoothstep((0.4 - temperature) / 0.3);
+  return [mix(color[0], 208, snow), mix(color[1], 213, snow), mix(color[2], 207, snow)];
 }
 
-export function generateWorld(settings: WorldSettings, onProgress?: (stage: string, progress: number) => void): WorldResult {
-  const started = performance.now();
+function renderWorld(
+  heightMap: Float32Array,
+  riverMask: Uint8Array,
+  settings: WorldSettings,
+  seed: number,
+) {
   const { width, height } = settings;
-  const seed = seedToInt(settings.seed || "ATLAS");
-  const random = makeRandom(seed);
-  const plateCount = 10 + Math.floor(random() * 5);
-  onProgress?.("Selecting continental structure", 9);
-  const coastModel = createCoastModel(seed, settings.continentSize, settings.coastDetail, width / height);
-  const plates = createPlates(random, plateCount);
-  const heightMap = new Float32Array(width * height);
-  onProgress?.("Growing fractured continental crust", 27);
-
+  const pixels = new Uint8ClampedArray(width * height * 4);
   let landPixels = 0;
   for (let y = 0; y < height; y += 1) {
     const ny = y / Math.max(1, height - 1);
+    const latitude = Math.abs(ny - 0.5) * 2;
     for (let x = 0; x < width; x += 1) {
       const nx = x / Math.max(1, width - 1);
-      const coast = coastField(nx, ny, coastModel, settings.coastDetail, seed);
-      let elevation: number;
-      if (coast > 0) {
-        const inlandness = clamp(coast / (coastModel.width * 0.092));
-        const hills = (fbm(nx * 9.5 + 3, ny * 9.5 - 2, seed + 487, 5) - 0.5) * (0.058 + inlandness * 0.1);
-        const rollingRelief = Math.max(0, ridgedNoise(nx * 15, ny * 15, seed + 509) - 0.61) * 0.078;
-        const fineRelief = (ridgedNoise(nx * 38, ny * 38, seed + 523) - 0.56) * 0.018 * inlandness;
-        elevation = 0.008 + Math.pow(inlandness, 0.72) * 0.31 + hills + rollingRelief + fineRelief;
-        const tectonicAmount = mix(0.16, 0.62, settings.tectonics / 100);
-        elevation += plateUplift(nx, ny, plates, tectonicAmount, seed) * 0.2;
-        elevation += rangeUplift(nx, ny, coastModel.continents, tectonicAmount, seed) * 0.94;
-        elevation = Math.max(0.002, elevation);
-        landPixels += 1;
-      } else {
-        const depth = clamp(-coast / (coastModel.width * 0.112));
-        const abyssTexture = (fbm(nx * 5.6, ny * 5.6, seed + 541, 3) - 0.5) * 0.055 * depth;
-        elevation = -0.012 - Math.pow(depth, 0.72) * 0.56 + abyssTexture;
-      }
-      heightMap[y * width + x] = elevation;
-    }
-  }
-
-  onProgress?.("Weathering mountain belts", 47);
-  thermalErode(heightMap, width, height, 2);
-  const climate = createClimate(heightMap, width, height, settings.moisture, seed);
-  onProgress?.("Filling basins and routing watersheds", 63);
-  const rivers = routeRivers(heightMap, climate.moistureMap, width, height, settings.moisture);
-  carveRiverValleys(heightMap, rivers.mask, width, height);
-  onProgress?.("Composing relief and biomes", 82);
-  const pixels = new Uint8ClampedArray(width * height * 4);
-
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
       const elevation = heightMap[index];
+      const temperature = clamp(1 - latitude * 0.88 - Math.max(0, elevation) * 0.62 + (fbm(nx * 3.1, ny * 3.1, seed + 401, 3) - 0.5) * 0.1);
+      const moisture = clamp(fbm(nx * 5.4 + 19, ny * 5.4 - 13, seed + 433, 5) * 0.78 + (settings.moisture - 50) / 95 + (1 - latitude) * 0.08);
       const shade = hillshade(heightMap, width, height, x, y);
-      const moisture = climate.moistureMap[index];
-      const temperature = climate.temperatureMap[index];
       let color: [number, number, number];
 
       if (settings.style === "ink") {
         if (elevation <= 0) {
-          const depth = clamp(-elevation * 2.2);
+          const depth = clamp(-elevation * 2.1);
           const contour = Math.abs(((-elevation * 30) % 1) - 0.5) < 0.04 ? 17 : 0;
           color = [82 - depth * 22 + contour, 116 - depth * 25 + contour, 119 - depth * 22 + contour];
         } else {
+          landPixels += 1;
           const contour = Math.abs(((elevation * 15) % 1) - 0.5) < 0.05 ? -25 : 0;
           const tint = moisture > 0.58 ? [177, 174, 126] : moisture < 0.34 ? [205, 179, 126] : [194, 184, 139];
           color = [tint[0] * shade + contour, tint[1] * shade + contour, tint[2] * shade + contour];
-          if (elevation < 0.009) color = [72, 70, 56];
+          if (elevation < 0.01) color = [72, 70, 56];
         }
       } else if (elevation <= 0) {
-        const depth = clamp(-elevation * 2.25);
-        const shelf = Math.exp(-Math.abs(elevation) * 20);
-        const texture = fbm(x / width * 20, y / height * 20, seed + 587, 3) - 0.5;
-        color = [mix(6, 20, shelf) + texture * 5, mix(26, 69, shelf) + texture * 8, mix(43, 82, shelf) + texture * 10];
+        const depth = clamp(-elevation * 2.2);
+        const shelf = Math.exp(-Math.abs(elevation) * 22);
+        const texture = fbm(nx * 20, ny * 20, seed + 461, 3) - 0.5;
+        color = [mix(6, 19, shelf) + texture * 5, mix(26, 68, shelf) + texture * 8, mix(43, 82, shelf) + texture * 10];
         color = [color[0] * mix(0.76, 1, 1 - depth), color[1] * mix(0.68, 1, 1 - depth), color[2] * mix(0.76, 1, 1 - depth)];
       } else {
+        landPixels += 1;
         color = elevation < 0.014 ? [177, 163, 111] : satelliteLandColor(elevation, temperature, moisture);
-        const vegetationTexture = (fbm(x / width * 34 + 5, y / height * 34 - 4, seed + 601, 3) - 0.5) * (moisture > 0.45 ? 14 : 8);
-        color = [color[0] * shade + vegetationTexture, color[1] * shade + vegetationTexture, color[2] * shade + vegetationTexture * 0.72];
+        const texture = (fbm(nx * 32 + 5, ny * 32 - 4, seed + 487, 3) - 0.5) * (moisture > 0.45 ? 13 : 8);
+        color = [color[0] * shade + texture, color[1] * shade + texture, color[2] * shade + texture * 0.72];
       }
 
-      if (rivers.mask[index] && elevation > 0.005) {
-        const riverBlend = rivers.mask[index] / 255;
-        const riverColor = settings.style === "ink" ? [45, 83, 89] : [19, 72, 91];
+      if (riverMask[index] && elevation > 0.004) {
+        const riverBlend = riverMask[index] / 255;
+        const riverColor = settings.style === "ink" ? [45, 83, 89] : [18, 72, 91];
         color = [mix(color[0], riverColor[0], riverBlend), mix(color[1], riverColor[1], riverBlend), mix(color[2], riverColor[2], riverBlend)];
       }
-      const grain = (hash(x, y, seed + 619) - 0.5) * (settings.style === "ink" ? 8 : 4.5);
+      const grain = (hash(x, y, seed + 509) - 0.5) * (settings.style === "ink" ? 8 : 4.5);
       const target = index * 4;
       pixels[target] = clamp(color[0] + grain, 0, 255);
       pixels[target + 1] = clamp(color[1] + grain, 0, 255);
@@ -907,21 +917,45 @@ export function generateWorld(settings: WorldSettings, onProgress?: (stage: stri
       pixels[target + 3] = 255;
     }
   }
+  return { pixels, landPixels };
+}
 
+function chooseWorldName(random: () => number) {
+  const first = ["Verdant", "Aurelian", "Sable", "Stormward", "Elder", "Thorn", "Ivory", "Cerulean", "Ashen", "Ember"];
+  const second = ["Reach", "Expanse", "Marches", "Wilds", "Dominion", "Coast", "Crown", "Basin", "Isles", "Meridian"];
+  return `The ${first[Math.floor(random() * first.length)]} ${second[Math.floor(random() * second.length)]}`;
+}
+
+export function generateWorld(settings: WorldSettings, onProgress?: (stage: string, progress: number) => void): WorldResult {
+  const started = performance.now();
+  const seed = seedToInt(settings.seed || "ATLAS");
+  onProgress?.("Sampling the planetary mesh", 10);
+  const mesh = buildGraphMesh(seed, settings.width, settings.height);
+  onProgress?.("Solving plate and crust regions", 28);
+  const terrain = createGraphTerrain(mesh, seed, settings);
+  onProgress?.("Conditioning graph drainage", 55);
+  const routing = routeGraphRivers(mesh, terrain, settings, seed);
+  onProgress?.("Interpolating Delaunay relief", 72);
+  const heightMap = rasterizeTriangles(mesh, terrain.elevation, settings.width, settings.height);
+  const riverMask = drawRiverMask(mesh, routing, settings.width, settings.height);
+  onProgress?.("Composing the satellite survey", 88);
+  const rendered = renderWorld(heightMap, riverMask, settings, seed);
   onProgress?.("Survey complete", 100);
-  const landPercent = Math.round((landPixels / (width * height)) * 100);
-  const survey = landPercent > 42 ? "Continental interior" : landPercent < 21 ? "Oceanic archipelago" : settings.moisture > 68 ? "Verdant continental shelf" : settings.moisture < 34 ? "Arid continental chain" : "Temperate broken continent";
+
+  const landPercent = Math.round((rendered.landPixels / (settings.width * settings.height)) * 100);
+  const survey = landPercent > 42 ? "Continental interior" : landPercent < 21 ? "Oceanic archipelago" : settings.moisture > 68 ? "Verdant plate mosaic" : settings.moisture < 34 ? "Arid rifted continents" : "Temperate plate mosaic";
   return {
-    pixels,
-    width,
-    height,
+    pixels: rendered.pixels,
+    width: settings.width,
+    height: settings.height,
     stats: {
-      name: chooseWorldName(random),
+      name: chooseWorldName(makeRandom(seed ^ 0xa7f17)),
       survey,
       landPercent,
-      plateCount,
-      riverCount: rivers.riverCount,
-      coastlineIndex: Math.round(coastModel.coastlineIndex * 10) / 10,
+      plateCount: terrain.plates.length,
+      riverCount: routing.riverCount,
+      coastlineIndex: Math.round(terrain.coastlineIndex * 10) / 10,
+      frameClearance: Math.round(terrain.frameClearance * 1000) / 10,
       generationMs: Math.round(performance.now() - started),
     },
   };
