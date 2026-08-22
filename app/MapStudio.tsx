@@ -21,6 +21,7 @@ const EMPTY_STATS: WorldStats = {
   landPercent: 0,
   plateCount: 0,
   riverCount: 0,
+  coastlineIndex: 0,
   generationMs: 0,
 };
 
@@ -179,7 +180,7 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isGenerating}>
             <span>{isGenerating ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isGenerating ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">Plate boundaries · elevation · watersheds · biomes</p>
+          <p className="generation-note">Crust growth · erosion · watersheds · biomes</p>
         </aside>
 
         <div className="map-stage">

@@ -4,10 +4,13 @@ Atlas Forge is a deterministic, browser-based fantasy world generator focused on
 
 ## Current milestone
 
-- Domain-warped, multi-craton continent construction
+- Cost-weighted crust growth on a high-resolution structural lattice
+- Candidate scoring for land coverage, connectedness, and coastline complexity
+- Coast-localized, multi-scale perturbation with bays and peninsula branches
 - Voronoi-style tectonic plates with convergent-boundary uplift
-- Priority-flood watershed routing and river accumulation
-- Latitude, elevation, moisture, and rain-shadow biome assignment
+- Curved mountain belts, thermal erosion, and flow-carved valleys
+- Priority-Flood watershed routing, rainfall-weighted accumulation, and rivers
+- Latitude, elevation, wind-order rainfall, and rain-shadow biome assignment
 - Satellite and hand-ink rendering from the same world model
 - Reproducible seeds, terrain controls, map zoom, and PNG export
 - Generation runs in a Web Worker to keep the interface responsive
