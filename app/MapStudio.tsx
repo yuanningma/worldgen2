@@ -36,6 +36,8 @@ const EMPTY_STATS: WorldStats = {
   islandSizeDiversity: 0,
   majorLandmassCount: 0,
   effectiveLandmassCount: 0,
+  landmassLatitudeDiversity: 0,
+  landmassSpacingIrregularity: 0,
   circumferenceKm: 0,
   focusLongitude: 0,
   generationMs: 0,
@@ -465,7 +467,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 10</span>
+            <span className="version">ALPHA 11</span>
           </div>
 
           <label className="seed-field">

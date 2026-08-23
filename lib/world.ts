@@ -34,6 +34,8 @@ export interface WorldStats {
   islandSizeDiversity: number;
   majorLandmassCount: number;
   effectiveLandmassCount: number;
+  landmassLatitudeDiversity: number;
+  landmassSpacingIrregularity: number;
   circumferenceKm: number;
   focusLongitude: number;
   generationMs: number;
@@ -84,8 +86,7 @@ interface TerrainCandidate {
   largestLandmassShare: number;
   oceanGapShare: number;
   meanLandmassElongation: number;
-  oceanCenter: number;
-  oceanWidth: number;
+  oceanBasin: OceanBasinPlan;
 }
 
 interface CoastPoint {
@@ -142,11 +143,19 @@ interface ContinentalSystemPlan {
   prominence: number;
 }
 
+interface OceanBasinPlan {
+  center: number;
+  width: number;
+  tilt: number;
+  meander: number;
+  phase: number;
+  widthPhase: number;
+}
+
 interface ContinentalAssignment {
   cluster: Int16Array;
   systems: ContinentalSystemPlan[];
-  oceanCenter: number;
-  oceanWidth: number;
+  oceanBasin: OceanBasinPlan;
 }
 
 export interface RasterTerrain {
@@ -164,6 +173,8 @@ export interface RasterTerrain {
   meaningfulLandmassCount: number;
   majorLandmassCount: number;
   effectiveLandmassCount: number;
+  landmassLatitudeDiversity: number;
+  landmassSpacingIrregularity: number;
   rockLevel: number;
   snowLevel: number;
 }
@@ -219,6 +230,23 @@ function planetScaleMetrics(settings: WorldSettings) {
     // leaving room for more independent plate provinces and ocean passages.
     featureScale: clamp(Math.pow(earthRatio, -0.78), 0.64, 1.34),
     plateMultiplier: clamp(Math.pow(earthRatio, 1.08), 0.72, 1.82),
+  };
+}
+
+function oceanBasinProfile(plan: OceanBasinPlan, latitude: number, aspect: number) {
+  const centeredLatitude = latitude - 0.5;
+  const primaryBend = Math.sin((latitude * 1.17 + plan.phase) * TAU);
+  const secondaryBend = Math.sin((latitude * 2.43 - plan.phase * 0.61) * TAU);
+  const center = wrap(
+    plan.center + plan.tilt * centeredLatitude + plan.meander * (primaryBend + secondaryBend * 0.34),
+    aspect,
+  );
+  const widthVariation = 1
+    + Math.sin((latitude * 1.31 + plan.widthPhase) * TAU) * 0.18
+    + Math.sin((latitude * 2.77 - plan.widthPhase * 0.73) * TAU) * 0.07;
+  return {
+    center,
+    halfWidth: plan.width * 0.5 * clamp(widthVariation, 0.72, 1.28),
   };
 }
 
@@ -589,23 +617,63 @@ function assignContinentalClusters(
   // sampling: neighboring systems can form an "Old World" family while another
   // remains isolated across a broad sea. The exact continent count still emerges
   // later when sea level cuts the continuous field.
-  const oceanCenter = random() * aspect;
-  const oceanWidth = clamp(mix(0.4, 0.66, random()) * mix(0.96, 1.12, planet.control), 0.38, 0.72);
-  const landCenter = wrap(oceanCenter + aspect * 0.5, aspect);
+  const oceanBasin: OceanBasinPlan = {
+    center: random() * aspect,
+    width: clamp(mix(0.4, 0.66, random()) * mix(0.96, 1.12, planet.control), 0.38, 0.72),
+    tilt: (random() - 0.5) * mix(0.16, 0.28, planet.control),
+    meander: mix(0.035, 0.085, random()) * mix(0.9, 1.18, planet.control),
+    phase: random(),
+    widthPhase: random(),
+  };
+  const landCenter = wrap(oceanBasin.center + aspect * 0.5, aspect);
   const provinceCount = rootCount >= 8 && random() < 0.74 ? 4 : rootCount >= 6 && random() < 0.82 ? 3 : 2;
-  const landArc = aspect - oceanWidth;
-  const provinceTemplate = provinceCount === 4
-    ? [-0.43, -0.15, 0.11, 0.39]
-    : provinceCount === 3 ? [-0.36, -0.03, 0.34] : [-0.23, 0.27];
-  const provinceOffsets = provinceTemplate.map((offset, index) => (
-    offset * landArc + (random() - 0.5) * (index % 2 ? 0.08 : 0.12)
+  const landArc = aspect - oceanBasin.width;
+
+  // Unequal Dirichlet-like gaps prevent the geographic provinces from landing
+  // on a regular longitude grid. One gap is deliberately widened and another
+  // tightened, producing an isolated continent plus a more closely related
+  // "Old World" family without prescribing the final number of landmasses.
+  const gapWeights = Array.from({ length: provinceCount + 1 }, () => (
+    0.22 + Math.pow(-Math.log(Math.max(0.025, random())), 1.18)
   ));
-  const latitudePattern = provinceCount === 4
-    ? [mix(0.25, 0.43, random()), mix(0.55, 0.74, random()), mix(0.29, 0.51, random()), mix(0.5, 0.71, random())]
-    : provinceCount === 3
-      ? [mix(0.3, 0.43, random()), mix(0.53, 0.68, random()), mix(0.34, 0.58, random())]
-      : [mix(0.28, 0.48, random()), mix(0.52, 0.72, random())];
-  if (random() < 0.5) latitudePattern.reverse();
+  const wideGap = 1 + Math.floor(random() * Math.max(1, provinceCount - 1));
+  gapWeights[wideGap] *= mix(1.65, 2.45, random());
+  const alternativeInternalGaps = Array.from({ length: Math.max(0, provinceCount - 1) }, (_, index) => index + 1)
+    .filter((gap) => gap !== wideGap);
+  const narrowGap = alternativeInternalGaps.length
+    ? alternativeInternalGaps[Math.floor(random() * alternativeInternalGaps.length)]
+    : (random() < 0.5 ? 0 : provinceCount);
+  gapWeights[narrowGap] *= mix(0.42, 0.68, random());
+  const totalGapWeight = gapWeights.reduce((sum, weight) => sum + weight, 0);
+  const occupiedArc = landArc * mix(0.78, 0.9, random());
+  let cursor = -occupiedArc * 0.5;
+  const provinceOffsets: number[] = [];
+  for (let province = 0; province < provinceCount; province += 1) {
+    cursor += occupiedArc * (gapWeights[province] / totalGapWeight);
+    provinceOffsets.push(cursor);
+  }
+
+  // Latitudes follow a slanted, low-frequency continental drift curve with a
+  // small independent offset. This produces staggered hemispheres and varied
+  // polar reach instead of the former alternating north/south rows.
+  const latitudeCenter = mix(0.36, 0.64, random());
+  const latitudeTrend = (random() - 0.5) * mix(0.34, 0.58, planet.control);
+  const latitudeWave = mix(0.08, 0.2, random());
+  const latitudePhase = random() * TAU;
+  const latitudePattern: number[] = [];
+  provinceOffsets.forEach((offset, index) => {
+    const normalizedOffset = offset / Math.max(0.001, occupiedArc * 0.5);
+    const curve = latitudeCenter
+      + latitudeTrend * normalizedOffset * 0.5
+      + Math.sin(latitudePhase + normalizedOffset * mix(1.15, 2.35, random())) * latitudeWave
+      + (random() - 0.5) * 0.13;
+    const previous = index > 0 ? latitudePattern[index - 1] : Number.NaN;
+    let latitude = clamp(curve, 0.14, 0.86);
+    if (Number.isFinite(previous) && Math.abs(latitude - previous) < 0.055) {
+      latitude = clamp(latitude + (random() < 0.5 ? -1 : 1) * mix(0.07, 0.14, random()), 0.14, 0.86);
+    }
+    latitudePattern.push(latitude);
+  });
   const provinceWeights = provinceCount === 4 ? [1.72, 1.18, 0.92, 0.68] : provinceCount === 3 ? [1.7, 1.08, 0.82] : [1.62, 1.08];
   if (random() < 0.38) provinceWeights[0] *= 1.22;
 
@@ -635,8 +703,11 @@ function assignContinentalClusters(
     const spread = siblings === 0
       ? mix(0.018, 0.058, random())
       : mix(0.11, 0.255, random()) * Math.pow(planet.featureScale, 0.35);
-    const targetX = wrap(landCenter + provinceOffsets[province] + Math.cos(angle) * spread, aspect);
-    const targetY = clamp(latitudePattern[province] + Math.sin(angle) * spread * mix(0.48, 0.8, random()), 0.14, 0.86);
+    const provisionalY = clamp(latitudePattern[province] + Math.sin(angle) * spread * mix(0.48, 0.8, random()), 0.14, 0.86);
+    const oceanAtLatitude = oceanBasinProfile(oceanBasin, provisionalY, aspect);
+    const oceanShift = periodicDelta(oceanBasin.center, oceanAtLatitude.center, aspect);
+    const targetX = wrap(landCenter + provinceOffsets[province] + oceanShift + Math.cos(angle) * spread, aspect);
+    const targetY = provisionalY;
     const prominence = id === 0
       ? mix(1.75, 2.15, random())
       : provinceWeights[province] * mix(0.72, 1.18, random());
@@ -722,7 +793,7 @@ function assignContinentalClusters(
     roundsWithoutGrowth = grew ? 0 : roundsWithoutGrowth + 1;
   }
   plates.forEach((plate) => { plate.continental = Boolean(continental[plate.id]); });
-  return { cluster, systems, oceanCenter, oceanWidth };
+  return { cluster, systems, oceanBasin };
 }
 
 function buildCrustComposition(
@@ -1456,8 +1527,9 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     const macro = periodicGradientFbm(nx + attempt * 0.137, ny - attempt * 0.091, 2.45, seed + 101, 4);
     const regional = periodicGradientFbm(nx - 0.23, ny + 0.19, 7.8, seed + 149, 4);
     const coastAmplitude = mix(0.07, 0.17, settings.coastDetail / 100);
-    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
-    const oceanHalfWidth = continentAssignment.oceanWidth * 0.5;
+    const oceanProfile = oceanBasinProfile(continentAssignment.oceanBasin, ny, mesh.aspect);
+    const oceanDistance = Math.abs(periodicDelta(oceanProfile.center, mesh.x[cell], mesh.aspect));
+    const oceanHalfWidth = oceanProfile.halfWidth;
     const oceanBasin = 1 - smoothstep((oceanDistance - oceanHalfWidth * 0.5) / Math.max(0.01, oceanHalfWidth * 0.78));
     const polarDistance = Math.min(ny, 1 - ny);
     const polarBand = 0.16;
@@ -1481,11 +1553,15 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   }
   const potential = smoothGraphField(mesh, base, 1, 0.84);
   const eligiblePotential: number[] = [];
-  const oceanReserveHalfWidth = continentAssignment.oceanWidth * mix(0.23, 0.31, planet.control);
+  const reservedOceanBasin: OceanBasinPlan = {
+    ...continentAssignment.oceanBasin,
+    width: continentAssignment.oceanBasin.width * mix(0.46, 0.62, planet.control),
+  };
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
-    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
-    if (polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] && oceanDistance > oceanReserveHalfWidth) {
+    const oceanProfile = oceanBasinProfile(reservedOceanBasin, mesh.y[cell], mesh.aspect);
+    const oceanDistance = Math.abs(periodicDelta(oceanProfile.center, mesh.x[cell], mesh.aspect));
+    if (polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] && oceanDistance > oceanProfile.halfWidth) {
       eligiblePotential.push(potential[cell]);
     }
   }
@@ -1494,9 +1570,10 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   const landMask = new Uint8Array(mesh.cellCount);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
-    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
+    const oceanProfile = oceanBasinProfile(reservedOceanBasin, mesh.y[cell], mesh.aspect);
+    const oceanDistance = Math.abs(periodicDelta(oceanProfile.center, mesh.x[cell], mesh.aspect));
     landMask[cell] = potential[cell] > seaLevel
-      && oceanDistance > oceanReserveHalfWidth
+      && oceanDistance > oceanProfile.halfWidth
       && polarDistance > FRAME_OCEAN_MARGIN
       && !mesh.boundary[cell] ? 1 : 0;
   }
@@ -1550,9 +1627,10 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   const sparseLandMask = new Uint8Array(mesh.cellCount);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
-    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
+    const oceanProfile = oceanBasinProfile(reservedOceanBasin, mesh.y[cell], mesh.aspect);
+    const oceanDistance = Math.abs(periodicDelta(oceanProfile.center, mesh.x[cell], mesh.aspect));
     sparseLandMask[cell] = potential[cell] > sparseThreshold
-      && oceanDistance > oceanReserveHalfWidth
+      && oceanDistance > oceanProfile.halfWidth
       && polarDistance > FRAME_OCEAN_MARGIN
       && !mesh.boundary[cell] ? 1 : 0;
   }
@@ -1581,8 +1659,7 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     largestLandmassShare: measured.largestLandmassShare,
     oceanGapShare: measured.oceanGapShare,
     meanLandmassElongation: measured.meanLandmassElongation,
-    oceanCenter: continentAssignment.oceanCenter,
-    oceanWidth: oceanReserveHalfWidth * 2,
+    oceanBasin: reservedOceanBasin,
   };
 }
 
@@ -1638,6 +1715,8 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
   const desiredEffectiveLands = mix(2.9, 6.2, planet.control);
   const largestLandmassTarget = mix(0.52, 0.34, planet.control);
   const desiredIslandArea = mix(1.8, 3.4, planet.control);
+  const desiredLatitudeDiversity = mix(0.46, 0.62, planet.control);
+  const desiredSpacingIrregularity = mix(0.32, 0.48, planet.control);
   let best = finalists[0];
   let bestVisualScore = Number.NEGATIVE_INFINITY;
   for (const candidate of finalists) {
@@ -1652,6 +1731,8 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
       - Math.max(0, desiredMajorLands - morphology.majorLandmassCount) * 6.4
       - Math.max(0, morphology.majorLandmassCount - desiredMajorLands - 2) * 2.1
       - Math.max(0, desiredEffectiveLands - morphology.effectiveLandmassCount) * 7.8
+      - Math.max(0, desiredLatitudeDiversity - morphology.landmassLatitudeDiversity) * 13.5
+      - Math.max(0, desiredSpacingIrregularity - morphology.landmassSpacingIrregularity) * 14.5
       - Math.max(0, desiredMajorLands + 1 - morphology.meaningfulLandmassCount) * 2.8;
     if (visualScore > bestVisualScore) {
       bestVisualScore = visualScore;
@@ -2232,15 +2313,28 @@ function coastlinePerimeterAtScale(coverage: Float32Array, width: number, height
   return perimeter;
 }
 
-function rasterLandmassAreas(coverage: Float32Array, width: number, height: number) {
+interface RasterLandmassComponent {
+  area: number;
+  minY: number;
+  maxY: number;
+  centerX: number;
+  centerY: number;
+}
+
+function rasterLandmassComponents(coverage: Float32Array, width: number, height: number) {
   const visited = new Uint8Array(coverage.length);
   const queue = new Uint32Array(coverage.length);
-  const areas: number[] = [];
+  const components: RasterLandmassComponent[] = [];
   for (let start = 0; start < coverage.length; start += 1) {
     if (coverage[start] <= 0.5 || visited[start]) continue;
     let head = 0;
     let tail = 0;
     let area = 0;
+    let sumY = 0;
+    let sumLongitudeX = 0;
+    let sumLongitudeY = 0;
+    let minY = height;
+    let maxY = 0;
     queue[tail++] = start;
     visited[start] = 1;
     while (head < tail) {
@@ -2248,6 +2342,12 @@ function rasterLandmassAreas(coverage: Float32Array, width: number, height: numb
       const x = current % width;
       const y = Math.floor(current / width);
       area += 1;
+      sumY += y;
+      const longitude = (x / Math.max(1, width)) * TAU;
+      sumLongitudeX += Math.cos(longitude);
+      sumLongitudeY += Math.sin(longitude);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
       const left = y * width + wrap(x - 1, width);
       const right = y * width + wrap(x + 1, width);
       if (coverage[left] > 0.5 && !visited[left]) { visited[left] = 1; queue[tail++] = left; }
@@ -2261,9 +2361,15 @@ function rasterLandmassAreas(coverage: Float32Array, width: number, height: numb
         if (coverage[down] > 0.5 && !visited[down]) { visited[down] = 1; queue[tail++] = down; }
       }
     }
-    areas.push(area);
+    components.push({
+      area,
+      minY,
+      maxY,
+      centerX: wrap(Math.atan2(sumLongitudeY, sumLongitudeX) / TAU),
+      centerY: sumY / Math.max(1, area),
+    });
   }
-  return areas.sort((a, b) => b - a);
+  return components.sort((a, b) => b.area - a.area);
 }
 
 function rasterMorphologyMetrics(
@@ -2282,15 +2388,58 @@ function rasterMorphologyMetrics(
     + normalizedPerimeters[3] * 0.34
     + normalizedPerimeters[4] * 0.2;
 
-  const areas = rasterLandmassAreas(coverage, width, height);
+  const components = rasterLandmassComponents(coverage, width, height);
+  const areas = components.map((component) => component.area);
   const meaningfulLandmassCount = areas.filter((area) => area >= landPixels * 0.006).length;
   const largestLandmassShare = (areas[0] ?? 0) / Math.max(1, landPixels);
-  const majorLandmassCount = areas.filter((area) => area >= landPixels * 0.04).length;
+  const majorComponents = components.filter((component) => component.area >= landPixels * 0.04);
+  const majorLandmassCount = majorComponents.length;
   const continentalAreas = areas.filter((area) => area >= landPixels * 0.004);
   const continentalPixels = continentalAreas.reduce((sum, area) => sum + area, 0);
   let concentration = 0;
   for (const area of continentalAreas) concentration += (area / Math.max(1, continentalPixels)) ** 2;
   const effectiveLandmassCount = concentration > 0 ? 1 / concentration : 0;
+  const deviation = (values: number[]) => {
+    if (values.length < 2) return 0;
+    const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+    return Math.sqrt(values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length);
+  };
+  const latitudeScale = Math.max(1, height - 1);
+  const centerDeviation = deviation(majorComponents.map((component) => component.centerY / latitudeScale));
+  const northEdgeDeviation = deviation(majorComponents.map((component) => component.minY / latitudeScale));
+  const southEdgeDeviation = deviation(majorComponents.map((component) => component.maxY / latitudeScale));
+  const pairAlignments: number[] = [];
+  for (let first = 0; first < majorComponents.length; first += 1) {
+    for (let second = first + 1; second < majorComponents.length; second += 1) {
+      const a = majorComponents[first];
+      const b = majorComponents[second];
+      const northMatch = Math.exp(-Math.abs(a.minY - b.minY) / (latitudeScale * 0.055));
+      const southMatch = Math.exp(-Math.abs(a.maxY - b.maxY) / (latitudeScale * 0.055));
+      const centerMatch = Math.exp(-Math.abs(a.centerY - b.centerY) / (latitudeScale * 0.075));
+      pairAlignments.push(Math.sqrt(northMatch * southMatch) * mix(0.78, 1, centerMatch));
+    }
+  }
+  pairAlignments.sort((a, b) => b - a);
+  const alignedPairCount = Math.max(1, Math.ceil(pairAlignments.length * 0.35));
+  const strongestAlignment = pairAlignments.length
+    ? pairAlignments.slice(0, alignedPairCount).reduce((sum, value) => sum + value, 0) / alignedPairCount
+    : 1;
+  const globalLatitudeStagger = clamp(centerDeviation / 0.2) * 0.5
+    + clamp(((northEdgeDeviation + southEdgeDeviation) * 0.5) / 0.18) * 0.5;
+  const landmassLatitudeDiversity = majorComponents.length < 2
+    ? 0
+    : (1 - strongestAlignment) * 0.72 + globalLatitudeStagger * 0.28;
+  const majorLongitudes = majorComponents.map((component) => component.centerX).sort((a, b) => a - b);
+  const longitudeGaps = majorLongitudes.map((longitude, index) => (
+    index + 1 < majorLongitudes.length
+      ? majorLongitudes[index + 1] - longitude
+      : 1 + majorLongitudes[0] - longitude
+  ));
+  const meanLongitudeGap = longitudeGaps.length ? 1 / longitudeGaps.length : 0;
+  const longitudeGapDeviation = deviation(longitudeGaps);
+  const landmassSpacingIrregularity = majorLongitudes.length < 2
+    ? 0
+    : clamp((longitudeGapDeviation / Math.max(0.001, meanLongitudeGap)) / 0.72);
   const islandMinimum = Math.max(3, landPixels * 0.000025);
   const islandMaximum = landPixels * 0.006;
   const islands = areas.filter((area) => area >= islandMinimum && area < islandMaximum);
@@ -2321,6 +2470,8 @@ function rasterMorphologyMetrics(
     meaningfulLandmassCount,
     majorLandmassCount,
     effectiveLandmassCount,
+    landmassLatitudeDiversity,
+    landmassSpacingIrregularity,
   };
 }
 
@@ -2342,10 +2493,11 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   const frameMarginX = 0;
   const frameMarginY = Math.ceil(height * FRAME_OCEAN_MARGIN);
   for (let y = 0; y < height; y += 1) {
+    const oceanProfile = oceanBasinProfile(terrain.oceanBasin, y / Math.max(1, height - 1), mesh.aspect);
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
       const worldX = (x / Math.max(1, width - 1)) * mesh.aspect;
-      const reserved = Math.abs(periodicDelta(terrain.oceanCenter, worldX, mesh.aspect)) < terrain.oceanWidth * 0.5;
+      const reserved = Math.abs(periodicDelta(oceanProfile.center, worldX, mesh.aspect)) < oceanProfile.halfWidth;
       oceanReserve[index] = reserved ? 1 : 0;
       macroLand[index] = potentialMap[index] > terrain.seaLevel && !reserved ? 1 : 0;
     }
@@ -2480,6 +2632,8 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
     meaningfulLandmassCount: morphology.meaningfulLandmassCount,
     majorLandmassCount: morphology.majorLandmassCount,
     effectiveLandmassCount: morphology.effectiveLandmassCount,
+    landmassLatitudeDiversity: morphology.landmassLatitudeDiversity,
+    landmassSpacingIrregularity: morphology.landmassSpacingIrregularity,
     rockLevel: elevationQuantile(elevation, coastCoverage, 0.87),
     snowLevel: elevationQuantile(elevation, coastCoverage, 0.98),
   };
@@ -2989,6 +3143,8 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       islandSizeDiversity: Math.round(raster.islandSizeDiversity * 100) / 100,
       majorLandmassCount: raster.majorLandmassCount,
       effectiveLandmassCount: Math.round(raster.effectiveLandmassCount * 10) / 10,
+      landmassLatitudeDiversity: Math.round(raster.landmassLatitudeDiversity * 100) / 100,
+      landmassSpacingIrregularity: Math.round(raster.landmassSpacingIrregularity * 100) / 100,
       circumferenceKm: Math.round(planet.circumferenceKm / 100) * 100,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),

@@ -45,11 +45,15 @@ test("global sea level cuts the continuous height field", () => {
 });
 
 test("continental systems emerge in a bounded natural range", () => {
-  const world = generateWorld(base);
+  const world = generateWorld({ ...base, width: 512, height: 256, simulationSites: 1400 });
   assert.ok(world.stats.continentSystems >= 3);
   assert.ok(world.stats.continentSystems <= 9);
   assert.equal(world.stats.continentSystems, world.stats.majorLandmassCount);
   assert.ok(world.stats.effectiveLandmassCount >= 2.5);
+  assert.ok(world.stats.landmassLatitudeDiversity >= 0.6,
+    `latitude diversity was ${world.stats.landmassLatitudeDiversity}`);
+  assert.ok(world.stats.landmassSpacingIrregularity >= 0.35,
+    `spacing irregularity was ${world.stats.landmassSpacingIrregularity}`);
 });
 
 test("planet scale changes the natural geographic carrying capacity", () => {
