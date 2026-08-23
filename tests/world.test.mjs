@@ -54,6 +54,8 @@ test("continental systems emerge in a bounded natural range", () => {
     `latitude diversity was ${world.stats.landmassLatitudeDiversity}`);
   assert.ok(world.stats.landmassSpacingIrregularity >= 0.35,
     `spacing irregularity was ${world.stats.landmassSpacingIrregularity}`);
+  assert.ok(world.stats.verticalLandmassBias <= 0.7,
+    `major-land orientation bias was ${world.stats.verticalLandmassBias}`);
 });
 
 test("planet scale changes the natural geographic carrying capacity", () => {

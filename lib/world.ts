@@ -36,6 +36,7 @@ export interface WorldStats {
   effectiveLandmassCount: number;
   landmassLatitudeDiversity: number;
   landmassSpacingIrregularity: number;
+  verticalLandmassBias: number;
   circumferenceKm: number;
   focusLongitude: number;
   generationMs: number;
@@ -175,6 +176,7 @@ export interface RasterTerrain {
   effectiveLandmassCount: number;
   landmassLatitudeDiversity: number;
   landmassSpacingIrregularity: number;
+  verticalLandmassBias: number;
   rockLevel: number;
   snowLevel: number;
 }
@@ -902,6 +904,7 @@ function buildCrustComposition(
     }
   };
 
+  let steepMajorSystems = 0;
   for (let rank = 0; rank < entries.length; rank += 1) {
     const [clusterId, group] = entries[rank];
     const system = assignment.systems[clusterId];
@@ -910,7 +913,7 @@ function buildCrustComposition(
     const uncompressed = rawNodes.map((node) => ({ ...node, x: referenceX + periodicDelta(referenceX, node.x, aspect) }));
     const rawCentroid = uncompressed.reduce((sum, node) => ({ x: sum.x + node.x / uncompressed.length, y: sum.y + node.y / uncompressed.length }), { x: 0, y: 0 });
     const compression = rank === 0 ? mix(0.68, 0.79, random()) : mix(0.56, 0.72, random());
-    const nodes = uncompressed.map((node) => ({
+    let nodes = uncompressed.map((node) => ({
       x: rawCentroid.x + (node.x - rawCentroid.x) * compression,
       y: constrainY(rawCentroid.y + (node.y - rawCentroid.y) * compression),
     }));
@@ -925,7 +928,48 @@ function buildCrustComposition(
     // A distorted anisotropic cratonic mass gives every major system a readable
     // body before lobes, peninsulas, and rifts modify its outline. This avoids
     // both a union of circular blobs and a skeleton of connected strokes.
-    const massAngle = random() * TAU;
+    // A real world can absolutely contain a strongly north-south continent,
+    // but sampling every craton orientation independently made entire atlases
+    // converge on the same vertical motif. Keep one occasional steep system and
+    // draw the remaining major masses from a broad oblique/lateral family.
+    const rawMassAngle = random() * TAU;
+    const canonicalAngle = ((rawMassAngle + Math.PI * 0.5) % Math.PI) - Math.PI * 0.5;
+    const orientationSign = canonicalAngle < 0 ? -1 : 1;
+    const useSteepOrientation = !isArchipelagic
+      && steepMajorSystems === 0
+      && Math.abs(canonicalAngle) > 0.9
+      && ((rawMassAngle * 1.61803398875) % 1) < 0.3;
+    const massAngle = useSteepOrientation
+      ? canonicalAngle
+      : orientationSign * Math.min(Math.abs(canonicalAngle), 0.76);
+    if (useSteepOrientation) steepMajorSystems += 1;
+    if (nodes.length > 1) {
+      let covarianceX = 0;
+      let covarianceY = 0;
+      let covarianceXY = 0;
+      for (const node of nodes) {
+        const dx = node.x - centroid.x;
+        const dy = node.y - centroid.y;
+        covarianceX += dx * dx;
+        covarianceY += dy * dy;
+        covarianceXY += dx * dy;
+      }
+      const nodeAngle = 0.5 * Math.atan2(2 * covarianceXY, covarianceX - covarianceY);
+      let axisDelta = massAngle - nodeAngle;
+      while (axisDelta > Math.PI * 0.5) axisDelta -= Math.PI;
+      while (axisDelta < -Math.PI * 0.5) axisDelta += Math.PI;
+      const rotation = axisDelta * 0.68;
+      const cosine = Math.cos(rotation);
+      const sine = Math.sin(rotation);
+      nodes = nodes.map((node) => {
+        const dx = node.x - centroid.x;
+        const dy = node.y - centroid.y;
+        return {
+          x: centroid.x + dx * cosine - dy * sine,
+          y: constrainY(centroid.y + dx * sine + dy * cosine),
+        };
+      });
+    }
     const archipelagoScale = isArchipelagic ? mix(0.54, 0.66, random()) : 1;
     const majorRadius = (isDominant ? mix(0.155, 0.215, random()) : mix(0.105, 0.175, random()))
       * coreScale * archipelagoScale * geographyScale;
@@ -1341,7 +1385,7 @@ function measureTerrain(
   planetControl = 0.6,
 ) {
   const visited = new Uint8Array(mesh.cellCount);
-  const components: { size: number; elongation: number }[] = [];
+  const components: { size: number; elongation: number; verticality: number }[] = [];
   const longitudeBins = 36;
   const binLand = new Uint32Array(longitudeBins);
   const binTotal = new Uint32Array(longitudeBins);
@@ -1396,7 +1440,12 @@ function measureTerrain(
     const root = Math.sqrt(Math.max(0, (covarianceX - covarianceY) ** 2 + 4 * covarianceXY ** 2));
     const major = Math.max(0, (trace + root) * 0.5);
     const minor = Math.max(0, (trace - root) * 0.5);
-    components.push({ size, elongation: Math.sqrt((major + 0.00008) / (minor + 0.00008)) });
+    const principalAngle = 0.5 * Math.atan2(2 * covarianceXY, covarianceX - covarianceY);
+    components.push({
+      size,
+      elongation: Math.sqrt((major + 0.00008) / (minor + 0.00008)),
+      verticality: Math.abs(Math.sin(principalAngle)),
+    });
   }
   components.sort((a, b) => b.size - a.size);
   const meaningful = components.filter((component) => component.size >= Math.max(5, landCells * 0.006));
@@ -1412,6 +1461,12 @@ function measureTerrain(
     .reduce((sum, component) => sum + component.size, 0);
   const weightedElongation = meaningful.reduce((sum, component) => sum + component.elongation * component.size, 0)
     / Math.max(1, meaningful.reduce((sum, component) => sum + component.size, 0));
+  const verticalShapeWeight = meaningful.reduce((sum, component) => (
+    sum + smoothstep((component.elongation - 1.12) / 1.18) * component.size
+  ), 0);
+  const verticalLandmassBias = meaningful.reduce((sum, component) => (
+    sum + component.verticality * smoothstep((component.elongation - 1.12) / 1.18) * component.size
+  ), 0) / Math.max(1, verticalShapeWeight);
   const excessivelyNarrow = meaningful.filter((component) => component.elongation > 3.35).length;
   let mediumCoast = desiredCoast * 0.8;
   let broadCoast = desiredCoast * 0.58;
@@ -1449,7 +1504,8 @@ function measureTerrain(
   const oceanCompositionPenalty = Math.max(0, 0.105 - oceanGap) * 82
     + Math.max(0, oceanGap - 0.36) * 34;
   const shapePenalty = Math.max(0, weightedElongation - 2.7) * 4.8
-    + Math.max(0, excessivelyNarrow - 1) * 4.5;
+    + Math.max(0, excessivelyNarrow - 1) * 4.5
+    + Math.max(0, verticalLandmassBias - 0.58) * 11;
   const islandPenalty = Math.max(0, 0.014 - islandShare) * 92
     + Math.max(0, islandShare - 0.06) * 34
     + Math.max(0, 4 - islandComponents.length) * 0.42;
@@ -1699,10 +1755,13 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
 
   // Graph metrics can distinguish connectedness and gross elongation, but they
   // cannot see whether complexity survives raster generalization. Render the
-  // three strongest candidates to a small, fixed cartographic grid and judge
+  // Every candidate reaches a small, fixed cartographic grid before selection.
+  // Graph metrics are useful for rejecting obvious failures, but raster-space
+  // covariance is substantially better at spotting a world where otherwise
+  // attractive continents all share the same north-south silhouette.
   // the same scale profile used for the final map. This is resolution-stable
   // and prevents fine noise from gaming a single perimeter score.
-  const finalists = candidates.sort((a, b) => b.score - a.score).slice(0, 3);
+  const finalists = candidates.sort((a, b) => b.score - a.score);
   if (settings.width < 512 || settings.height < 256) {
     const best = finalists[0];
     thermalErodeGraph(mesh, best.elevation, best.landMask, 2);
@@ -1733,6 +1792,8 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
       - Math.max(0, desiredEffectiveLands - morphology.effectiveLandmassCount) * 7.8
       - Math.max(0, desiredLatitudeDiversity - morphology.landmassLatitudeDiversity) * 13.5
       - Math.max(0, desiredSpacingIrregularity - morphology.landmassSpacingIrregularity) * 14.5
+      - Math.max(0, morphology.verticalLandmassBias - 0.5) * 24
+      - Math.max(0, 0.1 - morphology.verticalLandmassBias) * 2.5
       - Math.max(0, desiredMajorLands + 1 - morphology.meaningfulLandmassCount) * 2.8;
     if (visualScore > bestVisualScore) {
       bestVisualScore = visualScore;
@@ -2319,6 +2380,8 @@ interface RasterLandmassComponent {
   maxY: number;
   centerX: number;
   centerY: number;
+  elongation: number;
+  verticality: number;
 }
 
 function rasterLandmassComponents(coverage: Float32Array, width: number, height: number) {
@@ -2333,8 +2396,13 @@ function rasterLandmassComponents(coverage: Float32Array, width: number, height:
     let sumY = 0;
     let sumLongitudeX = 0;
     let sumLongitudeY = 0;
+    let sumX = 0;
+    let sumXX = 0;
+    let sumYY = 0;
+    let sumXY = 0;
     let minY = height;
     let maxY = 0;
+    const anchorX = start % width;
     queue[tail++] = start;
     visited[start] = 1;
     while (head < tail) {
@@ -2346,6 +2414,11 @@ function rasterLandmassComponents(coverage: Float32Array, width: number, height:
       const longitude = (x / Math.max(1, width)) * TAU;
       sumLongitudeX += Math.cos(longitude);
       sumLongitudeY += Math.sin(longitude);
+      const unwrappedX = anchorX + periodicDelta(anchorX, x, width);
+      sumX += unwrappedX;
+      sumXX += unwrappedX * unwrappedX;
+      sumYY += y * y;
+      sumXY += unwrappedX * y;
       minY = Math.min(minY, y);
       maxY = Math.max(maxY, y);
       const left = y * width + wrap(x - 1, width);
@@ -2361,12 +2434,24 @@ function rasterLandmassComponents(coverage: Float32Array, width: number, height:
         if (coverage[down] > 0.5 && !visited[down]) { visited[down] = 1; queue[tail++] = down; }
       }
     }
+    const meanX = sumX / Math.max(1, area);
+    const meanY = sumY / Math.max(1, area);
+    const covarianceX = Math.max(0, sumXX / Math.max(1, area) - meanX * meanX);
+    const covarianceY = Math.max(0, sumYY / Math.max(1, area) - meanY * meanY);
+    const covarianceXY = sumXY / Math.max(1, area) - meanX * meanY;
+    const trace = covarianceX + covarianceY;
+    const root = Math.sqrt(Math.max(0, (covarianceX - covarianceY) ** 2 + 4 * covarianceXY ** 2));
+    const major = Math.max(0, (trace + root) * 0.5);
+    const minor = Math.max(0, (trace - root) * 0.5);
+    const principalAngle = 0.5 * Math.atan2(2 * covarianceXY, covarianceX - covarianceY);
     components.push({
       area,
       minY,
       maxY,
       centerX: wrap(Math.atan2(sumLongitudeY, sumLongitudeX) / TAU),
-      centerY: sumY / Math.max(1, area),
+      centerY: meanY,
+      elongation: Math.sqrt((major + 1) / (minor + 1)),
+      verticality: Math.abs(Math.sin(principalAngle)),
     });
   }
   return components.sort((a, b) => b.area - a.area);
@@ -2440,6 +2525,14 @@ function rasterMorphologyMetrics(
   const landmassSpacingIrregularity = majorLongitudes.length < 2
     ? 0
     : clamp((longitudeGapDeviation / Math.max(0.001, meanLongitudeGap)) / 0.72);
+  let verticalWeight = 0;
+  let verticalTotal = 0;
+  for (const component of majorComponents) {
+    const shapeWeight = smoothstep((component.elongation - 1.12) / 1.18) * component.area;
+    verticalWeight += component.verticality * shapeWeight;
+    verticalTotal += shapeWeight;
+  }
+  const verticalLandmassBias = verticalTotal > 0 ? verticalWeight / verticalTotal : 0;
   const islandMinimum = Math.max(3, landPixels * 0.000025);
   const islandMaximum = landPixels * 0.006;
   const islands = areas.filter((area) => area >= islandMinimum && area < islandMaximum);
@@ -2472,6 +2565,7 @@ function rasterMorphologyMetrics(
     effectiveLandmassCount,
     landmassLatitudeDiversity,
     landmassSpacingIrregularity,
+    verticalLandmassBias,
   };
 }
 
@@ -2634,6 +2728,7 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
     effectiveLandmassCount: morphology.effectiveLandmassCount,
     landmassLatitudeDiversity: morphology.landmassLatitudeDiversity,
     landmassSpacingIrregularity: morphology.landmassSpacingIrregularity,
+    verticalLandmassBias: morphology.verticalLandmassBias,
     rockLevel: elevationQuantile(elevation, coastCoverage, 0.87),
     snowLevel: elevationQuantile(elevation, coastCoverage, 0.98),
   };
@@ -3145,6 +3240,7 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       effectiveLandmassCount: Math.round(raster.effectiveLandmassCount * 10) / 10,
       landmassLatitudeDiversity: Math.round(raster.landmassLatitudeDiversity * 100) / 100,
       landmassSpacingIrregularity: Math.round(raster.landmassSpacingIrregularity * 100) / 100,
+      verticalLandmassBias: Math.round(raster.verticalLandmassBias * 100) / 100,
       circumferenceKm: Math.round(planet.circumferenceKm / 100) * 100,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),

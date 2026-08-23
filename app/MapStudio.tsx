@@ -38,6 +38,7 @@ const EMPTY_STATS: WorldStats = {
   effectiveLandmassCount: 0,
   landmassLatitudeDiversity: 0,
   landmassSpacingIrregularity: 0,
+  verticalLandmassBias: 0,
   circumferenceKm: 0,
   focusLongitude: 0,
   generationMs: 0,
@@ -85,6 +86,20 @@ function wrap(value: number, period: number) {
 
 function planetCircumferenceKm(scale: number) {
   return Math.round((28_000 + 44_000 * (scale / 100)) / 100) * 100;
+}
+
+function sameWorldSettings(a: WorldSettings, b: WorldSettings) {
+  return a.seed === b.seed
+    && a.width === b.width
+    && a.height === b.height
+    && a.simulationSites === b.simulationSites
+    && a.planetScale === b.planetScale
+    && a.continentSize === b.continentSize
+    && a.seaLevel === b.seaLevel
+    && a.coastDetail === b.coastDetail
+    && a.tectonics === b.tectonics
+    && a.moisture === b.moisture
+    && a.style === b.style;
 }
 
 function drawAtlas(canvas: HTMLCanvasElement, texture: WorldTexture) {
@@ -216,7 +231,7 @@ export function MapStudio() {
   const atlasTargetRef = useRef<AtlasPreset>(ATLAS_PRESETS[1]);
   const hasDetailedAtlasRef = useRef(false);
   const generatedSeedRef = useRef(DEFAULTS.seed);
-  const pendingSeedRef = useRef(DEFAULTS.seed);
+  const pendingSettingsRef = useRef<WorldSettings>(DEFAULTS);
   const textureRef = useRef<WorldTexture | null>(null);
   const styleRef = useRef<RenderStyle>(DEFAULTS.style);
   const sphereCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -226,6 +241,8 @@ export function MapStudio() {
   const dragRef = useRef({ active: false, x: 0, y: 0 });
   const animationRef = useRef<number | null>(null);
   const [settings, setSettings] = useState(DEFAULTS);
+  const [generatedSettings, setGeneratedSettings] = useState<WorldSettings>(DEFAULTS);
+  const [renderedStyle, setRenderedStyle] = useState<RenderStyle>(DEFAULTS.style);
   const [stats, setStats] = useState(EMPTY_STATS);
   const [isGenerating, setIsGenerating] = useState(true);
   const [isRenderingAtlas, setIsRenderingAtlas] = useState(false);
@@ -237,6 +254,7 @@ export function MapStudio() {
   const [zoom, setZoom] = useState(1);
   const [viewMode, setViewMode] = useState<ViewMode>("globe");
   const isBusy = isGenerating || isRenderingAtlas;
+  const hasPendingChanges = !sameWorldSettings(settings, generatedSettings);
 
   const renderCurrentView = useCallback(() => {
     const texture = textureRef.current;
@@ -267,8 +285,7 @@ export function MapStudio() {
     setProgress(7);
     setGenerationStage("Composing continental terranes");
     setError(null);
-    styleRef.current = nextSettings.style;
-    pendingSeedRef.current = nextSettings.seed;
+    pendingSettingsRef.current = { ...nextSettings };
     workerRef.current.postMessage({ type: "generate", id, settings: nextSettings });
   }, []);
 
@@ -307,13 +324,17 @@ export function MapStudio() {
         setGenerationStage(message.stage);
         setProgress(message.progress);
       } else if (message.type === "complete") {
+        const completedSettings = pendingSettingsRef.current;
         textureRef.current = { pixels: new Uint8ClampedArray(message.pixels), width: message.width, height: message.height };
-        generatedSeedRef.current = pendingSeedRef.current;
+        generatedSeedRef.current = completedSettings.seed;
+        styleRef.current = completedSettings.style;
         hasDetailedAtlasRef.current = false;
         setAtlasResolution({ label: "MODEL", width: message.width, height: message.height });
         rotationRef.current.longitude = message.stats.focusLongitude;
         if (atlasCanvasRef.current) drawAtlas(atlasCanvasRef.current, textureRef.current);
         renderCurrentView();
+        setGeneratedSettings(completedSettings);
+        setRenderedStyle(completedSettings.style);
         setStats(message.stats);
         setProgress(100);
         setIsGenerating(false);
@@ -397,15 +418,11 @@ export function MapStudio() {
   };
 
   const selectStyle = (style: RenderStyle) => {
-    const next = { ...settings, style };
-    setSettings(next);
-    requestWorld(next);
+    setSettings((current) => ({ ...current, style }));
   };
 
   const randomize = () => {
-    const next = { ...settings, seed: freshSeed() };
-    setSettings(next);
-    requestWorld(next);
+    setSettings((current) => ({ ...current, seed: freshSeed() }));
   };
 
   const exportMap = () => {
@@ -414,7 +431,7 @@ export function MapStudio() {
     canvas.toBlob((blob) => {
       if (!blob) return;
       const link = document.createElement("a");
-      link.download = `${generatedSeedRef.current.toLowerCase()}-${settings.style}.png`;
+      link.download = `${generatedSeedRef.current.toLowerCase()}-${styleRef.current}.png`;
       link.href = URL.createObjectURL(blob);
       link.click();
       URL.revokeObjectURL(link.href);
@@ -457,9 +474,9 @@ export function MapStudio() {
         <div className="world-title"><span className="eyebrow">CURRENT WORLD</span><strong>{stats.name.toUpperCase()}</strong></div>
         <div className="topbar-actions">
           <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>DOWNLOAD VIEW</button>
-          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[0])} disabled={isBusy}>RENDER 4K</button>
-          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[1])} disabled={isBusy}>RENDER 8K</button>
-          <button className="export-button export-primary" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[2])} disabled={isBusy}>RENDER 10K</button>
+          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[0])} disabled={isBusy || hasPendingChanges}>RENDER 4K</button>
+          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[1])} disabled={isBusy || hasPendingChanges}>RENDER 8K</button>
+          <button className="export-button export-primary" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[2])} disabled={isBusy || hasPendingChanges}>RENDER 10K</button>
         </div>
       </header>
 
@@ -467,7 +484,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 11</span>
+            <span className="version">ALPHA 12</span>
           </div>
 
           <label className="seed-field">
@@ -500,7 +517,7 @@ export function MapStudio() {
           </div>
 
           <div className="export-section">
-            <div className="control-label"><span>IN-BROWSER ATLAS</span><output>{atlasResolution.width} × {atlasResolution.height}</output></div>
+            <div className="control-label"><span>OUTPUT ATLAS · CURRENT WORLD</span><output>{atlasResolution.width} × {atlasResolution.height}</output></div>
             <div className="export-grid">
               {ATLAS_PRESETS.map((preset) => (
                 <button
@@ -508,7 +525,7 @@ export function MapStudio() {
                   className={atlasResolution.width === preset.width ? "active" : ""}
                   type="button"
                   onClick={() => renderHighResolution(preset)}
-                  disabled={isBusy}
+                  disabled={isBusy || hasPendingChanges}
                 >
                   <strong>{preset.label}</strong><span>{preset.width} × {preset.height}</span>
                 </button>
@@ -538,9 +555,11 @@ export function MapStudio() {
           </div>
 
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isBusy}>
-            <span>{isBusy ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
+            <span>{isBusy ? generationStage.toUpperCase() : hasPendingChanges ? "APPLY SETTINGS & GENERATE" : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">4K/8K/10K draw directly into the atlas · larger planets fit more independent geographic provinces</p>
+          <p className={`generation-note ${hasPendingChanges ? "has-pending" : ""}`}>
+            {hasPendingChanges ? "SETTINGS STAGED · SUBMIT ONCE TO UPDATE THE WORLD" : "4K/8K/10K render the current world directly in the atlas"}
+          </p>
         </aside>
 
         <div className="map-stage">
@@ -561,7 +580,7 @@ export function MapStudio() {
             style={{ transform: `scale(${zoom})` }}
             aria-label={`Seamless ${atlasResolution.width} by ${atlasResolution.height} equirectangular fantasy world atlas`}
           />
-          <div className={`map-vignette ${settings.style === "climate" && viewMode === "atlas" ? "is-flat" : ""}`} />
+          <div className={`map-vignette ${renderedStyle === "climate" && viewMode === "atlas" ? "is-flat" : ""}`} />
 
           <div className="coordinates">{viewMode === "globe" ? "DRAG TO ROTATE" : "EQUIRECTANGULAR"} <span>—</span> {stats.circumferenceKm ? `${stats.circumferenceKm.toLocaleString("en-US")} KM` : "SEAMLESS 360°"}</div>
           <div className="view-switcher" aria-label="Map projection">
