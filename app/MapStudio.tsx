@@ -30,6 +30,9 @@ const EMPTY_STATS: WorldStats = {
   oceanGapPercent: 0,
   meanLandmassElongation: 0,
   coastScaleRatio: 0,
+  coastHierarchyIndex: 0,
+  islandAreaPercent: 0,
+  islandSizeDiversity: 0,
   focusLongitude: 0,
   generationMs: 0,
 };
@@ -59,6 +62,7 @@ const RESOLUTION_PRESETS = [
 const ATLAS_PRESETS = [
   { label: "4K", width: 4096, height: 2048 },
   { label: "8K", width: 8192, height: 4096 },
+  { label: "10K", width: 10000, height: 5000 },
 ] as const;
 
 type AtlasPreset = (typeof ATLAS_PRESETS)[number];
@@ -439,7 +443,8 @@ export function MapStudio() {
         <div className="topbar-actions">
           <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>DOWNLOAD VIEW</button>
           <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[0])} disabled={isBusy}>RENDER 4K</button>
-          <button className="export-button export-primary" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[1])} disabled={isBusy}>RENDER 8K</button>
+          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[1])} disabled={isBusy}>RENDER 8K</button>
+          <button className="export-button export-primary" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[2])} disabled={isBusy}>RENDER 10K</button>
         </div>
       </header>
 
@@ -447,7 +452,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 08</span>
+            <span className="version">ALPHA 09</span>
           </div>
 
           <label className="seed-field">

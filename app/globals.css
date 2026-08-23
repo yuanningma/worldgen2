@@ -60,7 +60,7 @@ button:disabled { cursor: wait; opacity: 0.62; }
 .resolution-grid button:last-child { border-right: 0; }
 .resolution-grid button.active { background: var(--ink); color: #f4f0e5; }
 .export-section { margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--line); }
-.export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.export-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 10px; }
 .export-grid button { display: grid; gap: 4px; border: 1px solid var(--line); padding: 9px 8px; background: transparent; text-align: left; cursor: pointer; }
 .export-grid button:hover { border-color: var(--accent); }
 .export-grid button.active { border-color: var(--accent); background: rgba(213, 102, 60, 0.08); color: var(--accent); }

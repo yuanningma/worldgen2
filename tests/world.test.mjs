@@ -81,6 +81,11 @@ test("the structural coast has meaningful perimeter without fragmenting the worl
   assert.ok(world.stats.landPercent >= 15 && world.stats.landPercent <= 50);
   assert.ok(world.stats.frameClearance >= 2, `frame clearance was ${world.stats.frameClearance}%`);
   assert.ok(world.stats.coastScaleRatio >= 1.2, `coast scale ratio was ${world.stats.coastScaleRatio}`);
+  assert.ok(world.stats.coastHierarchyIndex >= 8, `coast hierarchy was ${world.stats.coastHierarchyIndex}`);
+  assert.ok(world.stats.islandAreaPercent >= 0.5 && world.stats.islandAreaPercent <= 8,
+    `island area was ${world.stats.islandAreaPercent}%`);
+  assert.ok(world.stats.islandSizeDiversity >= 0 && world.stats.islandSizeDiversity <= 1,
+    `island diversity was ${world.stats.islandSizeDiversity}`);
 });
 
 test("coastal complexity adds persistent multiscale detail instead of only enlarging pixels", () => {
