@@ -7,6 +7,7 @@ export interface WorldSettings {
   width: number;
   height: number;
   simulationSites?: number;
+  planetScale?: number;
   continentSize: number;
   seaLevel?: number;
   coastDetail: number;
@@ -31,6 +32,9 @@ export interface WorldStats {
   coastHierarchyIndex: number;
   islandAreaPercent: number;
   islandSizeDiversity: number;
+  majorLandmassCount: number;
+  effectiveLandmassCount: number;
+  circumferenceKm: number;
   focusLongitude: number;
   generationMs: number;
 }
@@ -80,6 +84,8 @@ interface TerrainCandidate {
   largestLandmassShare: number;
   oceanGapShare: number;
   meanLandmassElongation: number;
+  oceanCenter: number;
+  oceanWidth: number;
 }
 
 interface CoastPoint {
@@ -156,6 +162,8 @@ export interface RasterTerrain {
   islandSizeDiversity: number;
   largestLandmassShare: number;
   meaningfulLandmassCount: number;
+  majorLandmassCount: number;
+  effectiveLandmassCount: number;
   rockLevel: number;
   snowLevel: number;
 }
@@ -196,6 +204,22 @@ function smoothstep(value: number) {
 function targetLandFraction(settings: WorldSettings) {
   if (settings.seaLevel === undefined) return mix(0.16, 0.47, settings.continentSize / 100);
   return mix(0.48, 0.19, clamp(settings.seaLevel / 100));
+}
+
+function planetScaleMetrics(settings: WorldSettings) {
+  const control = clamp((settings.planetScale ?? 60) / 100);
+  const circumferenceKm = mix(28_000, 72_000, control);
+  const earthRatio = circumferenceKm / 40_075;
+  return {
+    control,
+    circumferenceKm,
+    earthRatio,
+    // Geographic formations retain an approximately characteristic physical
+    // size. On a larger globe they therefore occupy less of the 2:1 atlas,
+    // leaving room for more independent plate provinces and ocean passages.
+    featureScale: clamp(Math.pow(earthRatio, -0.78), 0.64, 1.34),
+    plateMultiplier: clamp(Math.pow(earthRatio, 1.08), 0.72, 1.82),
+  };
 }
 
 function smootherstep(value: number) {
@@ -552,11 +576,13 @@ function assignContinentalClusters(
   random: () => number,
   continentalShare: number,
   aspect: number,
+  planet: ReturnType<typeof planetScaleMetrics>,
 ): ContinentalAssignment {
   const desired = Math.round(plates.length * clamp(continentalShare, 0.28, 0.58));
   const mass = clamp((continentalShare - 0.28) / 0.3);
-  const expectedRoots = mix(5.9, 4.35, mass) + (plates.length - 23) * 0.055;
-  const rootCount = Math.min(desired, Math.round(clamp(expectedRoots + (random() - 0.5) * 1.7, 4, 7)));
+  const scaleRoots = mix(4.5, 9.2, clamp((planet.earthRatio - 0.68) / 1.12));
+  const expectedRoots = scaleRoots - mass * 0.72 + (plates.length - 27) * 0.035;
+  const rootCount = Math.min(desired, Math.round(clamp(expectedRoots + (random() - 0.5) * 1.8, 4, 10)));
 
   // Compose the planet in a few unequal geographic provinces around one legible
   // ocean basin. This is a clustered point process, rather than farthest-point
@@ -564,17 +590,23 @@ function assignContinentalClusters(
   // remains isolated across a broad sea. The exact continent count still emerges
   // later when sea level cuts the continuous field.
   const oceanCenter = random() * aspect;
-  const oceanWidth = mix(0.4, 0.62, random());
+  const oceanWidth = clamp(mix(0.4, 0.66, random()) * mix(0.96, 1.12, planet.control), 0.38, 0.72);
   const landCenter = wrap(oceanCenter + aspect * 0.5, aspect);
-  const provinceCount = rootCount >= 6 && random() < 0.52 ? 3 : 2;
-  const provinceOffsets = provinceCount === 3
-    ? [-mix(0.38, 0.5, random()), (random() - 0.5) * 0.13, mix(0.34, 0.48, random())]
-    : [-mix(0.23, 0.37, random()), mix(0.25, 0.4, random())];
-  const latitudePattern = provinceCount === 3
-    ? [mix(0.3, 0.43, random()), mix(0.53, 0.68, random()), mix(0.34, 0.58, random())]
-    : [mix(0.28, 0.48, random()), mix(0.52, 0.72, random())];
+  const provinceCount = rootCount >= 8 && random() < 0.74 ? 4 : rootCount >= 6 && random() < 0.82 ? 3 : 2;
+  const landArc = aspect - oceanWidth;
+  const provinceTemplate = provinceCount === 4
+    ? [-0.43, -0.15, 0.11, 0.39]
+    : provinceCount === 3 ? [-0.36, -0.03, 0.34] : [-0.23, 0.27];
+  const provinceOffsets = provinceTemplate.map((offset, index) => (
+    offset * landArc + (random() - 0.5) * (index % 2 ? 0.08 : 0.12)
+  ));
+  const latitudePattern = provinceCount === 4
+    ? [mix(0.25, 0.43, random()), mix(0.55, 0.74, random()), mix(0.29, 0.51, random()), mix(0.5, 0.71, random())]
+    : provinceCount === 3
+      ? [mix(0.3, 0.43, random()), mix(0.53, 0.68, random()), mix(0.34, 0.58, random())]
+      : [mix(0.28, 0.48, random()), mix(0.52, 0.72, random())];
   if (random() < 0.5) latitudePattern.reverse();
-  const provinceWeights = provinceCount === 3 ? [1.7, 1.08, 0.82] : [1.62, 1.08];
+  const provinceWeights = provinceCount === 4 ? [1.72, 1.18, 0.92, 0.68] : provinceCount === 3 ? [1.7, 1.08, 0.82] : [1.62, 1.08];
   if (random() < 0.38) provinceWeights[0] *= 1.22;
 
   const provinceAssignments = Array.from({ length: provinceCount }, (_, index) => index);
@@ -600,7 +632,9 @@ function assignContinentalClusters(
     const province = provinceAssignments[id];
     const siblings = systems.filter((system) => system.province === province).length;
     const angle = random() * TAU + siblings * 2.17;
-    const spread = siblings === 0 ? mix(0.025, 0.075, random()) : mix(0.1, 0.24, random());
+    const spread = siblings === 0
+      ? mix(0.018, 0.058, random())
+      : mix(0.11, 0.255, random()) * Math.pow(planet.featureScale, 0.35);
     const targetX = wrap(landCenter + provinceOffsets[province] + Math.cos(angle) * spread, aspect);
     const targetY = clamp(latitudePattern[province] + Math.sin(angle) * spread * mix(0.48, 0.8, random()), 0.14, 0.86);
     const prominence = id === 0
@@ -615,7 +649,8 @@ function assignContinentalClusters(
       let crowding = 0;
       for (const existing of roots) {
         const separation = Math.hypot(periodicDelta(plates[existing].x, plate.x, aspect), plate.y - plates[existing].y);
-        if (separation < 0.16) crowding += (0.16 - separation) * 2.8;
+        const minimumSeparation = 0.145 * Math.pow(planet.featureScale, 0.42);
+        if (separation < minimumSeparation) crowding += (minimumSeparation - separation) * 3.2;
       }
       const score = targetDistance + crowding + Math.abs(plate.y - 0.5) * 0.035 + random() * 0.025;
       if (score < bestScore) {
@@ -695,10 +730,12 @@ function buildCrustComposition(
   assignment: ContinentalAssignment,
   aspect: number,
   random: () => number,
+  planet: ReturnType<typeof planetScaleMetrics>,
 ): CrustComposition {
   const masses: CrustMass[] = [];
   const terranes: CrustStroke[] = [];
   const cuts: CrustStroke[] = [];
+  const geographyScale = planet.featureScale;
   const groups = new Map<number, Plate[]>();
   for (const plate of plates) {
     const clusterId = assignment.cluster[plate.id];
@@ -762,6 +799,8 @@ function buildCrustComposition(
     bend: number,
     strength: number,
   ) => {
+    totalLength *= geographyScale;
+    firstRadius *= geographyScale * 1.08;
     let px = origin.x;
     let py = origin.y;
     let direction = heading;
@@ -783,7 +822,7 @@ function buildCrustComposition(
         radiusX: radius * mix(1.12, 1.56, random()),
         radiusY: radius * mix(0.62, 1, random()),
         angle: islandAngle,
-        strength: strength * mix(0.9, 1.08, random()),
+        strength: strength * mix(1.04, 1.22, random()),
         harmonicA: mix(0.1, 0.2, random()),
         harmonicB: mix(0.055, 0.13, random()),
         phaseA: random() * TAU,
@@ -817,7 +856,8 @@ function buildCrustComposition(
     // both a union of circular blobs and a skeleton of connected strokes.
     const massAngle = random() * TAU;
     const archipelagoScale = isArchipelagic ? mix(0.54, 0.66, random()) : 1;
-    const majorRadius = (isDominant ? mix(0.155, 0.215, random()) : mix(0.105, 0.175, random())) * coreScale * archipelagoScale;
+    const majorRadius = (isDominant ? mix(0.155, 0.215, random()) : mix(0.105, 0.175, random()))
+      * coreScale * archipelagoScale * geographyScale;
     const minorRadius = majorRadius * mix(0.58, 0.82, random());
     masses.push({
       x: centroid.x,
@@ -869,9 +909,9 @@ function buildCrustComposition(
     // a three-plate system does not become a chain of paddles.
     for (let index = 0; index < nodes.length; index += 1) {
       const node = nodes[index];
-      const radius = mix(0.067, 0.108, random()) * coreScale * (isArchipelagic ? 0.72 : 1);
+      const radius = mix(0.067, 0.108, random()) * coreScale * (isArchipelagic ? 0.72 : 1) * geographyScale;
       const angle = Math.atan2(group[index].vy, group[index].vx) + (random() - 0.5) * 0.75;
-      const halfLength = mix(0.018, 0.052, random()) * coreScale;
+      const halfLength = mix(0.018, 0.052, random()) * coreScale * geographyScale;
       terranes.push({
         ax: node.x - Math.cos(angle) * halfLength,
         ay: constrainY(node.y - Math.sin(angle) * halfLength),
@@ -906,8 +946,8 @@ function buildCrustComposition(
         phaseA: random() * TAU,
         phaseB: random() * TAU,
       });
-      const halfLength = mix(0.027, 0.071, random()) * coreScale;
-      const width = mix(0.04, 0.071, random()) * coreScale * (isArchipelagic ? 0.68 : 1);
+      const halfLength = mix(0.027, 0.071, random()) * coreScale * geographyScale;
+      const width = mix(0.04, 0.071, random()) * coreScale * (isArchipelagic ? 0.68 : 1) * geographyScale;
       const tangent = angle + (random() - 0.5) * 0.9;
       terranes.push({
         ax: lobeCenter.x - Math.cos(tangent) * halfLength,
@@ -942,7 +982,7 @@ function buildCrustComposition(
         const b = nodes[bestTo];
         const bendX = (a.x + b.x) * 0.5 + (random() - 0.5) * 0.035;
         const bendY = (a.y + b.y) * 0.5 + (random() - 0.5) * 0.035;
-        const width = mix(0.049, 0.075, random()) * coreScale;
+        const width = mix(0.049, 0.075, random()) * coreScale * geographyScale;
         terranes.push(
           { ax: a.x, ay: a.y, bx: bendX, by: bendY, radiusA: width, radiusB: width * mix(0.82, 1.04, random()), strength: 1.04 },
           { ax: bendX, ay: bendY, bx: b.x, by: b.y, radiusA: width * mix(0.82, 1.04, random()), radiusB: width, strength: 1.04 },
@@ -968,13 +1008,13 @@ function buildCrustComposition(
         outwardY = Math.sin(branchPhase + (branch / Math.max(1, branchCount)) * TAU);
       }
       const baseAngle = Math.atan2(outwardY, outwardX) + (random() - 0.5) * 0.92;
-      const totalLength = isCrescent && branch === 0 ? mix(0.1, 0.15, random()) : mix(0.05, 0.108, random());
-      const rootWidth = mix(0.034, 0.054, random());
+      const totalLength = (isCrescent && branch === 0 ? mix(0.1, 0.15, random()) : mix(0.05, 0.108, random())) * geographyScale;
+      const rootWidth = mix(0.034, 0.054, random()) * geographyScale;
       const tipWidth = rootWidth * mix(0.58, 0.78, random());
       const hook = (random() < 0.5 ? -1 : 1) * (isCrescent && branch === 0 ? mix(0.58, 0.92, random()) : mix(0.16, 0.52, random()));
       const end = addPath(terranes, anchor, baseAngle, totalLength, 3 + Math.floor(random() * 2), rootWidth, tipWidth, mix(0.98, 1.1, random()), hook);
 
-      if (random() < (isDominant ? 0.58 : 0.38)) {
+      if (random() < (isDominant ? 0.68 : 0.5)) {
         const tangent = baseAngle + hook + (random() < 0.5 ? -1 : 1) * mix(0.55, 0.95, random());
         const gap = mix(0.025, 0.052, random());
         const fragmentStart = { x: end.x + Math.cos(tangent) * gap, y: constrainY(end.y + Math.sin(tangent) * gap) };
@@ -990,7 +1030,7 @@ function buildCrustComposition(
       }
     }
 
-    if (!isArchipelagic && random() < (isDominant ? 0.5 : 0.3)) {
+    if (!isArchipelagic && random() < (isDominant ? 0.68 : 0.48)) {
       const coastAngle = random() * TAU;
       const chainHeading = coastAngle + (random() < 0.5 ? -1 : 1) * mix(0.28, 0.82, random());
       const coastOrigin = {
@@ -1014,32 +1054,32 @@ function buildCrustComposition(
       const anchor = outerNodes[inlet % outerNodes.length];
       let angle = Math.atan2(anchor.y - centroid.y, anchor.x - centroid.x);
       angle += (random() - 0.5) * 0.58;
-      const outside = mix(0.05, 0.1, random());
+      const outside = mix(0.05, 0.1, random()) * geographyScale;
       const start = { x: anchor.x + Math.cos(angle) * outside, y: constrainY(anchor.y + Math.sin(angle) * outside) };
-      const cutLength = outside + mix(0.035, isRifted ? 0.105 : 0.078, random());
-      const mouthWidth = mix(0.027, 0.052, random());
-      const headWidth = mix(0.013, 0.025, random());
+      const cutLength = outside + mix(0.035, isRifted ? 0.105 : 0.078, random()) * geographyScale;
+      const mouthWidth = mix(0.027, 0.052, random()) * geographyScale;
+      const headWidth = mix(0.013, 0.025, random()) * geographyScale;
       const cutCurl = (random() < 0.5 ? -1 : 1) * mix(0.12, 0.48, random());
       const head = addPath(cuts, start, angle + Math.PI, cutLength, 3 + Math.floor(random() * 2), mouthWidth, headWidth, mix(1.2, 1.52, random()), cutCurl);
       if (random() < 0.5) {
         const branchAngle = angle + Math.PI + cutCurl + (random() < 0.5 ? -1 : 1) * mix(0.55, 0.95, random());
-        addPath(cuts, head, branchAngle, mix(0.025, 0.055, random()), 2, headWidth * 1.15, headWidth * 0.6, mix(1.12, 1.4, random()), (random() - 0.5) * 0.3);
+        addPath(cuts, head, branchAngle, mix(0.025, 0.055, random()) * geographyScale, 2, headWidth * 1.15, headWidth * 0.6, mix(1.12, 1.4, random()), (random() - 0.5) * 0.3);
       }
     }
 
     const basinCount = random() < (isRifted ? 0.68 : 0.34) ? 1 : 0;
     for (let basin = 0; basin < basinCount; basin += 1) {
       const angle = random() * TAU;
-      const offset = mix(0.015, 0.052, random());
+      const offset = mix(0.015, 0.052, random()) * geographyScale;
       const basinX = centroid.x + Math.cos(angle) * offset;
       const basinY = constrainY(centroid.y + Math.sin(angle) * offset);
       cuts.push({
         ax: basinX,
         ay: basinY,
-        bx: basinX + Math.cos(angle + Math.PI * 0.5) * mix(0.022, 0.058, random()),
-        by: constrainY(basinY + Math.sin(angle + Math.PI * 0.5) * mix(0.022, 0.058, random())),
-        radiusA: mix(0.023, 0.048, random()),
-        radiusB: mix(0.018, 0.04, random()),
+        bx: basinX + Math.cos(angle + Math.PI * 0.5) * mix(0.022, 0.058, random()) * geographyScale,
+        by: constrainY(basinY + Math.sin(angle + Math.PI * 0.5) * mix(0.022, 0.058, random()) * geographyScale),
+        radiusA: mix(0.023, 0.048, random()) * geographyScale,
+        radiusB: mix(0.018, 0.04, random()) * geographyScale,
         strength: mix(1.04, 1.38, random()),
       });
     }
@@ -1056,8 +1096,8 @@ function buildCrustComposition(
         ay: firstEdge.y,
         bx: opposite.x,
         by: opposite.y,
-        radiusA: mix(0.009, 0.018, random()),
-        radiusB: mix(0.008, 0.016, random()),
+        radiusA: mix(0.009, 0.018, random()) * geographyScale,
+        radiusB: mix(0.008, 0.016, random()) * geographyScale,
         strength: mix(1.22, 1.52, random()),
       });
     }
@@ -1222,7 +1262,13 @@ function thresholdGraphField(mesh: GraphMesh, field: Float32Array, landFraction:
   return result;
 }
 
-function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: number, measureCoastHierarchy = true) {
+function measureTerrain(
+  mesh: GraphMesh,
+  landMask: Uint8Array,
+  desiredCoast: number,
+  measureCoastHierarchy = true,
+  planetControl = 0.6,
+) {
   const visited = new Uint8Array(mesh.cellCount);
   const components: { size: number; elongation: number }[] = [];
   const longitudeBins = 36;
@@ -1320,11 +1366,13 @@ function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: num
   }
   const oceanGap = longestOceanRun / longitudeBins;
   const clearancePenalty = Math.max(0, 0.06 - minimumEdgeDistance) * 115;
-  const componentPenalty = meaningful.length < 5
-    ? (5 - meaningful.length) * 6.6
-    : Math.max(0, meaningful.length - 9) * 2.6;
+  const desiredComponents = Math.round(mix(4, 7, planetControl));
+  const componentPenalty = meaningful.length < desiredComponents
+    ? (desiredComponents - meaningful.length) * 6.6
+    : Math.max(0, meaningful.length - (desiredComponents + 3)) * 2.6;
+  const largestTarget = mix(0.5, 0.34, planetControl);
   const hierarchyPenalty = Math.max(0, 0.28 - largestShare) * 48
-    + Math.max(0, largestShare - 0.48) * 96
+    + Math.max(0, largestShare - largestTarget) * 104
     + Math.max(0, 0.1 - secondShare) * 26
     + Math.max(0, 0.075 - (largestShare - secondShare)) * 34;
   const oceanCompositionPenalty = Math.max(0, 0.105 - oceanGap) * 82
@@ -1360,7 +1408,8 @@ function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: num
 
 function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, settings: WorldSettings): TerrainCandidate {
   const random = makeRandom(seed ^ Math.imul(attempt + 1, 0x9e3779b1));
-  const plateCount = 20 + Math.floor(random() * 7);
+  const planet = planetScaleMetrics(settings);
+  const plateCount = Math.round(clamp((19 + random() * 7) * planet.plateMultiplier, 16, 46));
   const sites = choosePlateSites(mesh, random, plateCount);
   const plates: Plate[] = sites.map((siteCell, id) => {
     const angle = random() * TAU;
@@ -1386,8 +1435,9 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     random,
     continentalShare,
     mesh.aspect,
+    planet,
   );
-  const crustComposition = buildCrustComposition(plates, continentAssignment, mesh.aspect, random);
+  const crustComposition = buildCrustComposition(plates, continentAssignment, mesh.aspect, random, planet);
   for (const plate of plates) {
     plate.crustBias = plate.continental ? 0.12 + random() * 0.1 : -0.08 - random() * 0.08;
   }
@@ -1414,12 +1464,12 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     const edgePenalty = polarDistance < polarBand
       ? Math.pow((polarBand - polarDistance) / polarBand, 1.55) * 3.1
       : 0;
-    let basePotential = clamp(structuredCrust, -1.4, 1.1) * 0.82
+    let basePotential = clamp(structuredCrust, -1.4, 1.1) * mix(0.82, 0.94, planet.control)
       + plate.crustBias
       + (plate.continental ? interior * 0.05 : -interior * 0.035)
-      + macro * 0.3
-      + regional * coastAmplitude
-      - oceanBasin * 0.36
+      + macro * mix(0.31, 0.19, planet.control)
+      + regional * coastAmplitude * mix(1, 0.78, planet.control)
+      - oceanBasin * mix(0.68, 1.12, planet.control)
       - edgePenalty;
     if (!plate.continental && polarDistance > 0.12 && Number.isFinite(convergence.distance[cell])) {
       const arcInfluence = Math.exp(-convergence.distance[cell] / 0.014) * convergence.strength[cell];
@@ -1431,16 +1481,24 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   }
   const potential = smoothGraphField(mesh, base, 1, 0.84);
   const eligiblePotential: number[] = [];
+  const oceanReserveHalfWidth = continentAssignment.oceanWidth * mix(0.23, 0.31, planet.control);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
-    if (polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell]) eligiblePotential.push(potential[cell]);
+    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
+    if (polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] && oceanDistance > oceanReserveHalfWidth) {
+      eligiblePotential.push(potential[cell]);
+    }
   }
   const targetEligibleFraction = clamp((targetLand * mesh.cellCount) / Math.max(1, eligiblePotential.length), 0, 0.92);
   const seaLevel = selectThreshold(Float32Array.from(eligiblePotential), targetEligibleFraction);
   const landMask = new Uint8Array(mesh.cellCount);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
-    landMask[cell] = potential[cell] > seaLevel && polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] ? 1 : 0;
+    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
+    landMask[cell] = potential[cell] > seaLevel
+      && oceanDistance > oceanReserveHalfWidth
+      && polarDistance > FRAME_OCEAN_MARGIN
+      && !mesh.boundary[cell] ? 1 : 0;
   }
 
   const ridge = new Float32Array(mesh.cellCount);
@@ -1479,6 +1537,8 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     mesh,
     landMask,
     mix(12.2, 18.4, settings.coastDetail / 100),
+    true,
+    planet.control,
   );
   // Also judge the same continuous crust at a lower exposed-land fraction.
   // Attractive continents should remain broad geographic bodies when sea level
@@ -1490,12 +1550,22 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   const sparseLandMask = new Uint8Array(mesh.cellCount);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
-    sparseLandMask[cell] = potential[cell] > sparseThreshold && polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] ? 1 : 0;
+    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
+    sparseLandMask[cell] = potential[cell] > sparseThreshold
+      && oceanDistance > oceanReserveHalfWidth
+      && polarDistance > FRAME_OCEAN_MARGIN
+      && !mesh.boundary[cell] ? 1 : 0;
   }
-  const sparseMeasured = measureTerrain(mesh, sparseLandMask, mix(11.4, 16.8, settings.coastDetail / 100), false);
+  const sparseMeasured = measureTerrain(
+    mesh,
+    sparseLandMask,
+    mix(11.4, 16.8, settings.coastDetail / 100),
+    false,
+    planet.control,
+  );
   const lowLandStabilityPenalty = Math.max(0, sparseMeasured.meanLandmassElongation - 2.55) * 7.2
     + Math.max(0, sparseMeasured.largestLandmassShare - 0.68) * 34
-    + Math.max(0, 5 - sparseMeasured.meaningfulComponents) * 2.5;
+    + Math.max(0, Math.round(mix(4, 7, planet.control)) - sparseMeasured.meaningfulComponents) * 2.5;
   return {
     plates,
     plateId,
@@ -1511,6 +1581,8 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     largestLandmassShare: measured.largestLandmassShare,
     oceanGapShare: measured.oceanGapShare,
     meanLandmassElongation: measured.meanLandmassElongation,
+    oceanCenter: continentAssignment.oceanCenter,
+    oceanWidth: oceanReserveHalfWidth * 2,
   };
 }
 
@@ -1544,7 +1616,7 @@ function thermalErodeGraph(mesh: GraphMesh, elevation: Float32Array, landMask: U
 
 function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettings) {
   const candidates = [buildTerrainCandidate(mesh, seed, 0, settings)];
-  for (let attempt = 1; attempt < 5; attempt += 1) {
+  for (let attempt = 1; attempt < 6; attempt += 1) {
     candidates.push(buildTerrainCandidate(mesh, seed, attempt, settings));
   }
 
@@ -1553,14 +1625,19 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
   // three strongest candidates to a small, fixed cartographic grid and judge
   // the same scale profile used for the final map. This is resolution-stable
   // and prevents fine noise from gaming a single perimeter score.
-  const finalists = candidates.sort((a, b) => b.score - a.score).slice(0, 2);
+  const finalists = candidates.sort((a, b) => b.score - a.score).slice(0, 3);
   if (settings.width < 512 || settings.height < 256) {
     const best = finalists[0];
     thermalErodeGraph(mesh, best.elevation, best.landMask, 2);
     return best;
   }
   const coarseSettings = { ...settings, width: 512, height: 256 };
+  const planet = planetScaleMetrics(settings);
   const desiredHierarchy = mix(11.2, 15.6, settings.coastDetail / 100);
+  const desiredMajorLands = mix(3, 6, planet.control);
+  const desiredEffectiveLands = mix(2.9, 6.2, planet.control);
+  const largestLandmassTarget = mix(0.52, 0.34, planet.control);
+  const desiredIslandArea = mix(1.8, 3.4, planet.control);
   let best = finalists[0];
   let bestVisualScore = Number.NEGATIVE_INFINITY;
   for (const candidate of finalists) {
@@ -1568,11 +1645,14 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
     const visualScore = candidate.score
       - Math.max(0, desiredHierarchy - morphology.coastHierarchyIndex) * 1.05
       - Math.max(0, morphology.coastHierarchyIndex - 20.5) * 0.48
-      - Math.max(0, 2.2 - morphology.islandAreaPercent) * 1.15
+      - Math.max(0, desiredIslandArea - morphology.islandAreaPercent) * 1.15
       - Math.max(0, morphology.islandAreaPercent - 5.8) * 0.42
       - Math.max(0, 0.42 - morphology.islandSizeDiversity) * 2.2
-      - Math.max(0, morphology.largestLandmassShare - 0.48) * 88
-      - Math.max(0, 5 - morphology.meaningfulLandmassCount) * 2.8;
+      - Math.max(0, morphology.largestLandmassShare - largestLandmassTarget) * 108
+      - Math.max(0, desiredMajorLands - morphology.majorLandmassCount) * 6.4
+      - Math.max(0, morphology.majorLandmassCount - desiredMajorLands - 2) * 2.1
+      - Math.max(0, desiredEffectiveLands - morphology.effectiveLandmassCount) * 7.8
+      - Math.max(0, desiredMajorLands + 1 - morphology.meaningfulLandmassCount) * 2.8;
     if (visualScore > bestVisualScore) {
       bestVisualScore = visualScore;
       best = candidate;
@@ -1845,13 +1925,16 @@ function selectRasterThreshold(
   targetFraction: number,
   marginX: number,
   marginY: number,
+  excluded?: Uint8Array,
 ) {
   let minimum = Number.POSITIVE_INFINITY;
   let maximum = Number.NEGATIVE_INFINITY;
   let eligible = 0;
   for (let y = marginY; y < height - marginY; y += 1) {
     for (let x = marginX; x < width - marginX; x += 1) {
-      const value = values[y * width + x];
+      const index = y * width + x;
+      if (excluded?.[index]) continue;
+      const value = values[index];
       minimum = Math.min(minimum, value);
       maximum = Math.max(maximum, value);
       eligible += 1;
@@ -1862,7 +1945,9 @@ function selectRasterThreshold(
   const scale = (binCount - 1) / Math.max(1e-6, maximum - minimum);
   for (let y = marginY; y < height - marginY; y += 1) {
     for (let x = marginX; x < width - marginX; x += 1) {
-      const bin = clamp(Math.floor((values[y * width + x] - minimum) * scale), 0, binCount - 1);
+      const index = y * width + x;
+      if (excluded?.[index]) continue;
+      const bin = clamp(Math.floor((values[index] - minimum) * scale), 0, binCount - 1);
       histogram[bin] += 1;
     }
   }
@@ -1903,6 +1988,8 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
   const random = makeRandom(seed ^ 0x42c0a57);
   const selected: CoastFeature[] = [];
   const anchors: CoastCandidate[] = [];
+  const planet = planetScaleMetrics(settings);
+  const geographyScale = planet.featureScale;
   const makeFeature = (points: CoastPoint[], strength: number): CoastFeature => {
     const padding = Math.max(...points.map((point) => point.width));
     return {
@@ -1927,7 +2014,7 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
     const featureLength = (regional
       ? peninsula ? mix(0.034, 0.074, random()) : mix(0.045, 0.1, random())
       : peninsula ? mix(0.008, 0.029, random()) : mix(0.01, 0.034, random()))
-      * mix(0.82, 1.14, coastControl);
+      * mix(0.82, 1.14, coastControl) * geographyScale;
     const rootWidth = featureLength * (regional
       ? peninsula ? mix(0.32, 0.48, random()) : slender ? mix(0.22, 0.31, random()) : mix(0.31, 0.48, random())
       : peninsula ? mix(0.28, 0.43, random()) : mix(0.27, 0.42, random()));
@@ -1992,26 +2079,27 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
   // scale. Then grow several smaller neighbors around each one. This produces
   // geographic provinces instead of distributing equally-sized notches around
   // every coast.
-  const regionalTarget = Math.round(mix(8, 13, coastControl));
+  const coastSystemMultiplier = clamp(Math.pow(planet.earthRatio, 1.28), 0.72, 1.72);
+  const regionalTarget = Math.round(mix(8, 13, coastControl) * coastSystemMultiplier);
   const regionalAnchors: CoastCandidate[] = [];
   let attempts = 0;
   while (regionalAnchors.length < regionalTarget && attempts < regionalTarget * 40 && candidates.length) {
     attempts += 1;
     const candidate = candidates[Math.floor(random() * candidates.length)];
-    if (regionalAnchors.some((anchor) => distanceBetween(anchor, candidate) < 0.052)) continue;
+    if (regionalAnchors.some((anchor) => distanceBetween(anchor, candidate) < 0.052 * geographyScale)) continue;
     createSystem(candidate, "regional");
     regionalAnchors.push(candidate);
   }
 
-  const mesoTarget = Math.round(mix(42, 80, coastControl));
+  const mesoTarget = Math.round(mix(42, 80, coastControl) * coastSystemMultiplier);
   let mesoSystems = 0;
   for (const regionalAnchor of regionalAnchors) {
     const localTarget = 3 + Math.floor(random() * 4);
     for (let local = 0; local < localTarget && mesoSystems < mesoTarget; local += 1) {
       const nearby = candidates.filter((candidate) => {
         const distance = distanceBetween(regionalAnchor, candidate);
-        return distance > 0.018 && distance < mix(0.065, 0.125, coastControl)
-          && !anchors.some((anchor) => distanceBetween(anchor, candidate) < 0.011);
+        return distance > 0.018 * geographyScale && distance < mix(0.065, 0.125, coastControl) * geographyScale
+          && !anchors.some((anchor) => distanceBetween(anchor, candidate) < 0.011 * geographyScale);
       });
       if (!nearby.length) break;
       createSystem(nearby[Math.floor(random() * nearby.length)], "meso");
@@ -2022,7 +2110,7 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
   while (mesoSystems < mesoTarget && attempts < mesoTarget * 36 && candidates.length) {
     attempts += 1;
     const candidate = candidates[Math.floor(random() * candidates.length)];
-    if (anchors.some((anchor) => distanceBetween(anchor, candidate) < 0.011)) continue;
+    if (anchors.some((anchor) => distanceBetween(anchor, candidate) < 0.011 * geographyScale)) continue;
     createSystem(candidate, "meso");
     mesoSystems += 1;
   }
@@ -2197,6 +2285,12 @@ function rasterMorphologyMetrics(
   const areas = rasterLandmassAreas(coverage, width, height);
   const meaningfulLandmassCount = areas.filter((area) => area >= landPixels * 0.006).length;
   const largestLandmassShare = (areas[0] ?? 0) / Math.max(1, landPixels);
+  const majorLandmassCount = areas.filter((area) => area >= landPixels * 0.04).length;
+  const continentalAreas = areas.filter((area) => area >= landPixels * 0.004);
+  const continentalPixels = continentalAreas.reduce((sum, area) => sum + area, 0);
+  let concentration = 0;
+  for (const area of continentalAreas) concentration += (area / Math.max(1, continentalPixels)) ** 2;
+  const effectiveLandmassCount = concentration > 0 ? 1 / concentration : 0;
   const islandMinimum = Math.max(3, landPixels * 0.000025);
   const islandMaximum = landPixels * 0.006;
   const islands = areas.filter((area) => area >= islandMinimum && area < islandMaximum);
@@ -2225,6 +2319,8 @@ function rasterMorphologyMetrics(
     islandSizeDiversity,
     largestLandmassShare,
     meaningfulLandmassCount,
+    majorLandmassCount,
+    effectiveLandmassCount,
   };
 }
 
@@ -2242,12 +2338,16 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
     1,
   );
   const macroLand = new Uint8Array(width * height);
+  const oceanReserve = new Uint8Array(width * height);
   const frameMarginX = 0;
   const frameMarginY = Math.ceil(height * FRAME_OCEAN_MARGIN);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
-      macroLand[index] = potentialMap[index] > terrain.seaLevel ? 1 : 0;
+      const worldX = (x / Math.max(1, width - 1)) * mesh.aspect;
+      const reserved = Math.abs(periodicDelta(terrain.oceanCenter, worldX, mesh.aspect)) < terrain.oceanWidth * 0.5;
+      oceanReserve[index] = reserved ? 1 : 0;
+      macroLand[index] = potentialMap[index] > terrain.seaLevel && !reserved ? 1 : 0;
     }
   }
   const signedDistance = signedEuclideanDistance(macroLand, width, height, true);
@@ -2257,6 +2357,8 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   const warpXField = new Float32Array(width * height);
   const warpYField = new Float32Array(width * height);
   const detailControl = settings.coastDetail / 100;
+  const planet = planetScaleMetrics(settings);
+  const frequencyScale = 1 / planet.featureScale;
   const detailAmplitude = mix(14, 84, detailControl) * pixelScale;
   const warpAmplitude = mix(4, 15, detailControl) * pixelScale;
   const minimumDimension = Math.min(width, height);
@@ -2268,8 +2370,8 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       const longitude = nx * TAU;
       const longitudeX = Math.cos(longitude);
       const longitudeY = Math.sin(longitude);
-      const warpX = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.13, 2.4, seed + 521, 3) * warpAmplitude;
-      const warpY = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.21, 2.4, seed + 557, 3) * warpAmplitude;
+      const warpX = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.13, 2.4 * frequencyScale, seed + 521, 3) * warpAmplitude;
+      const warpY = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.21, 2.4 * frequencyScale, seed + 557, 3) * warpAmplitude;
       const index = y * width + x;
       warpXField[index] = warpX;
       warpYField[index] = warpY;
@@ -2277,15 +2379,15 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       const envelope = Math.exp(-((Math.abs(baseDistance) / Math.max(4, detailAmplitude * 2.7)) ** 2));
       const fault = sampleField(faultAtlas.field, faultAtlas.width, faultAtlas.height, nx * (faultAtlas.width - 1), ny * (faultAtlas.height - 1));
       const regionalRoughness = mix(0.42, 1.16, smoothstep(
-        0.5 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.08, 3.1, seed + 579, 3) * 0.72,
+        0.5 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.08, 3.1 * frequencyScale, seed + 579, 3) * 0.72,
       ));
-      const coastNoise = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 4.2, seed + 593, 4) * 0.24
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.17, 10.5, seed + 617, 4) * 0.3
+      const coastNoise = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 4.2 * frequencyScale, seed + 593, 4) * 0.24
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.17, 10.5 * frequencyScale, seed + 617, 4) * 0.3
         + regionalRoughness * (
-          periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 25, seed + 641, 3) * 0.28
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.09, 58, seed + 673, 2) * 0.17
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.31, 124, seed + 691, 1) * 0.085
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.28, 268, seed + 709, 1) * 0.045
+          periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 25 * frequencyScale, seed + 641, 3) * 0.28
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.09, 58 * frequencyScale, seed + 673, 2) * 0.17
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.31, 124 * frequencyScale, seed + 691, 1) * 0.085
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.28, 268 * frequencyScale, seed + 709, 1) * 0.045
         )
         + fault * 0.1;
       const feature = coastFeatureValue(features, nx * mesh.aspect, ny, detailAmplitude * 0.9, mesh.aspect);
@@ -2296,7 +2398,7 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   }
 
   const targetLand = targetLandFraction(settings);
-  const threshold = selectRasterThreshold(coastalField, width, height, targetLand, frameMarginX, frameMarginY);
+  const threshold = selectRasterThreshold(coastalField, width, height, targetLand, frameMarginX, frameMarginY, oceanReserve);
   const coastCoverage = new Float32Array(width * height);
   const coastSigned = new Float32Array(width * height);
   const elevation = new Float32Array(width * height);
@@ -2314,13 +2416,15 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       const longitude = nx * TAU;
       const longitudeX = Math.cos(longitude);
       const longitudeY = Math.sin(longitude);
-      const signed = coastalField[index] - threshold;
+      const signed = oceanReserve[index]
+        ? -Math.max(1, Math.abs(coastalField[index] - threshold))
+        : coastalField[index] - threshold;
       coastSigned[index] = signed;
       const horizontal = coastalField[y * width + ((x + 1) % width)] - coastalField[y * width + wrap(x - 1, width)];
       const vertical = coastalField[Math.min(height - 1, y + 1) * width + x] - coastalField[Math.max(0, y - 1) * width + x];
       const localGradient = Math.max(0.65, Math.hypot(horizontal, vertical) * 0.5);
       const withinFrame = y >= frameMarginY && y < height - frameMarginY;
-      const coverage = withinFrame ? smoothstep(0.5 + signed / (localGradient * 1.65)) : 0;
+      const coverage = withinFrame && !oceanReserve[index] ? smoothstep(0.5 + signed / (localGradient * 1.65)) : 0;
       coastCoverage[index] = coverage;
       if (coverage > 0.5) {
         landPixels += 1;
@@ -2374,6 +2478,8 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
     islandSizeDiversity: morphology.islandSizeDiversity,
     largestLandmassShare: morphology.largestLandmassShare,
     meaningfulLandmassCount: morphology.meaningfulLandmassCount,
+    majorLandmassCount: morphology.majorLandmassCount,
+    effectiveLandmassCount: morphology.effectiveLandmassCount,
     rockLevel: elevationQuantile(elevation, coastCoverage, 0.87),
     snowLevel: elevationQuantile(elevation, coastCoverage, 0.98),
   };
@@ -2700,6 +2806,8 @@ export function renderCartographicStrip(
   const heightScale = outputHeight / sourceHeight;
   const detailScale = outputHeight / 4096;
   const detailControl = model.settings.coastDetail / 100;
+  const planet = planetScaleMetrics(model.settings);
+  const frequencyScale = 1 / planet.featureScale;
   const shoreRoughness = mix(0.72, 1.34, detailControl);
   const coastBand = Math.max(4, 104 * detailScale);
   const pixels = new Uint8ClampedArray(outputWidth * stripHeight * 4);
@@ -2721,18 +2829,18 @@ export function renderCartographicStrip(
         const longitudeY = Math.sin(longitude);
         const envelope = Math.exp(-((Math.abs(signed) / Math.max(2, coastBand * 0.58)) ** 2));
         const warpLongitude = longitude
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.11, 13, model.seed + 887, 2) * 0.026;
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.11, 13 * frequencyScale, model.seed + 887, 2) * 0.026;
         const warpLatitude = ny
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 17, model.seed + 899, 2) * 0.018;
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 17 * frequencyScale, model.seed + 899, 2) * 0.018;
         const warpedX = Math.cos(warpLongitude);
         const warpedY = Math.sin(warpLongitude);
         const regional = mix(0.52, 1.24, smoothstep(
-          0.5 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 3.2, model.seed + 903, 3) * 0.72,
+          0.5 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 3.2 * frequencyScale, model.seed + 903, 3) * 0.72,
         ));
-        const micro = periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude, 64, model.seed + 911, 2) * 36
-          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude - 0.19, 170, model.seed + 947, 2) * 17
-          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude + 0.27, 430, model.seed + 983, 1) * 7
-          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude - 0.31, 1100, model.seed + 997, 1) * 3;
+        const micro = periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude, 64 * frequencyScale, model.seed + 911, 2) * 36
+          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude - 0.19, 170 * frequencyScale, model.seed + 947, 2) * 17
+          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude + 0.27, 430 * frequencyScale, model.seed + 983, 1) * 7
+          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude - 0.31, 1100 * frequencyScale, model.seed + 997, 1) * 3;
         signed += micro * detailScale * shoreRoughness * regional * envelope;
       }
 
@@ -2842,6 +2950,7 @@ function findFocusLongitude(coverage: Float32Array, width: number, height: numbe
 export function generateWorldModel(settings: WorldSettings, onProgress?: (stage: string, progress: number) => void): WorldModel {
   const started = performance.now();
   const seed = seedToInt(settings.seed || "ATLAS");
+  const planet = planetScaleMetrics(settings);
   onProgress?.("Sampling the dense wrapped mesh", 10);
   const mesh = buildGraphMesh(seed, settings.width, settings.height, settings.simulationSites);
   onProgress?.("Composing continental systems and rifts", 28);
@@ -2868,7 +2977,7 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       landPercent,
       plateCount: terrain.plates.length,
       riverCount: routing.riverCount,
-      continentSystems: terrain.continentComponents,
+      continentSystems: raster.majorLandmassCount,
       coastlineIndex: Math.round(raster.coastlineIndex * 10) / 10,
       frameClearance: Math.round(raster.frameClearance * 1000) / 10,
       largestLandmassPercent: Math.round(raster.largestLandmassShare * 1000) / 10,
@@ -2878,6 +2987,9 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       coastHierarchyIndex: Math.round(raster.coastHierarchyIndex * 10) / 10,
       islandAreaPercent: Math.round(raster.islandAreaPercent * 10) / 10,
       islandSizeDiversity: Math.round(raster.islandSizeDiversity * 100) / 100,
+      majorLandmassCount: raster.majorLandmassCount,
+      effectiveLandmassCount: Math.round(raster.effectiveLandmassCount * 10) / 10,
+      circumferenceKm: Math.round(planet.circumferenceKm / 100) * 100,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),
     },

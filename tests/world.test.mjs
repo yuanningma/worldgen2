@@ -6,6 +6,7 @@ const base = {
   seed: "VERDANT-047",
   width: 144,
   height: 90,
+  planetScale: 60,
   continentSize: 56,
   seaLevel: 52,
   coastDetail: 76,
@@ -47,6 +48,21 @@ test("continental systems emerge in a bounded natural range", () => {
   const world = generateWorld(base);
   assert.ok(world.stats.continentSystems >= 3);
   assert.ok(world.stats.continentSystems <= 9);
+  assert.equal(world.stats.continentSystems, world.stats.majorLandmassCount);
+  assert.ok(world.stats.effectiveLandmassCount >= 2.5);
+});
+
+test("planet scale changes the natural geographic carrying capacity", () => {
+  // Exercise the normal visual-candidate path: tiny test rasters intentionally
+  // skip its scale-space morphology scoring for suite speed.
+  const compact = generateWorld({ ...base, width: 512, height: 256, simulationSites: 1400, planetScale: 12 });
+  const grand = generateWorld({ ...base, width: 512, height: 256, simulationSites: 1400, planetScale: 84 });
+  assert.ok(grand.stats.circumferenceKm > compact.stats.circumferenceKm * 1.7);
+  assert.ok(grand.stats.plateCount > compact.stats.plateCount);
+  assert.ok(grand.stats.effectiveLandmassCount > compact.stats.effectiveLandmassCount + 0.8,
+    `effective landmasses were ${compact.stats.effectiveLandmassCount} and ${grand.stats.effectiveLandmassCount}`);
+  assert.ok(grand.stats.continentSystems >= compact.stats.continentSystems,
+    `major lands were ${compact.stats.continentSystems} and ${grand.stats.continentSystems}`);
 });
 
 test("large cartographic exports are deterministic, bounded, and seamless by strip", () => {

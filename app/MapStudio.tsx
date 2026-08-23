@@ -9,6 +9,7 @@ const DEFAULTS: WorldSettings = {
   width: 1536,
   height: 768,
   simulationSites: 22000,
+  planetScale: 72,
   continentSize: 56,
   seaLevel: 52,
   coastDetail: 84,
@@ -33,6 +34,9 @@ const EMPTY_STATS: WorldStats = {
   coastHierarchyIndex: 0,
   islandAreaPercent: 0,
   islandSizeDiversity: 0,
+  majorLandmassCount: 0,
+  effectiveLandmassCount: 0,
+  circumferenceKm: 0,
   focusLongitude: 0,
   generationMs: 0,
 };
@@ -77,6 +81,10 @@ function wrap(value: number, period: number) {
   return ((value % period) + period) % period;
 }
 
+function planetCircumferenceKm(scale: number) {
+  return Math.round((28_000 + 44_000 * (scale / 100)) / 100) * 100;
+}
+
 function drawAtlas(canvas: HTMLCanvasElement, texture: WorldTexture) {
   canvas.width = texture.width;
   canvas.height = texture.height;
@@ -91,6 +99,7 @@ function drawGlobe(
   latitude: number,
   zoom: number,
   sphereCanvas: HTMLCanvasElement,
+  style: RenderStyle,
 ) {
   canvas.width = texture.width;
   canvas.height = texture.height;
@@ -155,7 +164,7 @@ function drawGlobe(
       const bottomLeft = (y1 * sourceWidth + x0) * 4;
       const bottomRight = (y1 * sourceWidth + x1) * 4;
       const light = Math.max(0, screenX * -0.34 + screenY * 0.3 + screenZ * 0.88);
-      const shade = 0.68 + light * 0.34;
+      const shade = style === "climate" ? 0.86 + light * 0.16 : 0.68 + light * 0.34;
       const edge = Math.min(1, (1 - radiusSquared) * radius * 0.78);
       const target = (py * diameter + px) * 4;
       for (let channel = 0; channel < 3; channel += 1) {
@@ -181,14 +190,16 @@ function SettingSlider({
   label,
   value,
   onChange,
+  valueLabel,
 }: {
   label: string;
   value: number;
   onChange: (value: number) => void;
+  valueLabel?: string;
 }) {
   return (
     <div className="control-group">
-      <div className="control-label"><span>{label}</span><output>{value}%</output></div>
+      <div className="control-label"><span>{label}</span><output>{valueLabel ?? `${value}%`}</output></div>
       <input aria-label={label} type="range" min="0" max="100" value={value} onChange={(event) => onChange(Number(event.target.value))} />
     </div>
   );
@@ -205,6 +216,7 @@ export function MapStudio() {
   const generatedSeedRef = useRef(DEFAULTS.seed);
   const pendingSeedRef = useRef(DEFAULTS.seed);
   const textureRef = useRef<WorldTexture | null>(null);
+  const styleRef = useRef<RenderStyle>(DEFAULTS.style);
   const sphereCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewModeRef = useRef<ViewMode>("globe");
   const zoomRef = useRef(1);
@@ -231,7 +243,7 @@ export function MapStudio() {
       const canvas = globeCanvasRef.current;
       if (!canvas) return;
       sphereCanvasRef.current ??= document.createElement("canvas");
-      drawGlobe(canvas, texture, rotationRef.current.longitude, rotationRef.current.latitude, zoomRef.current, sphereCanvasRef.current);
+      drawGlobe(canvas, texture, rotationRef.current.longitude, rotationRef.current.latitude, zoomRef.current, sphereCanvasRef.current, styleRef.current);
     } else if (!hasDetailedAtlasRef.current) {
       const canvas = atlasCanvasRef.current;
       if (canvas) drawAtlas(canvas, texture);
@@ -253,6 +265,7 @@ export function MapStudio() {
     setProgress(7);
     setGenerationStage("Composing continental terranes");
     setError(null);
+    styleRef.current = nextSettings.style;
     pendingSeedRef.current = nextSettings.seed;
     workerRef.current.postMessage({ type: "generate", id, settings: nextSettings });
   }, []);
@@ -452,7 +465,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 09</span>
+            <span className="version">ALPHA 10</span>
           </div>
 
           <label className="seed-field">
@@ -501,6 +514,12 @@ export function MapStudio() {
             </div>
           </div>
 
+          <SettingSlider
+            label="PLANET CIRCUMFERENCE"
+            value={settings.planetScale ?? 60}
+            valueLabel={`${planetCircumferenceKm(settings.planetScale ?? 60).toLocaleString("en-US")} KM`}
+            onChange={(value) => updateSetting("planetScale", value)}
+          />
           <SettingSlider label="CONTINENT MASS" value={settings.continentSize} onChange={(value) => updateSetting("continentSize", value)} />
           <SettingSlider label="GLOBAL SEA LEVEL" value={settings.seaLevel ?? 52} onChange={(value) => updateSetting("seaLevel", value)} />
           <SettingSlider label="COASTAL COMPLEXITY" value={settings.coastDetail} onChange={(value) => updateSetting("coastDetail", value)} />
@@ -519,7 +538,7 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isBusy}>
             <span>{isBusy ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">4K/8K draw directly into the atlas · 8K uses about 128 MB of canvas memory</p>
+          <p className="generation-note">4K/8K/10K draw directly into the atlas · larger planets fit more independent geographic provinces</p>
         </aside>
 
         <div className="map-stage">
@@ -540,9 +559,9 @@ export function MapStudio() {
             style={{ transform: `scale(${zoom})` }}
             aria-label={`Seamless ${atlasResolution.width} by ${atlasResolution.height} equirectangular fantasy world atlas`}
           />
-          <div className="map-vignette" />
+          <div className={`map-vignette ${settings.style === "climate" && viewMode === "atlas" ? "is-flat" : ""}`} />
 
-          <div className="coordinates">{viewMode === "globe" ? "DRAG TO ROTATE" : "EQUIRECTANGULAR"} <span>—</span> SEAMLESS 360°</div>
+          <div className="coordinates">{viewMode === "globe" ? "DRAG TO ROTATE" : "EQUIRECTANGULAR"} <span>—</span> {stats.circumferenceKm ? `${stats.circumferenceKm.toLocaleString("en-US")} KM` : "SEAMLESS 360°"}</div>
           <div className="view-switcher" aria-label="Map projection">
             <button type="button" className={viewMode === "globe" ? "active" : ""} onClick={() => changeViewMode("globe")} aria-pressed={viewMode === "globe"}>GLOBE</button>
             <button type="button" className={viewMode === "atlas" ? "active" : ""} onClick={() => changeViewMode("atlas")} aria-pressed={viewMode === "atlas"}>ATLAS</button>
@@ -555,12 +574,16 @@ export function MapStudio() {
 
           <div className="survey-strip" aria-label="World survey">
             <div><span>LAND</span><strong>{stats.landPercent || "—"}%</strong></div>
-            <div><span>SYSTEMS</span><strong>{stats.continentSystems || "—"}</strong></div>
+            <div><span>MAJOR LANDS</span><strong>{stats.majorLandmassCount || "—"}</strong></div>
             <div><span>HEADWATERS</span><strong>{stats.riverCount || "—"}</strong></div>
             <div><span>GENESIS</span><strong>{stats.generationMs ? `${(stats.generationMs / 1000).toFixed(1)}s` : "—"}</strong></div>
           </div>
 
-          <div className="scale-bar"><span>0</span><i /><span>1,000 KM</span></div>
+          <div className="scale-bar">
+            <span>PLANET</span>
+            <i />
+            <span>{stats.circumferenceKm ? `${(stats.circumferenceKm / 1000).toFixed(1)}K KM CIRC.` : "WORLD SCALE"}</span>
+          </div>
           <div className="map-caption"><span className="eyebrow">BIOME SURVEY</span><strong>{stats.survey}</strong></div>
 
           {isBusy && (

@@ -88,6 +88,7 @@ input[type="range"] { width: 100%; margin: 12px 0 0; accent-color: var(--accent)
 .world-canvas.globe-view:active { cursor: grabbing; }
 .world-canvas:focus-visible { outline: 2px solid rgba(213, 102, 60, 0.9); outline-offset: -4px; }
 .map-vignette { position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 120px rgba(2, 12, 15, 0.46); background: linear-gradient(180deg, rgba(9, 19, 21, 0.08), transparent 30%, transparent 75%, rgba(8, 19, 21, 0.22)); }
+.map-vignette.is-flat { box-shadow: none; background: none; }
 .coordinates { position: absolute; top: 20px; left: 22px; padding: 7px 9px; background: rgba(8, 23, 27, 0.62); color: #d7d7c9; font: 500 9px/1 var(--font-geist-mono), monospace; letter-spacing: 0.08em; backdrop-filter: blur(8px); }
 .coordinates span { color: #91a5a0; margin: 0 6px; }
 .view-switcher { position: absolute; top: 20px; left: 248px; display: grid; grid-template-columns: repeat(2, 1fr); height: 31px; border: 1px solid rgba(229, 228, 217, 0.28); background: rgba(8, 23, 27, 0.62); color: #c4cfcb; backdrop-filter: blur(8px); }
