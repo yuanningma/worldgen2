@@ -29,6 +29,7 @@ const EMPTY_STATS: WorldStats = {
   largestLandmassPercent: 0,
   oceanGapPercent: 0,
   meanLandmassElongation: 0,
+  coastScaleRatio: 0,
   focusLongitude: 0,
   generationMs: 0,
 };
@@ -55,12 +56,12 @@ const RESOLUTION_PRESETS = [
   { label: "ULTRA", width: 2048, height: 1024 },
 ] as const;
 
-const EXPORT_PRESETS = [
+const ATLAS_PRESETS = [
   { label: "4K", width: 4096, height: 2048 },
   { label: "8K", width: 8192, height: 4096 },
 ] as const;
 
-type ExportPreset = (typeof EXPORT_PRESETS)[number];
+type AtlasPreset = (typeof ATLAS_PRESETS)[number];
 
 function freshSeed() {
   const words = ["AURELIA", "BRAMBLE", "CERULEAN", "EMBER", "HALCYON", "MISTRAL", "SABLE", "THORN", "VESPER"];
@@ -190,12 +191,13 @@ function SettingSlider({
 }
 
 export function MapStudio() {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const globeCanvasRef = useRef<HTMLCanvasElement>(null);
+  const atlasCanvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestRef = useRef(0);
-  const exportRequestRef = useRef(0);
-  const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const exportTargetRef = useRef<ExportPreset>(EXPORT_PRESETS[1]);
+  const atlasRequestRef = useRef(0);
+  const atlasTargetRef = useRef<AtlasPreset>(ATLAS_PRESETS[1]);
+  const hasDetailedAtlasRef = useRef(false);
   const generatedSeedRef = useRef(DEFAULTS.seed);
   const pendingSeedRef = useRef(DEFAULTS.seed);
   const textureRef = useRef<WorldTexture | null>(null);
@@ -208,24 +210,27 @@ export function MapStudio() {
   const [settings, setSettings] = useState(DEFAULTS);
   const [stats, setStats] = useState(EMPTY_STATS);
   const [isGenerating, setIsGenerating] = useState(true);
-  const [isExporting, setIsExporting] = useState(false);
-  const [exportTarget, setExportTarget] = useState<ExportPreset>(EXPORT_PRESETS[1]);
+  const [isRenderingAtlas, setIsRenderingAtlas] = useState(false);
+  const [atlasTarget, setAtlasTarget] = useState<AtlasPreset>(ATLAS_PRESETS[1]);
+  const [atlasResolution, setAtlasResolution] = useState({ label: "HIGH", width: DEFAULTS.width, height: DEFAULTS.height });
   const [generationStage, setGenerationStage] = useState("Preparing genesis engine");
   const [progress, setProgress] = useState(6);
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [viewMode, setViewMode] = useState<ViewMode>("globe");
-  const isBusy = isGenerating || isExporting;
+  const isBusy = isGenerating || isRenderingAtlas;
 
   const renderCurrentView = useCallback(() => {
-    const canvas = canvasRef.current;
     const texture = textureRef.current;
-    if (!canvas || !texture) return;
+    if (!texture) return;
     if (viewModeRef.current === "globe") {
+      const canvas = globeCanvasRef.current;
+      if (!canvas) return;
       sphereCanvasRef.current ??= document.createElement("canvas");
       drawGlobe(canvas, texture, rotationRef.current.longitude, rotationRef.current.latitude, zoomRef.current, sphereCanvasRef.current);
-    } else {
-      drawAtlas(canvas, texture);
+    } else if (!hasDetailedAtlasRef.current) {
+      const canvas = atlasCanvasRef.current;
+      if (canvas) drawAtlas(canvas, texture);
     }
   }, []);
 
@@ -254,42 +259,28 @@ export function MapStudio() {
     worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
       const message = event.data;
       if (message.type === "export-tile") {
-        if (message.id !== exportRequestRef.current) return;
-        const canvas = exportCanvasRef.current;
+        if (message.id !== atlasRequestRef.current) return;
+        const canvas = atlasCanvasRef.current;
         const context = canvas?.getContext("2d");
         if (!canvas || !context) return;
         context.putImageData(new ImageData(new Uint8ClampedArray(message.pixels), message.width, message.height), 0, message.y);
-        setProgress(Math.min(96, Math.round(((message.y + message.height) / exportTargetRef.current.height) * 96)));
+        setProgress(Math.min(99, Math.round(((message.y + message.height) / atlasTargetRef.current.height) * 100)));
         return;
       }
       if (message.type === "export-complete") {
-        if (message.id !== exportRequestRef.current) return;
-        const canvas = exportCanvasRef.current;
-        if (!canvas) return;
-        const target = exportTargetRef.current;
-        setGenerationStage(`Encoding the ${target.label} PNG`);
-        setProgress(98);
-        canvas.toBlob((blob) => {
-          if (!blob) {
-            setError(`The browser could not encode the ${target.label} atlas. Try the 4K or current-view export instead.`);
-          } else {
-            const link = document.createElement("a");
-            link.download = `${generatedSeedRef.current.toLowerCase()}-${target.label.toLowerCase()}-atlas.png`;
-            link.href = URL.createObjectURL(blob);
-            link.click();
-            URL.revokeObjectURL(link.href);
-          }
-          exportCanvasRef.current = null;
-          setProgress(100);
-          setIsExporting(false);
-        }, "image/png");
+        if (message.id !== atlasRequestRef.current) return;
+        const target = atlasTargetRef.current;
+        setAtlasResolution(target);
+        setGenerationStage(`${target.label} atlas ready in browser`);
+        setProgress(100);
+        setIsRenderingAtlas(false);
         return;
       }
       if (message.type === "export-error") {
-        if (message.id !== exportRequestRef.current) return;
-        exportCanvasRef.current = null;
+        if (message.id !== atlasRequestRef.current) return;
+        hasDetailedAtlasRef.current = false;
         setError(message.message);
-        setIsExporting(false);
+        setIsRenderingAtlas(false);
         return;
       }
       if (message.id !== requestRef.current) return;
@@ -299,7 +290,10 @@ export function MapStudio() {
       } else if (message.type === "complete") {
         textureRef.current = { pixels: new Uint8ClampedArray(message.pixels), width: message.width, height: message.height };
         generatedSeedRef.current = pendingSeedRef.current;
+        hasDetailedAtlasRef.current = false;
+        setAtlasResolution({ label: "MODEL", width: message.width, height: message.height });
         rotationRef.current.longitude = message.stats.focusLongitude;
+        if (atlasCanvasRef.current) drawAtlas(atlasCanvasRef.current, textureRef.current);
         renderCurrentView();
         setStats(message.stats);
         setProgress(100);
@@ -396,7 +390,7 @@ export function MapStudio() {
   };
 
   const exportMap = () => {
-    const canvas = canvasRef.current;
+    const canvas = viewModeRef.current === "atlas" ? atlasCanvasRef.current : globeCanvasRef.current;
     if (!canvas) return;
     canvas.toBlob((blob) => {
       if (!blob) return;
@@ -408,23 +402,29 @@ export function MapStudio() {
     }, "image/png");
   };
 
-  const exportHighResolution = (target: ExportPreset) => {
+  const renderHighResolution = (target: AtlasPreset) => {
     if (!workerRef.current || isBusy || !textureRef.current) return;
-    const canvas = document.createElement("canvas");
+    const canvas = atlasCanvasRef.current;
+    if (!canvas) return;
     canvas.width = target.width;
     canvas.height = target.height;
     if (!canvas.getContext("2d")) {
       setError(`This browser cannot allocate a ${target.label} atlas canvas.`);
       return;
     }
-    exportCanvasRef.current = canvas;
-    exportTargetRef.current = target;
-    setExportTarget(target);
-    const id = ++exportRequestRef.current;
-    setIsExporting(true);
+    hasDetailedAtlasRef.current = true;
+    atlasTargetRef.current = target;
+    setAtlasTarget(target);
+    setAtlasResolution(target);
+    viewModeRef.current = "atlas";
+    setViewMode("atlas");
+    setZoom(1);
+    zoomRef.current = 1;
+    const id = ++atlasRequestRef.current;
+    setIsRenderingAtlas(true);
     setError(null);
     setProgress(1);
-    setGenerationStage(`Rendering ${target.label} cartographic strips`);
+    setGenerationStage(`Drawing the ${target.label} atlas in browser`);
     workerRef.current.postMessage({ type: "export", id, width: target.width, height: target.height });
   };
 
@@ -437,9 +437,9 @@ export function MapStudio() {
         </div>
         <div className="world-title"><span className="eyebrow">CURRENT WORLD</span><strong>{stats.name.toUpperCase()}</strong></div>
         <div className="topbar-actions">
-          <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>EXPORT VIEW</button>
-          <button className="export-button" type="button" onClick={() => exportHighResolution(EXPORT_PRESETS[0])} disabled={isBusy}>EXPORT 4K</button>
-          <button className="export-button export-primary" type="button" onClick={() => exportHighResolution(EXPORT_PRESETS[1])} disabled={isBusy}>EXPORT 8K</button>
+          <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>DOWNLOAD VIEW</button>
+          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[0])} disabled={isBusy}>RENDER 4K</button>
+          <button className="export-button export-primary" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[1])} disabled={isBusy}>RENDER 8K</button>
         </div>
       </header>
 
@@ -447,7 +447,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 07</span>
+            <span className="version">ALPHA 08</span>
           </div>
 
           <label className="seed-field">
@@ -480,10 +480,16 @@ export function MapStudio() {
           </div>
 
           <div className="export-section">
-            <div className="control-label"><span>HIGH-RES ATLAS</span><output>same geography</output></div>
+            <div className="control-label"><span>IN-BROWSER ATLAS</span><output>{atlasResolution.width} × {atlasResolution.height}</output></div>
             <div className="export-grid">
-              {EXPORT_PRESETS.map((preset) => (
-                <button key={preset.label} type="button" onClick={() => exportHighResolution(preset)} disabled={isBusy}>
+              {ATLAS_PRESETS.map((preset) => (
+                <button
+                  key={preset.label}
+                  className={atlasResolution.width === preset.width ? "active" : ""}
+                  type="button"
+                  onClick={() => renderHighResolution(preset)}
+                  disabled={isBusy}
+                >
                   <strong>{preset.label}</strong><span>{preset.width} × {preset.height}</span>
                 </button>
               ))}
@@ -500,6 +506,7 @@ export function MapStudio() {
             <span className="section-label">RENDERING STYLE</span>
             <div className="style-grid">
               <button className={`style-card ${settings.style === "satellite" ? "active" : ""}`} type="button" onClick={() => selectStyle("satellite")} aria-pressed={settings.style === "satellite"} disabled={isBusy}><i className="satellite-swatch" />Satellite</button>
+              <button className={`style-card ${settings.style === "climate" ? "active" : ""}`} type="button" onClick={() => selectStyle("climate")} aria-pressed={settings.style === "climate"} disabled={isBusy}><i className="climate-swatch" />Climate atlas</button>
               <button className={`style-card ${settings.style === "ink" ? "active" : ""}`} type="button" onClick={() => selectStyle("ink")} aria-pressed={settings.style === "ink"} disabled={isBusy}><i className="ink-swatch" />Field ink</button>
             </div>
           </div>
@@ -507,21 +514,26 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isBusy}>
             <span>{isBusy ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">Preview builds the model · 4K/8K rerender it in memory-bounded strips</p>
+          <p className="generation-note">4K/8K draw directly into the atlas · 8K uses about 128 MB of canvas memory</p>
         </aside>
 
         <div className="map-stage">
           <canvas
-            ref={canvasRef}
-            className={`world-canvas ${viewMode === "globe" ? "globe-view" : "atlas-view"}`}
-            style={{ transform: viewMode === "atlas" ? `scale(${zoom})` : undefined }}
-            aria-label={viewMode === "globe" ? "Rotatable procedural fantasy planet" : "Seamless equirectangular fantasy world atlas"}
+            ref={globeCanvasRef}
+            className={`world-canvas globe-view ${viewMode === "globe" ? "" : "is-hidden"}`}
+            aria-label="Rotatable procedural fantasy planet"
             tabIndex={viewMode === "globe" ? 0 : -1}
             onPointerDown={handlePointerDown}
             onPointerMove={handlePointerMove}
             onPointerUp={handlePointerUp}
             onPointerCancel={handlePointerUp}
             onKeyDown={handleMapKey}
+          />
+          <canvas
+            ref={atlasCanvasRef}
+            className={`world-canvas atlas-view ${viewMode === "atlas" ? "" : "is-hidden"}`}
+            style={{ transform: `scale(${zoom})` }}
+            aria-label={`Seamless ${atlasResolution.width} by ${atlasResolution.height} equirectangular fantasy world atlas`}
           />
           <div className="map-vignette" />
 
@@ -551,7 +563,7 @@ export function MapStudio() {
               <div className="generation-orbit"><span /></div>
               <strong>{generationStage}</strong>
               <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
-              <span>{progress}% · {isExporting ? `strip-rendered ${exportTarget.width} × ${exportTarget.height} atlas` : "deterministic from seed"}</span>
+              <span>{progress}% · {isRenderingAtlas ? `drawing ${atlasTarget.width} × ${atlasTarget.height} into the atlas` : "deterministic from seed"}</span>
             </div>
           )}
           {error && <div className="error-toast" role="alert">{error}</div>}

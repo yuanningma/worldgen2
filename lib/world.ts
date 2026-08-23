@@ -1,6 +1,6 @@
 import { Delaunay } from "d3-delaunay";
 
-export type RenderStyle = "satellite" | "ink";
+export type RenderStyle = "satellite" | "ink" | "climate";
 
 export interface WorldSettings {
   seed: string;
@@ -27,6 +27,7 @@ export interface WorldStats {
   largestLandmassPercent: number;
   oceanGapPercent: number;
   meanLandmassElongation: number;
+  coastScaleRatio: number;
   focusLongitude: number;
   generationMs: number;
 }
@@ -103,7 +104,21 @@ interface CrustStroke {
   strength: number;
 }
 
+interface CrustMass {
+  x: number;
+  y: number;
+  radiusX: number;
+  radiusY: number;
+  angle: number;
+  strength: number;
+  harmonicA: number;
+  harmonicB: number;
+  phaseA: number;
+  phaseB: number;
+}
+
 interface CrustComposition {
+  masses: CrustMass[];
   terranes: CrustStroke[];
   cuts: CrustStroke[];
   period: number;
@@ -127,10 +142,12 @@ interface ContinentalAssignment {
 
 export interface RasterTerrain {
   elevation: Float32Array;
+  mountainStrength: Float32Array;
   coastCoverage: Float32Array;
   coastSigned: Float32Array;
   coastlineIndex: number;
   frameClearance: number;
+  coastScaleRatio: number;
   rockLevel: number;
   snowLevel: number;
 }
@@ -539,7 +556,7 @@ function assignContinentalClusters(
   // remains isolated across a broad sea. The exact continent count still emerges
   // later when sea level cuts the continuous field.
   const oceanCenter = random() * aspect;
-  const oceanWidth = mix(0.32, 0.48, random());
+  const oceanWidth = mix(0.4, 0.62, random());
   const landCenter = wrap(oceanCenter + aspect * 0.5, aspect);
   const provinceCount = rootCount >= 6 && random() < 0.52 ? 3 : 2;
   const provinceOffsets = provinceCount === 3
@@ -671,6 +688,7 @@ function buildCrustComposition(
   aspect: number,
   random: () => number,
 ): CrustComposition {
+  const masses: CrustMass[] = [];
   const terranes: CrustStroke[] = [];
   const cuts: CrustStroke[] = [];
   const groups = new Map<number, Plate[]>();
@@ -747,6 +765,41 @@ function buildCrustComposition(
     const isCrescent = rank > 0 && rank < entries.length - 1 && random() < 0.24;
     const isArchipelagic = group.length === 1 && rank >= Math.ceil(entries.length * 0.58);
 
+    // A distorted anisotropic cratonic mass gives every major system a readable
+    // body before lobes, peninsulas, and rifts modify its outline. This avoids
+    // both a union of circular blobs and a skeleton of connected strokes.
+    const massAngle = random() * TAU;
+    const majorRadius = (isDominant ? mix(0.155, 0.215, random()) : mix(0.105, 0.175, random())) * coreScale;
+    const minorRadius = majorRadius * mix(0.58, 0.82, random());
+    masses.push({
+      x: centroid.x,
+      y: centroid.y,
+      radiusX: majorRadius,
+      radiusY: minorRadius,
+      angle: massAngle,
+      strength: mix(0.94, 1.08, random()),
+      harmonicA: mix(0.08, 0.16, random()),
+      harmonicB: mix(0.045, 0.11, random()),
+      phaseA: random() * TAU,
+      phaseB: random() * TAU,
+    });
+    if ((isDominant || group.length >= 3) && random() < 0.72) {
+      const offsetAngle = massAngle + mix(0.7, 1.35, random()) * (random() < 0.5 ? -1 : 1);
+      const offset = majorRadius * mix(0.42, 0.72, random());
+      masses.push({
+        x: centroid.x + Math.cos(offsetAngle) * offset,
+        y: constrainY(centroid.y + Math.sin(offsetAngle) * offset),
+        radiusX: majorRadius * mix(0.56, 0.78, random()),
+        radiusY: minorRadius * mix(0.58, 0.82, random()),
+        angle: massAngle + (random() - 0.5) * 1.1,
+        strength: mix(0.88, 1.01, random()),
+        harmonicA: mix(0.07, 0.14, random()),
+        harmonicB: mix(0.04, 0.09, random()),
+        phaseA: random() * TAU,
+        phaseB: random() * TAU,
+      });
+    }
+
     // Broad, overlapping terranes establish compact silhouettes. Plate centers
     // influence their placement, but are pulled toward a shared cratonic core so
     // a three-plate system does not become a chain of paddles.
@@ -772,13 +825,13 @@ function buildCrustComposition(
     const lobePhase = random() * TAU;
     for (let lobe = 0; lobe < lobeCount; lobe += 1) {
       const angle = lobePhase + (lobe / lobeCount) * TAU + (random() - 0.5) * 0.68;
-      const offset = mix(0.035, 0.085, random()) * coreScale;
+      const offset = mix(0.04, 0.1, random()) * coreScale;
       const lobeCenter = {
         x: centroid.x + Math.cos(angle) * offset,
         y: constrainY(centroid.y + Math.sin(angle) * offset),
       };
-      const halfLength = mix(0.025, 0.064, random()) * coreScale;
-      const width = mix(0.052, 0.086, random()) * coreScale * (isArchipelagic ? 0.68 : 1);
+      const halfLength = mix(0.027, 0.071, random()) * coreScale;
+      const width = mix(0.04, 0.071, random()) * coreScale * (isArchipelagic ? 0.68 : 1);
       const tangent = angle + (random() - 0.5) * 0.9;
       terranes.push({
         ax: lobeCenter.x - Math.cos(tangent) * halfLength,
@@ -863,16 +916,16 @@ function buildCrustComposition(
     }
 
     const outerNodes = [...nodes].sort((a, b) => Math.hypot(b.x - centroid.x, b.y - centroid.y) - Math.hypot(a.x - centroid.x, a.y - centroid.y));
-    const inletCount = (isDominant || isRifted ? 2 : 1) + (random() < 0.42 ? 1 : 0);
+    const inletCount = (isDominant || isRifted ? 3 : 1) + (random() < 0.52 ? 1 : 0);
     for (let inlet = 0; inlet < inletCount; inlet += 1) {
       const anchor = outerNodes[inlet % outerNodes.length];
       let angle = Math.atan2(anchor.y - centroid.y, anchor.x - centroid.x);
       angle += (random() - 0.5) * 0.58;
-      const outside = mix(0.055, 0.105, random());
+      const outside = mix(0.05, 0.1, random());
       const start = { x: anchor.x + Math.cos(angle) * outside, y: constrainY(anchor.y + Math.sin(angle) * outside) };
-      const cutLength = outside + mix(0.055, isRifted ? 0.15 : 0.11, random());
-      const mouthWidth = mix(0.03, 0.055, random());
-      const headWidth = mix(0.011, 0.026, random());
+      const cutLength = outside + mix(0.048, isRifted ? 0.14 : 0.105, random());
+      const mouthWidth = mix(0.021, 0.044, random());
+      const headWidth = mix(0.007, 0.019, random());
       const cutCurl = (random() < 0.5 ? -1 : 1) * mix(0.12, 0.48, random());
       const head = addPath(cuts, start, angle + Math.PI, cutLength, 3 + Math.floor(random() * 2), mouthWidth, headWidth, mix(1.2, 1.52, random()), cutCurl);
       if (random() < 0.5) {
@@ -916,7 +969,22 @@ function buildCrustComposition(
       });
     }
   }
-  return { terranes, cuts, period: aspect };
+  return { masses, terranes, cuts, period: aspect };
+}
+
+function evaluateCrustMass(x: number, y: number, mass: CrustMass) {
+  const cosAngle = Math.cos(mass.angle);
+  const sinAngle = Math.sin(mass.angle);
+  const dx = x - mass.x;
+  const dy = y - mass.y;
+  const localX = dx * cosAngle + dy * sinAngle;
+  const localY = -dx * sinAngle + dy * cosAngle;
+  const theta = Math.atan2(localY / mass.radiusY, localX / mass.radiusX);
+  const boundary = Math.max(0.72, 1
+    + Math.sin(theta * 3 + mass.phaseA) * mass.harmonicA
+    + Math.sin(theta * 5 + mass.phaseB) * mass.harmonicB);
+  const radius = Math.hypot(localX / mass.radiusX, localY / mass.radiusY) / boundary;
+  return (1 - Math.pow(radius, 1.62)) * mass.strength;
 }
 
 function evaluateCrustStroke(x: number, y: number, stroke: CrustStroke) {
@@ -927,11 +995,25 @@ function evaluateCrustStroke(x: number, y: number, stroke: CrustStroke) {
   const closestX = stroke.ax + dx * projection;
   const closestY = stroke.ay + dy * projection;
   const radius = mix(stroke.radiusA, stroke.radiusB, projection);
-  return (1 - Math.hypot(x - closestX, y - closestY) / Math.max(0.003, radius)) * stroke.strength;
+  const length = Math.sqrt(Math.max(1e-8, lengthSquared));
+  const lateral = ((x - closestX) * -dy + (y - closestY) * dx) / length;
+  const phase = stroke.ax * 71.7 + stroke.ay * 113.9 + stroke.bx * 37.1 + stroke.by * 59.3;
+  const shoulder = Math.sin(projection * TAU * 1.35 + phase) * 0.085
+    + Math.sign(lateral || 1) * Math.sin(projection * Math.PI + phase * 0.37) * 0.055;
+  const shapedRadius = Math.max(0.003, radius * (1 + shoulder));
+  const normalizedDistance = Math.hypot(x - closestX, y - closestY) / shapedRadius;
+  // A broad-topped terrane retains geographic width as sea level rises. Linear
+  // capsule falloff collapses to medial lines, which produced the old skinny,
+  // tacked-on silhouettes at low land fractions.
+  return (1 - Math.pow(normalizedDistance, 1.48)) * stroke.strength;
 }
 
 function evaluateCrustComposition(composition: CrustComposition, x: number, y: number) {
   let terrane = -1.4;
+  for (const mass of composition.masses) {
+    const periodicX = x + Math.round((mass.x - x) / composition.period) * composition.period;
+    terrane = Math.max(terrane, evaluateCrustMass(periodicX, y, mass));
+  }
   for (const stroke of composition.terranes) {
     const centerX = (stroke.ax + stroke.bx) * 0.5;
     const periodicX = x + Math.round((centerX - x) / composition.period) * composition.period;
@@ -1196,7 +1278,7 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
       + (plate.continental ? interior * 0.05 : -interior * 0.035)
       + macro * 0.3
       + regional * coastAmplitude
-      - oceanBasin * 0.24
+      - oceanBasin * 0.36
       - edgePenalty;
     if (!plate.continental && polarDistance > 0.12 && Number.isFinite(convergence.distance[cell])) {
       const arcInfluence = Math.exp(-convergence.distance[cell] / 0.014) * convergence.strength[cell];
@@ -1257,6 +1339,22 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     landMask,
     mix(11, 16.5, settings.coastDetail / 100),
   );
+  // Also judge the same continuous crust at a lower exposed-land fraction.
+  // Attractive continents should remain broad geographic bodies when sea level
+  // rises instead of collapsing into a set of long capsule centerlines.
+  const sparseThreshold = selectThreshold(
+    Float32Array.from(eligiblePotential),
+    clamp((Math.max(0.17, targetLand - 0.075) * mesh.cellCount) / Math.max(1, eligiblePotential.length), 0, 0.9),
+  );
+  const sparseLandMask = new Uint8Array(mesh.cellCount);
+  for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const polarDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
+    sparseLandMask[cell] = potential[cell] > sparseThreshold && polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] ? 1 : 0;
+  }
+  const sparseMeasured = measureTerrain(mesh, sparseLandMask, mix(10.2, 14.8, settings.coastDetail / 100));
+  const lowLandStabilityPenalty = Math.max(0, sparseMeasured.meanLandmassElongation - 2.55) * 7.2
+    + Math.max(0, sparseMeasured.largestLandmassShare - 0.78) * 24
+    + Math.max(0, 3 - sparseMeasured.meaningfulComponents) * 2.5;
   return {
     plates,
     plateId,
@@ -1265,7 +1363,7 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     landMask,
     ridge,
     seaLevel,
-    score: measured.score,
+    score: measured.score - lowLandStabilityPenalty,
     coastlineIndex: measured.coastlineIndex,
     frameClearance: measured.frameClearance,
     continentComponents: measured.meaningfulComponents,
@@ -1350,12 +1448,13 @@ function routeGraphRivers(mesh: GraphMesh, terrain: TerrainCandidate, settings: 
     const target = receiver[cell];
     if (target >= 0) accumulation[target] += accumulation[cell];
   }
-  const threshold = landCells * mix(0.0075, 0.0038, settings.moisture / 100);
+  const threshold = landCells * mix(0.0056, 0.0028, settings.moisture / 100);
   const river = new Uint8Array(mesh.cellCount);
   for (const cell of order) {
     if (accumulation[cell] >= threshold && terrain.elevation[cell] > 0.012) river[cell] = 1;
   }
   let riverCount = 0;
+  const drawableSources = new Uint8Array(mesh.cellCount);
   for (const cell of order) {
     if (!river[cell]) continue;
     let hasRiverInflow = false;
@@ -1366,10 +1465,26 @@ function routeGraphRivers(mesh: GraphMesh, terrain: TerrainCandidate, settings: 
         break;
       }
     }
-    if (!hasRiverInflow) riverCount += 1;
+    if (!hasRiverInflow) {
+      let pathLength = 0;
+      let steps = 0;
+      let current = cell;
+      while (current >= 0 && steps < mesh.cellCount) {
+        const target = receiver[current];
+        if (target < 0) break;
+        pathLength += graphDistance(mesh, current, target);
+        steps += 1;
+        current = target;
+        if (!terrain.landMask[current]) break;
+      }
+      if (steps >= 4 && pathLength >= 0.045) {
+        drawableSources[cell] = 1;
+        riverCount += 1;
+      }
+    }
     terrain.elevation[cell] = Math.max(0.003, terrain.elevation[cell] - clamp(Math.log2(accumulation[cell] / threshold + 1) * 0.012, 0.004, 0.035));
   }
-  return { receiver, accumulation, river, threshold, riverCount };
+  return { receiver, accumulation, river, drawableSources, threshold, riverCount };
 }
 
 function rasterizeTriangles(mesh: GraphMesh, values: Float32Array, width: number, height: number) {
@@ -1628,20 +1743,20 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
       maxY: Math.max(...points.map((point) => point.y)) + padding,
     };
   };
-  const desired = Math.round(mix(14, 30, settings.coastDetail / 100));
+  const desired = Math.round(mix(17, 33, settings.coastDetail / 100));
   let systems = 0;
   let attempts = 0;
   while (systems < desired && candidates.length && attempts < desired * 22) {
     attempts += 1;
     const candidate = candidates[Math.floor(random() * candidates.length)];
-    if (anchors.some((anchor) => Math.hypot(periodicDelta(anchor.x, candidate.x, mesh.aspect), anchor.y - candidate.y) < 0.044)) continue;
+    if (anchors.some((anchor) => Math.hypot(periodicDelta(anchor.x, candidate.x, mesh.aspect), anchor.y - candidate.y) < 0.035)) continue;
 
-    const peninsula = random() < 0.18;
+    const peninsula = random() < 0.26;
     const sign = peninsula ? 1 : -1;
-    const featureLength = (peninsula ? mix(0.035, 0.078, random()) : mix(0.055, 0.145, random()))
+    const featureLength = (peninsula ? mix(0.027, 0.068, random()) : mix(0.038, 0.104, random()))
       * mix(0.78, 1.16, settings.coastDetail / 100);
-    const rootWidth = featureLength * (peninsula ? mix(0.24, 0.36, random()) : mix(0.28, 0.46, random()));
-    const tipWidth = rootWidth * (peninsula ? mix(0.68, 0.9, random()) : mix(0.45, 0.68, random()));
+    const rootWidth = featureLength * (peninsula ? mix(0.2, 0.33, random()) : mix(0.18, 0.34, random()));
+    const tipWidth = rootWidth * (peninsula ? mix(0.58, 0.84, random()) : mix(0.3, 0.58, random()));
     const segmentCount = 4 + Math.floor(random() * 3);
     const points: CoastPoint[] = [];
     let heading = Math.atan2(candidate.dy * sign, candidate.dx * sign);
@@ -1778,13 +1893,34 @@ function elevationQuantile(elevation: Float32Array, coverage: Float32Array, frac
   return maximum;
 }
 
+function coastlinePerimeterAtScale(coverage: Float32Array, width: number, height: number, step: number) {
+  let perimeter = 0;
+  const offset = Math.floor(step * 0.5);
+  for (let y = offset; y < height; y += step) {
+    const previousY = Math.max(offset, y - step);
+    for (let x = offset; x < width; x += step) {
+      const land = coverage[y * width + x] > 0.5;
+      const leftX = wrap(x - step, width);
+      if (land !== (coverage[y * width + leftX] > 0.5)) perimeter += step;
+      if (y !== previousY && land !== (coverage[previousY * width + x] > 0.5)) perimeter += step;
+    }
+  }
+  return perimeter;
+}
+
 function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings: WorldSettings, seed: number): RasterTerrain {
   const { width, height } = settings;
   const pixelScale = Math.min(width, height) / 630;
   const potentialMap = rasterizeTriangles(mesh, terrain.potential, width, height);
   const reliefRadius = Math.max(3, Math.round(pixelScale * 5));
   const macroElevation = boxBlurField(rasterizeTriangles(mesh, terrain.elevation, width, height), width, height, reliefRadius, 2);
-  const ridgeMap = boxBlurField(rasterizeTriangles(mesh, terrain.ridge, width, height), width, height, Math.max(2, Math.round(reliefRadius * 0.7)), 2);
+  const ridgeMap = boxBlurField(
+    rasterizeTriangles(mesh, terrain.ridge, width, height),
+    width,
+    height,
+    Math.max(1, Math.round(reliefRadius * 0.36)),
+    1,
+  );
   const macroLand = new Uint8Array(width * height);
   const frameMarginX = 0;
   const frameMarginY = Math.ceil(height * FRAME_OCEAN_MARGIN);
@@ -1820,12 +1956,17 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       const baseDistance = sampleField(signedDistance, width, height, x + warpX, y + warpY, true);
       const envelope = Math.exp(-((Math.abs(baseDistance) / Math.max(4, detailAmplitude * 2.7)) ** 2));
       const fault = sampleField(faultAtlas.field, faultAtlas.width, faultAtlas.height, nx * (faultAtlas.width - 1), ny * (faultAtlas.height - 1));
-      const coastNoise = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 4.2, seed + 593, 4) * 0.22
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.17, 10.5, seed + 617, 4) * 0.24
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 25, seed + 641, 3) * 0.22
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.09, 58, seed + 673, 2) * 0.16
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.31, 124, seed + 691, 1) * 0.1
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.28, 268, seed + 709, 1) * 0.06
+      const regionalRoughness = mix(0.42, 1.16, smoothstep(
+        0.5 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.08, 3.1, seed + 579, 3) * 0.72,
+      ));
+      const coastNoise = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 4.2, seed + 593, 4) * 0.24
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.17, 10.5, seed + 617, 4) * 0.25
+        + regionalRoughness * (
+          periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 25, seed + 641, 3) * 0.2
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.09, 58, seed + 673, 2) * 0.14
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.31, 124, seed + 691, 1) * 0.085
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.28, 268, seed + 709, 1) * 0.045
+        )
         + fault * 0.1;
       const feature = coastFeatureValue(features, nx * mesh.aspect, ny, detailAmplitude * 0.9, mesh.aspect);
       const polarClearance = Math.min(ny, 1 - ny);
@@ -1839,6 +1980,7 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   const coastCoverage = new Float32Array(width * height);
   const coastSigned = new Float32Array(width * height);
   const elevation = new Float32Array(width * height);
+  const mountainStrength = new Float32Array(width * height);
   let coastEdges = 0;
   let landPixels = 0;
   let minimumClearance = 0.5;
@@ -1876,8 +2018,11 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
         const hills = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 8.5, seed + 701, 5) * 0.031
           + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.15, 25, seed + 733, 4) * 0.009;
         const folded = 1 - Math.abs(periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.17, 33, seed + 761, 4));
-        const mountainCore = Math.pow(ridgeEnvelope, 1.28) * (0.1 + Math.pow(folded, 3.5) * 0.62);
-        const foothills = Math.pow(ridgeEnvelope, 0.68) * 0.045;
+        const rangeBreaks = smoothstep(0.52 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.31, 7.4, seed + 787, 3) * 0.66);
+        const rangeCore = Math.pow(ridgeEnvelope, 1.72) * mix(0.3, 1, Math.pow(folded, 3.2)) * mix(0.48, 1.12, rangeBreaks);
+        mountainStrength[index] = clamp(rangeCore * 1.58);
+        const mountainCore = rangeCore * (0.08 + Math.pow(folded, 4.2) * 0.72);
+        const foothills = Math.pow(ridgeEnvelope, 1.08) * 0.027;
         const mountains = tectonicAmount * (mountainCore + foothills);
         elevation[index] = Math.max(0.003,
           0.007 + Math.pow(inland, 0.68) * 0.22 + Math.max(0, structural) * 0.11
@@ -1893,14 +2038,20 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
     if ((coastCoverage[y * width] > 0.5) !== (coastCoverage[(y + 1) * width - 1] > 0.5)) coastEdges += 1;
   }
 
+  const measurementUnit = Math.max(1, Math.round(Math.min(width, height) / 512));
+  const finePerimeter = coastlinePerimeterAtScale(coastCoverage, width, height, measurementUnit);
+  const coarsePerimeter = coastlinePerimeterAtScale(coastCoverage, width, height, measurementUnit * 8);
+
   return {
     elevation,
+    mountainStrength,
     coastCoverage,
     coastSigned,
     coastlineIndex: landPixels ? coastEdges / Math.sqrt(landPixels) : 0,
     frameClearance: minimumClearance,
-    rockLevel: elevationQuantile(elevation, coastCoverage, 0.79),
-    snowLevel: elevationQuantile(elevation, coastCoverage, 0.955),
+    coastScaleRatio: finePerimeter / Math.max(1, coarsePerimeter),
+    rockLevel: elevationQuantile(elevation, coastCoverage, 0.87),
+    snowLevel: elevationQuantile(elevation, coastCoverage, 0.98),
   };
 }
 
@@ -1944,7 +2095,7 @@ function drawRiverMask(
       const shiftedB = { ...b, x: b.x + shift };
       const pixelScale = Math.min(width, height) / 630;
       const strength = Math.max(1, (a.strength + b.strength) * 0.5);
-      const radius = clamp((0.38 + Math.log2(strength + 1) * 0.34) * pixelScale, 0.42, 2.8 * pixelScale);
+      const radius = clamp((0.2 + Math.log2(strength + 1) * 0.22) * pixelScale, 0.26, 1.75 * pixelScale);
       const padding = radius + 1.25;
       const minX = Math.max(0, Math.floor(Math.min(shiftedA.x, shiftedB.x) - padding));
       const maxX = Math.min(width - 1, Math.ceil(Math.max(shiftedA.x, shiftedB.x) + padding));
@@ -1953,7 +2104,7 @@ function drawRiverMask(
       const dx = shiftedB.x - shiftedA.x;
       const dy = shiftedB.y - shiftedA.y;
       const lengthSquared = dx * dx + dy * dy;
-      const opacity = Math.min(235, 112 + Math.log2(strength + 1) * 34);
+      const opacity = Math.min(225, 92 + Math.log2(strength + 1) * 31);
       for (let y = minY; y <= maxY; y += 1) {
         for (let x = minX; x <= maxX; x += 1) {
           const index = y * width + x;
@@ -1972,7 +2123,7 @@ function drawRiverMask(
   };
 
   for (let source = 0; source < mesh.cellCount; source += 1) {
-    if (!routing.river[source] || hasRiverInflow[source]) continue;
+    if (!routing.drawableSources[source] || hasRiverInflow[source]) continue;
     const points: RiverPoint[] = [];
     let cell = source;
     let guard = 0;
@@ -2001,6 +2152,11 @@ function drawRiverMask(
       }
     }
     const path = smoothPath(points);
+    let pathLength = 0;
+    for (let index = 0; index + 1 < path.length; index += 1) {
+      pathLength += Math.hypot(path[index + 1].x - path[index].x, path[index + 1].y - path[index].y);
+    }
+    if (points.length < 4 || pathLength < height * 0.045) continue;
     for (let index = 0; index + 1 < path.length; index += 1) drawCapsule(path[index], path[index + 1]);
   }
 
@@ -2039,6 +2195,7 @@ function satelliteLandColor(
   moisture: number,
   rockLevel: number,
   snowLevel: number,
+  mountainStrength: number,
 ): [number, number, number] {
   const green = smoothstep((moisture - 0.26) / 0.5);
   const cool = smoothstep((0.38 - temperature) / 0.36);
@@ -2047,10 +2204,32 @@ function satelliteLandColor(
   const forest: [number, number, number] = [mix(54, 36, warm), mix(82, 78, warm), mix(54, 44, warm)];
   let color: [number, number, number] = [mix(dry[0], forest[0], green), mix(dry[1], forest[1], green), mix(dry[2], forest[2], green)];
   color = [mix(color[0], 108, cool * 0.5), mix(color[1], 115, cool * 0.5), mix(color[2], 92, cool * 0.5)];
-  const rock = smoothstep((elevation - rockLevel) / Math.max(0.035, snowLevel - rockLevel));
+  const rock = smoothstep((mountainStrength - 0.14) / 0.46)
+    * smoothstep((elevation - rockLevel * 0.58) / Math.max(0.025, rockLevel * 0.5));
   color = [mix(color[0], 116, rock), mix(color[1], 113, rock), mix(color[2], 105, rock)];
-  const snow = smoothstep((elevation - snowLevel) / Math.max(0.025, snowLevel * 0.12)) * smoothstep((0.58 - temperature) / 0.32);
+  const snow = smoothstep((mountainStrength - 0.64) / 0.3)
+    * smoothstep((elevation - snowLevel * 0.7) / Math.max(0.025, snowLevel * 0.2))
+    * smoothstep((0.62 - temperature) / 0.34);
   return [mix(color[0], 208, snow), mix(color[1], 213, snow), mix(color[2], 207, snow)];
+}
+
+function climateAtlasLandColor(
+  elevation: number,
+  temperature: number,
+  moisture: number,
+  rockLevel: number,
+  snowLevel: number,
+  mountainStrength: number,
+): [number, number, number] {
+  if (mountainStrength > 0.68 && elevation >= snowLevel * 0.66 && temperature < 0.74) return [241, 241, 224];
+  if (mountainStrength > 0.38 && elevation >= rockLevel * 0.52) return [166, 112, 78];
+  if (mountainStrength > 0.13 && elevation >= rockLevel * 0.38) return [207, 155, 108];
+  if (temperature < 0.2) return [220, 226, 205];
+  if (moisture < 0.24 && temperature > 0.54) return [229, 188, 103];
+  if (moisture < 0.34) return temperature > 0.56 ? [216, 194, 125] : [197, 194, 139];
+  if (moisture > 0.72 && temperature > 0.55) return [58, 124, 48];
+  if (moisture > 0.64) return [105, 157, 75];
+  return temperature < 0.42 ? [174, 204, 146] : [190, 217, 158];
 }
 
 function renderWorld(
@@ -2106,7 +2285,12 @@ function renderWorld(
       let oceanColor: [number, number, number];
       let landColor: [number, number, number];
 
-      if (settings.style === "ink") {
+      if (settings.style === "climate") {
+        oceanColor = depth > 0.42 ? [168, 203, 232] : [186, 215, 239];
+        landColor = climateAtlasLandColor(
+          Math.max(0.003, elevation), temperature, moisture, raster.rockLevel, raster.snowLevel, raster.mountainStrength[index],
+        );
+      } else if (settings.style === "ink") {
         const waterContour = Math.abs(((-Math.min(0, elevation) * 30) % 1) - 0.5) < 0.035 ? 13 : 0;
         oceanColor = [82 - depth * 22 + waterContour, 116 - depth * 25 + waterContour, 119 - depth * 22 + waterContour];
         const contour = Math.abs(((Math.max(0, elevation) * 15) % 1) - 0.5) < 0.045 ? -21 : 0;
@@ -2117,7 +2301,9 @@ function renderWorld(
         const oceanTexture = sampleField(oceanNoise, climateWidth, climateHeight, climateX, climateY, true);
         oceanColor = [mix(5, 22, shelf) + oceanTexture * 2.2, mix(24, 72, shelf) + oceanTexture * 3.5, mix(42, 91, shelf) + oceanTexture * 4.2];
         oceanColor = [oceanColor[0] * mix(0.74, 1, 1 - depth), oceanColor[1] * mix(0.67, 1, 1 - depth), oceanColor[2] * mix(0.75, 1, 1 - depth)];
-        landColor = satelliteLandColor(Math.max(0.003, elevation), temperature, moisture, raster.rockLevel, raster.snowLevel);
+        landColor = satelliteLandColor(
+          Math.max(0.003, elevation), temperature, moisture, raster.rockLevel, raster.snowLevel, raster.mountainStrength[index],
+        );
         const texture = sampleField(surfaceNoise, climateWidth, climateHeight, climateX, climateY, true) * (moisture > 0.45 ? 3.5 : 2.7);
         landColor = [landColor[0] * shade + texture, landColor[1] * shade + texture, landColor[2] * shade + texture * 0.65];
         const beach = (1 - smoothstep(Math.max(0, elevation) / 0.026)) * smoothstep(coverage);
@@ -2129,17 +2315,18 @@ function renderWorld(
         mix(oceanColor[1], landColor[1], coverage),
         mix(oceanColor[2], landColor[2], coverage),
       ];
-      if (settings.style === "ink") {
+      if (settings.style === "ink" || settings.style === "climate") {
         const coastLine = clamp(4 * coverage * (1 - coverage));
-        color = [mix(color[0], 54, coastLine), mix(color[1], 61, coastLine), mix(color[2], 54, coastLine)];
+        const outline = settings.style === "climate" ? [76, 91, 73] : [54, 61, 54];
+        color = [mix(color[0], outline[0], coastLine), mix(color[1], outline[1], coastLine), mix(color[2], outline[2], coastLine)];
       }
 
       if (riverMask[index] && coverage > 0.18) {
         const riverBlend = (riverMask[index] / 255) * smoothstep(coverage);
-        const riverColor = settings.style === "ink" ? [45, 83, 89] : [18, 72, 91];
+        const riverColor = settings.style === "climate" ? [55, 106, 163] : settings.style === "ink" ? [45, 83, 89] : [18, 72, 91];
         color = [mix(color[0], riverColor[0], riverBlend), mix(color[1], riverColor[1], riverBlend), mix(color[2], riverColor[2], riverBlend)];
       }
-      const grain = (hash(x, y, seed + 509) - 0.5) * (settings.style === "ink" ? 3 : 1.4);
+      const grain = settings.style === "climate" ? 0 : (hash(x, y, seed + 509) - 0.5) * (settings.style === "ink" ? 3 : 1.4);
       const target = index * 4;
       pixels[target] = clamp(color[0] + grain, 0, 255);
       pixels[target + 1] = clamp(color[1] + grain, 0, 255);
@@ -2162,29 +2349,6 @@ function sampleByteField(source: Uint8Array, width: number, height: number, x: n
   return mix(
     mix(source[y0 * width + x0], source[y0 * width + x1], fx),
     mix(source[y1 * width + x0], source[y1 * width + x1], fx),
-    fy,
-  );
-}
-
-function samplePixelChannel(
-  source: Uint8ClampedArray,
-  width: number,
-  height: number,
-  x: number,
-  y: number,
-  channel: number,
-) {
-  const wrappedX = wrap(x, width);
-  const clampedY = clamp(y, 0, height - 1);
-  const x0 = Math.floor(wrappedX);
-  const y0 = Math.floor(clampedY);
-  const x1 = (x0 + 1) % width;
-  const y1 = Math.min(height - 1, y0 + 1);
-  const fx = wrappedX - x0;
-  const fy = clampedY - y0;
-  return mix(
-    mix(source[(y0 * width + x0) * 4 + channel], source[(y0 * width + x1) * 4 + channel], fx),
-    mix(source[(y1 * width + x0) * 4 + channel], source[(y1 * width + x1) * 4 + channel], fx),
     fy,
   );
 }
@@ -2212,11 +2376,8 @@ export function renderCartographicStrip(
   const heightScale = outputHeight / sourceHeight;
   const detailScale = outputHeight / 4096;
   const detailControl = model.settings.coastDetail / 100;
-  const shoreRoughness = mix(0.68, 1.18, detailControl);
-  const coastBand = Math.max(3, 62 * detailScale);
-  const frequencyA = Math.min(190, outputWidth / 18);
-  const frequencyB = Math.min(470, outputWidth / 8);
-  const frequencyC = Math.min(1120, outputWidth / 4);
+  const shoreRoughness = mix(0.72, 1.34, detailControl);
+  const coastBand = Math.max(4, 104 * detailScale);
   const pixels = new Uint8ClampedArray(outputWidth * stripHeight * 4);
 
   for (let localY = 0; localY < stripHeight; localY += 1) {
@@ -2235,54 +2396,87 @@ export function renderCartographicStrip(
         const longitudeX = Math.cos(longitude);
         const longitudeY = Math.sin(longitude);
         const envelope = Math.exp(-((Math.abs(signed) / Math.max(2, coastBand * 0.58)) ** 2));
-        const micro = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, frequencyA, model.seed + 911, 1) * 10.5
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.19, frequencyB, model.seed + 947, 1) * 4.2
-          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.27, frequencyC, model.seed + 983, 1) * 1.55;
-        signed += micro * detailScale * shoreRoughness * envelope;
+        const warpLongitude = longitude
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.11, 13, model.seed + 887, 2) * 0.026;
+        const warpLatitude = ny
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 17, model.seed + 899, 2) * 0.018;
+        const warpedX = Math.cos(warpLongitude);
+        const warpedY = Math.sin(warpLongitude);
+        const regional = mix(0.52, 1.24, smoothstep(
+          0.5 + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 3.2, model.seed + 903, 3) * 0.72,
+        ));
+        const micro = periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude, 88, model.seed + 911, 2) * 18
+          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude - 0.19, 238, model.seed + 947, 2) * 7.4
+          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude + 0.27, 610, model.seed + 983, 1) * 2.9
+          + periodicGradientFbmFromUnit(warpedX, warpedY, warpLatitude - 0.31, 1450, model.seed + 997, 1) * 1.05;
+        signed += micro * detailScale * shoreRoughness * regional * envelope;
       }
 
-      const coverage = smoothstep(0.5 + signed / Math.max(0.78, 1.2 * detailScale));
+      const coverage = smoothstep(0.5 + signed / Math.max(0.68, 0.92 * detailScale));
       let color: [number, number, number];
       if (coverage < 0.01) {
         const depth = smoothstep(-signed / Math.max(8, outputHeight * 0.055));
-        color = [mix(31, 8, depth), mix(91, 41, depth), mix(108, 63, depth)];
+        color = model.settings.style === "climate"
+          ? depth > 0.42 ? [168, 203, 232] : [186, 215, 239]
+          : model.settings.style === "ink"
+            ? [mix(103, 69, depth), mix(139, 105, depth), mix(145, 119, depth)]
+            : [mix(31, 8, depth), mix(91, 41, depth), mix(108, 63, depth)];
       } else {
         const elevation = Math.max(0.0025, sampleField(model.raster.elevation, sourceWidth, sourceHeight, sourceX, sourceY, true));
-        const baseCoverage = sampleField(model.raster.coastCoverage, sourceWidth, sourceHeight, sourceX, sourceY, true);
-        const guideRed = baseCoverage > 0.28 ? samplePixelChannel(model.pixels, sourceWidth, sourceHeight, sourceX, sourceY, 0) : 102;
-        const guideGreen = baseCoverage > 0.28 ? samplePixelChannel(model.pixels, sourceWidth, sourceHeight, sourceX, sourceY, 1) : 126;
-        const moisture = clamp(0.52 + (guideGreen - guideRed) / 115 + (model.settings.moisture - 50) / 150);
-        const temperature = clamp(1 - latitude * 0.88 - elevation * 0.58);
-        const natural = satelliteLandColor(elevation, temperature, moisture, model.raster.rockLevel, model.raster.snowLevel);
-        const relief = sampleByteField(model.shadeMap, sourceWidth, sourceHeight, sourceX, sourceY) / 255 * 1.3;
-        const reliefLight = clamp(0.72 + relief * 0.34, 0.69, 1.16);
-        const muted: [number, number, number] = [
-          mix(natural[0], 119, 0.24) * reliefLight,
-          mix(natural[1], 139, 0.24) * reliefLight,
-          mix(natural[2], 101, 0.24) * reliefLight,
-        ];
-        const beach = smoothstep(1 - Math.max(0, signed) / Math.max(2.2, 5.5 * detailScale));
-        const contourPhase = Math.abs(((elevation * 32) % 1) - 0.5);
-        const contour = contourPhase < 0.017 ? -7 : 0;
-        const land: [number, number, number] = [
-          mix(muted[0] + contour, 190, beach * 0.48),
-          mix(muted[1] + contour, 179, beach * 0.48),
-          mix(muted[2] + contour, 129, beach * 0.48),
-        ];
+        const mountainStrength = sampleField(model.raster.mountainStrength, sourceWidth, sourceHeight, sourceX, sourceY, true);
         const depth = smoothstep(-signed / Math.max(8, outputHeight * 0.055));
-        const ocean: [number, number, number] = [mix(31, 8, depth), mix(91, 41, depth), mix(108, 63, depth)];
+        const longitude = nx * TAU;
+        const longitudeX = Math.cos(longitude);
+        const longitudeY = Math.sin(longitude);
+        const temperature = clamp(1 - latitude * 0.88 - elevation * 0.57
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 2.8, model.seed + 401, 3) * 0.055);
+        const moisture = clamp(0.5
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.13, 4.8, model.seed + 433, 4) * 0.34
+          + (model.settings.moisture - 50) / 95 + (1 - latitude) * 0.08);
+        let land: [number, number, number];
+        let ocean: [number, number, number];
+        if (model.settings.style === "climate") {
+          land = climateAtlasLandColor(elevation, temperature, moisture, model.raster.rockLevel, model.raster.snowLevel, mountainStrength);
+          ocean = depth > 0.42 ? [168, 203, 232] : [186, 215, 239];
+        } else if (model.settings.style === "ink") {
+          const tint: [number, number, number] = moisture > 0.58 ? [177, 174, 126] : moisture < 0.34 ? [205, 179, 126] : [194, 184, 139];
+          const contour = Math.abs(((elevation * 17) % 1) - 0.5) < 0.026 ? -18 : 0;
+          land = [tint[0] + contour, tint[1] + contour, tint[2] + contour];
+          ocean = [mix(103, 69, depth), mix(139, 105, depth), mix(145, 119, depth)];
+        } else {
+          const natural = satelliteLandColor(elevation, temperature, moisture, model.raster.rockLevel, model.raster.snowLevel, mountainStrength);
+          const relief = sampleByteField(model.shadeMap, sourceWidth, sourceHeight, sourceX, sourceY) / 255 * 1.3;
+          const mountainBand = smoothstep((mountainStrength - 0.18) / 0.5);
+          const reliefGrain = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.29, 185, model.seed + 1007, 2) * mountainBand * 0.08;
+          const reliefLight = clamp(0.72 + relief * 0.34 + reliefGrain, 0.66, 1.19);
+          const muted: [number, number, number] = [
+            mix(natural[0], 119, 0.24) * reliefLight,
+            mix(natural[1], 139, 0.24) * reliefLight,
+            mix(natural[2], 101, 0.24) * reliefLight,
+          ];
+          const beach = smoothstep(1 - Math.max(0, signed) / Math.max(2.2, 5.5 * detailScale));
+          const contour = Math.abs(((elevation * 32) % 1) - 0.5) < 0.017 ? -7 : 0;
+          land = [
+            mix(muted[0] + contour, 190, beach * 0.48),
+            mix(muted[1] + contour, 179, beach * 0.48),
+            mix(muted[2] + contour, 129, beach * 0.48),
+          ];
+          ocean = [mix(31, 8, depth), mix(91, 41, depth), mix(108, 63, depth)];
+        }
         color = [mix(ocean[0], land[0], coverage), mix(ocean[1], land[1], coverage), mix(ocean[2], land[2], coverage)];
 
         const coastLine = smoothstep(1 - Math.abs(signed) / Math.max(0.9, 1.65 * detailScale));
-        color = [mix(color[0], 48, coastLine * 0.62), mix(color[1], 62, coastLine * 0.62), mix(color[2], 57, coastLine * 0.62)];
+        const coastInk = model.settings.style === "climate" ? [76, 91, 73] : [48, 62, 57];
+        color = [mix(color[0], coastInk[0], coastLine * 0.62), mix(color[1], coastInk[1], coastLine * 0.62), mix(color[2], coastInk[2], coastLine * 0.62)];
         const river = sampleByteField(model.riverMask, sourceWidth, sourceHeight, sourceX, sourceY) / 255;
         if (river > 0.025 && coverage > 0.12) {
-          const riverBlend = river * smoothstep(coverage) * 0.88;
-          color = [mix(color[0], 28, riverBlend), mix(color[1], 91, riverBlend), mix(color[2], 113, riverBlend)];
+          const riverBlend = river * smoothstep(coverage) * (model.settings.style === "climate" ? 0.78 : 0.86);
+          const riverColor = model.settings.style === "climate" ? [55, 106, 163] : [28, 91, 113];
+          color = [mix(color[0], riverColor[0], riverBlend), mix(color[1], riverColor[1], riverBlend), mix(color[2], riverColor[2], riverBlend)];
         }
       }
 
-      const grain = (hash(seamX, y, model.seed + 1019) - 0.5) * 1.25;
+      const grain = model.settings.style === "climate" ? 0 : (hash(seamX, y, model.seed + 1019) - 0.5) * 1.25;
       const target = (localY * outputWidth + x) * 4;
       pixels[target] = clamp(color[0] + grain, 0, 255);
       pixels[target + 1] = clamp(color[1] + grain, 0, 255);
@@ -2356,6 +2550,7 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       largestLandmassPercent: Math.round(terrain.largestLandmassShare * 1000) / 10,
       oceanGapPercent: Math.round(terrain.oceanGapShare * 1000) / 10,
       meanLandmassElongation: Math.round(terrain.meanLandmassElongation * 100) / 100,
+      coastScaleRatio: Math.round(raster.coastScaleRatio * 100) / 100,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),
     },

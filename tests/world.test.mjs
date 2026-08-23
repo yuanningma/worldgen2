@@ -28,6 +28,15 @@ test("different seeds produce different geography", () => {
   assert.notDeepEqual(first.pixels, second.pixels);
 });
 
+test("the categorical climate atlas is a distinct deterministic rendering", () => {
+  const first = generateWorld({ ...base, style: "climate" });
+  const second = generateWorld({ ...base, style: "climate" });
+  const satellite = generateWorld(base);
+  assert.deepEqual(first.pixels, second.pixels);
+  assert.notDeepEqual(first.pixels, satellite.pixels);
+  assert.equal(first.stats.landPercent, satellite.stats.landPercent);
+});
+
 test("global sea level cuts the continuous height field", () => {
   const lowSea = generateWorld({ ...base, seaLevel: 18 });
   const highSea = generateWorld({ ...base, seaLevel: 86 });
@@ -71,6 +80,14 @@ test("the structural coast has meaningful perimeter without fragmenting the worl
   assert.ok(world.stats.coastlineIndex < 45, `coastline index was ${world.stats.coastlineIndex}`);
   assert.ok(world.stats.landPercent >= 15 && world.stats.landPercent <= 50);
   assert.ok(world.stats.frameClearance >= 2, `frame clearance was ${world.stats.frameClearance}%`);
+  assert.ok(world.stats.coastScaleRatio >= 1.2, `coast scale ratio was ${world.stats.coastScaleRatio}`);
+});
+
+test("coastal complexity adds persistent multiscale detail instead of only enlarging pixels", () => {
+  const low = generateWorld({ ...base, width: 192, height: 96, simulationSites: 2200, coastDetail: 15 });
+  const high = generateWorld({ ...base, width: 192, height: 96, simulationSites: 2200, coastDetail: 95 });
+  assert.ok(high.stats.coastScaleRatio > low.stats.coastScaleRatio + 0.1,
+    `scale ratios were ${low.stats.coastScaleRatio} and ${high.stats.coastScaleRatio}`);
 });
 
 test("the equirectangular texture joins cleanly at the longitude seam", () => {
