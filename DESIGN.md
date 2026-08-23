@@ -13,17 +13,18 @@ Two earlier approaches exposed opposite weaknesses. Raster crust growth produced
 Atlas Forge now keeps those representations separate:
 
 1. **An irregular graph organizes the planet.** Deterministic Poisson-disc sites become a Delaunay adjacency graph. Well-separated weighted Voronoi seeds receive plate ownership, motion vectors, and continental or oceanic crust.
-2. **A terrane network replaces compact plate-shaped blobs.** Connected continental plate clusters seed a constructive field of compact cores, bent links, curved multi-segment branches, and detached fragments. Branching variable-width negative paths then cut deep gulfs, rifts, straits, and inland basins through that skeleton. All geometry is evaluated in the physical 2:1 map metric, avoiding the horizontally stretched "paddle" forms created by treating texture UV axes as equal lengths. Plate type contributes a smaller bias, while rotated gradient fields supply broad variation. Five candidates are scored before dense work begins.
+2. **A terrane network replaces compact plate-shaped blobs.** Plate count, adjacency, spacing, and continental mass determine how many well-separated cratons nucleate for a seed; the user does not request a continent count. Connected continental plate clusters then seed a constructive field of compact cores, bent links, curved multi-segment branches, and detached fragments. Branching variable-width negative paths cut deep gulfs, rifts, straits, and inland basins through that skeleton. All geometry is evaluated in the physical 2:1 map metric, avoiding the horizontally stretched "paddle" forms created by treating texture UV axes as equal lengths. Plate type contributes a smaller bias, while rotated gradient fields supply broad variation. Five candidates are scored for a healthy component range and balanced land distribution before dense work begins.
 3. **Longitude is periodic throughout the model.** Plate ownership, graph distance, seam adjacency, terrane strokes, climate fields, signed coastal distance, relief sampling, and river drawing all wrap horizontally. A continent can cross the equirectangular seam without becoming two unrelated islands.
-4. **Relative plate motion organizes relief.** Convergent and divergent graph edges become multi-source distance fields. They control mountain envelopes and rifts without deciding every shoreline point.
+4. **Relative plate motion organizes relief and island arcs.** Convergent and divergent graph edges become multi-source distance fields. They control mountain envelopes and rifts without deciding every shoreline point. Strong convergence on oceanic crust also raises a noise-gated chain of potential islands before sea level is selected, so the surviving arc is a tectonic consequence rather than decorative scatter.
 5. **Graph Priority-Flood guarantees drainage.** Depression conditioning assigns receivers, moisture-weighted contributing area selects river paths, and river vertices carve the structural elevation.
 6. **A dense signed-distance coast breaks free of the mesh.** The selected crust potential is rasterized into a macro mask and converted to a horizontally wrapped exact Euclidean signed-distance field. The separable linear-time transform avoids the grid bias of the earlier chamfer approximation, while domain warping displaces the field in pixel space.
 7. **Coastal detail has a scale hierarchy.** Broad, regional, fine, and micro periodic-gradient fields are confined to a coastal envelope. A small independently implemented Donjon-inspired spherical fault atlas adds long correlated cuts. Roughly two dozen semantic coastal systems are then placed from actual land/ocean graph boundaries: branching, variable-width negative paths create nested gulfs and drowned valleys, while a smaller number of broad positive paths create capes and peninsulas. Spatial bounds keep this richer grammar fast.
-8. **Sea level remains controllable.** A dense histogram quantile restores the requested land fraction after coastal displacement, while oceanic polar caps keep the projection readable without imposing an artificial longitude frame.
+8. **Sea level is a first-class heightmap cut.** Continental mass controls the amount and reach of structural crust, while a separate global sea-level control selects a dense histogram quantile after coastal displacement. This makes flooding and exposing shelves predictable without asking the tectonic grammar to regenerate a different planet. Oceanic polar caps keep the projection readable without imposing an artificial longitude frame.
 9. **Visible relief is synthesized at output resolution.** A denser graph and additional broad smoothing supply the macro surface. Continuous hills and folded ridged detail are modulated by convergent-boundary strength, so mountain chains remain geological without exposing Delaunay triangles.
 10. **Rendering is coverage-aware.** A local signed-field gradient estimates subpixel land coverage. Sea, beach, and land colors blend through that coverage; mountain color thresholds come from land-height quantiles, and broad-dominant hillshade keeps ranges legible without making them chunky.
 11. **Rivers are curves, not pixel stamps.** Complete receiver chains are unwrapped across the seam, smoothed twice, then rasterized as variable-width antialiased capsules and clipped to the refined coast.
 12. **The same texture supports two projections.** Atlas mode shows the complete 2:1 equirectangular world without cropping. Globe mode bilinearly projects it onto a shaded orthographic sphere that supports pointer, touch, and keyboard rotation.
+13. **Large output is a render problem, not a larger simulation.** The Worker retains the selected height/coast/river model and rasterizes an 8192 × 4096 cartographic atlas in 128-row strips. Export-only periodic coast octaves add detail at roughly 40, 17, and 7-pixel wavelengths. Only the final browser canvas is full size; the intermediate terrain fields stay at the selected working resolution.
 
 ## Generation pipeline
 
@@ -43,9 +44,10 @@ seed + controls
   → antialiased coasts, curved rivers, and multiscale hillshade
   → seamless satellite or field-ink texture
   → equirectangular atlas or interactive orthographic globe
+  → optional 8K strip-rendered cartographic atlas
 ```
 
-The pipeline is deterministic. The UI sends a serializable recipe to a dedicated Web Worker, which transfers the finished pixel buffer without copying it. Simulation density is fixed at roughly 22,000 graph sites and is independent of render resolution, so the same seed keeps the same plate world at Preview (1024 × 512), High (1536 × 768), and Ultra (2048 × 1024). High is the default. Broad sliding-window relief filters remove visible Delaunay facets without erasing continuous high-resolution surface detail. Generation remains off the interaction thread; globe rotation reprojects the completed texture without regenerating geography.
+The pipeline is deterministic. The UI sends a serializable recipe to a dedicated Web Worker, which transfers a display copy while retaining the reusable height model for export. Simulation density is fixed at roughly 22,000 graph sites and is independent of render resolution, so the same seed keeps the same plate world at Preview (1024 × 512), High (1536 × 768), and Ultra (2048 × 1024). High is the default. Broad sliding-window relief filters remove visible Delaunay facets without erasing continuous high-resolution surface detail. Generation remains off the interaction thread; globe rotation reprojects the completed texture without regenerating geography. The 8K export path transfers 4 MiB strips, while its final 8192 × 4096 RGBA canvas occupies about 128 MiB before PNG encoding.
 
 ## Aesthetic safeguards
 
@@ -56,6 +58,8 @@ The pipeline is deterministic. The UI sends a serializable recipe to a dedicated
 - Constructive branches and subtractive cuts create silhouette hierarchy before any fractal detail is applied.
 - Continental tips remain rounded and tapered; complexity comes from composition rather than uniformly jagged shores.
 - Donjon-like random faults are a minority residual; the tectonic/terrane field remains the constraint.
+- Continental systems emerge from the seeded plate/craton process; candidate scoring only rejects pathological too-few or too-many outcomes.
+- Sea level remains independent of that structure, so flooding shelves does not regenerate a different tectonic world.
 - A dense land-area quantile and oceanic polar caps keep composition stable while longitude remains seamless.
 - Mountain folds inherit convergent-boundary envelopes and use seed-independent height quantiles for reliable visual emphasis.
 - White pixel grain and square river brushes are deliberately avoided.
@@ -72,6 +76,8 @@ The implementation is original, but its structure follows lessons from establish
 - Felzenszwalb and Huttenlocher's [Distance Transforms of Sampled Functions](https://www.cs.cornell.edu/dph/papers/dt.pdf) supplies the separable exact Euclidean distance-transform method used by the dense wrapped coastline pass.
 - [D3 Delaunay](https://d3js.org/d3-delaunay) supplies the robust triangulation used for graph adjacency and the dual Voronoi interpretation.
 - [Azgaar's Fantasy Map Generator](https://github.com/Azgaar/Fantasy-Map-Generator) demonstrates the value of composing heightmaps from purposeful hills, ranges, pits, troughs, and straits rather than relying on one universal noise field.
+- [WorldEngine](https://github.com/Mindwerks/worldengine) and [plate-tectonics](https://github.com/Mindwerks/plate-tectonics) keep tectonic simulation, heightmap output, and sea-level parameters distinct; Atlas Forge follows that separation while retaining its more composition-driven coast grammar.
+- [World Machine's tiled-build documentation](https://help.world-machine.com/topic/world-machine-professional-edition-addendum/) notes that single huge heightfields become unwieldy around 8192 × 8192 and uses tiled output to go larger. Atlas Forge applies the same memory lesson inside the browser with strip rendering.
 - Barnes et al.'s [Priority-Flood paper](https://rbarnes.org/sci/2014_depressions.pdf) provides the depression-conditioning basis used by the watershed pass.
 
 These sources reinforce a practical division of labor: plates and flow provide believable relationships, fractal fields provide scale-rich detail, and explicit composition rules decide whether the result is attractive.
@@ -80,7 +86,7 @@ These sources reinforce a practical division of labor: plates and flow provide b
 
 - `app/MapStudio.tsx` owns controls, Worker orchestration, atlas display, orthographic globe projection, rotation, zoom, and PNG export.
 - `lib/world.ts` owns mesh construction, plate fields, candidate selection, graph hydrology, dense coastline synthesis, relief, and rendering.
-- `workers/world.worker.ts` isolates generation from interaction and transfers the final raster.
+- `workers/world.worker.ts` isolates generation, retains the current world model, and streams high-resolution export strips.
 - `types/d3-delaunay.d.ts` types the small triangulation surface used by the engine.
 - `app/globals.css` defines the responsive field-instrument interface.
 
@@ -94,7 +100,7 @@ No server data, account, or external API is required. There is intentionally no 
 - Climate color currently uses latitude, height, coherent moisture, and the moisture control; directional precipitation remains deferred.
 - Hydrology retains river paths but not persistent lakes, deltas, sediment fans, or endorheic basins.
 - Field-ink mode is an alternate renderer, not yet a complete label-and-symbol cartographic system.
-- PNG export uses the selected working resolution up to 2048 × 1024; tiled 4K–8K export is a later performance milestone.
+- The downloadable 8K PNG is a flattened cartographic image; separate 16-bit elevation, biome, normal, and river layers remain future work.
 
 ## Roadmap
 
@@ -115,7 +121,7 @@ No server data, account, or external API is required. There is intentionally no 
 
 ### Production renderer
 
-- Progressive and tiled high-resolution generation
+- Progressive regional rerendering and multi-file tiled export beyond 8K
 - WebGPU compute path with Web Worker fallback
 - Layer export for elevation, biome, rivers, masks, and normal maps
 - More interpretations: parchment atlas, watercolor, shaded relief, and monochrome print

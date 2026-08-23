@@ -8,9 +8,10 @@ Atlas Forge is a deterministic browser-based fantasy world generator focused on 
 - Directional terrane networks with curved continental arms and narrow isthmuses
 - Branching variable-width rifts, nested gulfs, inland basins, detached fragments, and island chains
 - Seamless 360° longitude with continent systems allowed to cross the atlas seam
-- Two or three coherent continental families instead of scattered independent islands
+- Naturally nucleated coherent continental systems instead of a requested continent count
+- Seeded oceanic convergence that can raise discontinuous tectonic island arcs
 - A denser irregular simulation mesh and smoother multiscale relief
-- Five-candidate composition scoring and controllable sea-level quantiles
+- Five-candidate composition scoring with separate structural mass and global sea-level controls
 - Exact Euclidean signed-distance coastlines with domain warp and five-scale fractal detail
 - A bounded Donjon-inspired spherical fault residual near the coast
 - Explicit seeded peninsulas, bays, straits, and near-coast islands
@@ -22,6 +23,7 @@ Atlas Forge is a deterministic browser-based fantasy world generator focused on 
 - Draggable orthographic globe and seamless equirectangular atlas views
 - Preview, High, and Ultra resolution tiers with resolution-stable geography
 - Reproducible controls, zoom, PNG export, and responsive Web Worker generation
+- Memory-bounded 8192 × 4096 cartographic export with export-scale shoreline detail
 
 ## Run locally
 
@@ -44,4 +46,4 @@ The implementation and research-informed product decisions are documented in [DE
 
 ## Project status
 
-This is the fifth continent-and-satellite checkpoint. It replaces stretched capsule silhouettes with physically scaled curved terranes, branching coastal systems, exact wrapped distance fields, smoother relief, and resolution-stable High/Ultra output. Political borders, settlements, labels, authored regional editing, true polar graph topology, and full hydraulic erosion remain intentionally deferred until the base geography is consistently attractive.
+This is the sixth continent-and-satellite checkpoint. It formalizes the generator as a reusable height model: plate spacing, motion, and continental mass naturally nucleate a bounded set of cratons; global sea level cuts that field independently; and an 8K strip renderer adds fine shoreline detail without simulating dozens of full-resolution fields. Political borders, settlements, labels, authored regional editing, true polar graph topology, and full hydraulic erosion remain intentionally deferred until the base geography is consistently attractive.

@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { generateWorld } from "../lib/world.ts";
+import { generateWorld, generateWorldModel, renderCartographicStrip } from "../lib/world.ts";
 
 const base = {
   seed: "VERDANT-047",
   width: 144,
   height: 90,
   continentSize: 56,
+  seaLevel: 52,
   coastDetail: 76,
   tectonics: 58,
   moisture: 54,
@@ -27,16 +28,37 @@ test("different seeds produce different geography", () => {
   assert.notDeepEqual(first.pixels, second.pixels);
 });
 
-test("continent mass increases land coverage for a fixed seed", () => {
-  const sparse = generateWorld({ ...base, continentSize: 15 });
-  const broad = generateWorld({ ...base, continentSize: 90 });
-  assert.ok(broad.stats.landPercent > sparse.stats.landPercent + 10);
+test("global sea level cuts the continuous height field", () => {
+  const lowSea = generateWorld({ ...base, seaLevel: 18 });
+  const highSea = generateWorld({ ...base, seaLevel: 86 });
+  assert.ok(lowSea.stats.landPercent > highSea.stats.landPercent + 12);
+});
+
+test("continental systems emerge in a bounded natural range", () => {
+  const world = generateWorld(base);
+  assert.ok(world.stats.continentSystems >= 3);
+  assert.ok(world.stats.continentSystems <= 9);
+});
+
+test("large cartographic exports are deterministic, bounded, and seamless by strip", () => {
+  const model = generateWorldModel({ ...base, width: 160, height: 80, simulationSites: 2200 });
+  const first = renderCartographicStrip(model, 512, 256, 32, 24);
+  const second = renderCartographicStrip(model, 512, 256, 32, 24);
+  assert.deepEqual(first, second);
+  assert.equal(first.length, 512 * 24 * 4);
+  for (let y = 0; y < 24; y += 1) {
+    const left = y * 512 * 4;
+    const right = (y * 512 + 511) * 4;
+    for (let channel = 0; channel < 3; channel += 1) {
+      assert.ok(Math.abs(first[left + channel] - first[right + channel]) <= 2);
+    }
+  }
 });
 
 test("the structural coast has meaningful perimeter without fragmenting the world", () => {
   const world = generateWorld(base);
   assert.ok(world.stats.coastlineIndex > 10.5, `coastline index was ${world.stats.coastlineIndex}`);
-  assert.ok(world.stats.coastlineIndex < 24, `coastline index was ${world.stats.coastlineIndex}`);
+  assert.ok(world.stats.coastlineIndex < 45, `coastline index was ${world.stats.coastlineIndex}`);
   assert.ok(world.stats.landPercent >= 15 && world.stats.landPercent <= 50);
   assert.ok(world.stats.frameClearance >= 2, `frame clearance was ${world.stats.frameClearance}%`);
 });
@@ -74,7 +96,7 @@ test("fixed-seed suite preserves terrane complexity and oceanic polar caps", () 
   ]) {
     const world = generateWorld({ ...base, seed });
     assert.ok(world.stats.landPercent >= 28 && world.stats.landPercent <= 42, `${seed} land was ${world.stats.landPercent}%`);
-    assert.ok(world.stats.coastlineIndex >= 10.5 && world.stats.coastlineIndex <= 24, `${seed} coast was ${world.stats.coastlineIndex}`);
+    assert.ok(world.stats.coastlineIndex >= 10.5 && world.stats.coastlineIndex <= 45, `${seed} coast was ${world.stats.coastlineIndex}`);
     assert.ok(world.stats.frameClearance >= 2, `${seed} frame clearance was ${world.stats.frameClearance}%`);
   }
 });

@@ -10,6 +10,7 @@ const DEFAULTS: WorldSettings = {
   height: 768,
   simulationSites: 22000,
   continentSize: 56,
+  seaLevel: 52,
   coastDetail: 84,
   tectonics: 58,
   moisture: 54,
@@ -22,6 +23,7 @@ const EMPTY_STATS: WorldStats = {
   landPercent: 0,
   plateCount: 0,
   riverCount: 0,
+  continentSystems: 0,
   coastlineIndex: 0,
   frameClearance: 0,
   focusLongitude: 0,
@@ -31,7 +33,10 @@ const EMPTY_STATS: WorldStats = {
 type WorkerMessage =
   | { type: "progress"; id: number; stage: string; progress: number }
   | { type: "complete"; id: number; width: number; height: number; pixels: ArrayBuffer; stats: WorldStats }
-  | { type: "error"; id: number; message: string };
+  | { type: "error"; id: number; message: string }
+  | { type: "export-tile"; id: number; y: number; width: number; height: number; pixels: ArrayBuffer }
+  | { type: "export-complete"; id: number; width: number; height: number }
+  | { type: "export-error"; id: number; message: string };
 
 type ViewMode = "globe" | "atlas";
 
@@ -46,6 +51,9 @@ const RESOLUTION_PRESETS = [
   { label: "HIGH", width: 1536, height: 768 },
   { label: "ULTRA", width: 2048, height: 1024 },
 ] as const;
+
+const EXPORT_WIDTH = 8192;
+const EXPORT_HEIGHT = 4096;
 
 function freshSeed() {
   const words = ["AURELIA", "BRAMBLE", "CERULEAN", "EMBER", "HALCYON", "MISTRAL", "SABLE", "THORN", "VESPER"];
@@ -178,6 +186,10 @@ export function MapStudio() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const workerRef = useRef<Worker | null>(null);
   const requestRef = useRef(0);
+  const exportRequestRef = useRef(0);
+  const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const generatedSeedRef = useRef(DEFAULTS.seed);
+  const pendingSeedRef = useRef(DEFAULTS.seed);
   const textureRef = useRef<WorldTexture | null>(null);
   const sphereCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const viewModeRef = useRef<ViewMode>("globe");
@@ -188,11 +200,13 @@ export function MapStudio() {
   const [settings, setSettings] = useState(DEFAULTS);
   const [stats, setStats] = useState(EMPTY_STATS);
   const [isGenerating, setIsGenerating] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
   const [generationStage, setGenerationStage] = useState("Preparing genesis engine");
   const [progress, setProgress] = useState(6);
   const [error, setError] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [viewMode, setViewMode] = useState<ViewMode>("globe");
+  const isBusy = isGenerating || isExporting;
 
   const renderCurrentView = useCallback(() => {
     const canvas = canvasRef.current;
@@ -221,7 +235,8 @@ export function MapStudio() {
     setProgress(7);
     setGenerationStage("Composing continental terranes");
     setError(null);
-    workerRef.current.postMessage({ id, settings: nextSettings });
+    pendingSeedRef.current = nextSettings.seed;
+    workerRef.current.postMessage({ type: "generate", id, settings: nextSettings });
   }, []);
 
   useEffect(() => {
@@ -229,12 +244,51 @@ export function MapStudio() {
     workerRef.current = worker;
     worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
       const message = event.data;
+      if (message.type === "export-tile") {
+        if (message.id !== exportRequestRef.current) return;
+        const canvas = exportCanvasRef.current;
+        const context = canvas?.getContext("2d");
+        if (!canvas || !context) return;
+        context.putImageData(new ImageData(new Uint8ClampedArray(message.pixels), message.width, message.height), 0, message.y);
+        setProgress(Math.min(96, Math.round(((message.y + message.height) / EXPORT_HEIGHT) * 96)));
+        return;
+      }
+      if (message.type === "export-complete") {
+        if (message.id !== exportRequestRef.current) return;
+        const canvas = exportCanvasRef.current;
+        if (!canvas) return;
+        setGenerationStage("Encoding the 8K PNG");
+        setProgress(98);
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            setError("The browser could not encode the 8K atlas. Try the current-view export instead.");
+          } else {
+            const link = document.createElement("a");
+            link.download = `${generatedSeedRef.current.toLowerCase()}-8k-atlas.png`;
+            link.href = URL.createObjectURL(blob);
+            link.click();
+            URL.revokeObjectURL(link.href);
+          }
+          exportCanvasRef.current = null;
+          setProgress(100);
+          setIsExporting(false);
+        }, "image/png");
+        return;
+      }
+      if (message.type === "export-error") {
+        if (message.id !== exportRequestRef.current) return;
+        exportCanvasRef.current = null;
+        setError(message.message);
+        setIsExporting(false);
+        return;
+      }
       if (message.id !== requestRef.current) return;
       if (message.type === "progress") {
         setGenerationStage(message.stage);
         setProgress(message.progress);
       } else if (message.type === "complete") {
         textureRef.current = { pixels: new Uint8ClampedArray(message.pixels), width: message.width, height: message.height };
+        generatedSeedRef.current = pendingSeedRef.current;
         rotationRef.current.longitude = message.stats.focusLongitude;
         renderCurrentView();
         setStats(message.stats);
@@ -337,11 +391,29 @@ export function MapStudio() {
     canvas.toBlob((blob) => {
       if (!blob) return;
       const link = document.createElement("a");
-      link.download = `${settings.seed.toLowerCase()}-${settings.style}.png`;
+      link.download = `${generatedSeedRef.current.toLowerCase()}-${settings.style}.png`;
       link.href = URL.createObjectURL(blob);
       link.click();
       URL.revokeObjectURL(link.href);
     }, "image/png");
+  };
+
+  const exportHighResolution = () => {
+    if (!workerRef.current || isBusy || !textureRef.current) return;
+    const canvas = document.createElement("canvas");
+    canvas.width = EXPORT_WIDTH;
+    canvas.height = EXPORT_HEIGHT;
+    if (!canvas.getContext("2d")) {
+      setError("This browser cannot allocate an 8K atlas canvas.");
+      return;
+    }
+    exportCanvasRef.current = canvas;
+    const id = ++exportRequestRef.current;
+    setIsExporting(true);
+    setError(null);
+    setProgress(1);
+    setGenerationStage("Rendering 8K cartographic strips");
+    workerRef.current.postMessage({ type: "export", id, width: EXPORT_WIDTH, height: EXPORT_HEIGHT });
   };
 
   return (
@@ -352,21 +424,24 @@ export function MapStudio() {
           <div><span className="brand-name">ATLAS FORGE</span><span className="brand-subtitle">PROCEDURAL WORLDS</span></div>
         </div>
         <div className="world-title"><span className="eyebrow">CURRENT WORLD</span><strong>{stats.name.toUpperCase()}</strong></div>
-        <button className="export-button" type="button" onClick={exportMap} disabled={isGenerating}>EXPORT PNG</button>
+        <div className="topbar-actions">
+          <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>EXPORT VIEW</button>
+          <button className="export-button export-primary" type="button" onClick={exportHighResolution} disabled={isBusy}>EXPORT 8K ATLAS</button>
+        </div>
       </header>
 
       <section className="workspace">
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 05</span>
+            <span className="version">ALPHA 06</span>
           </div>
 
           <label className="seed-field">
             <span>WORLD SEED</span>
             <span className="seed-entry">
               <input value={settings.seed} maxLength={28} spellCheck="false" onChange={(event) => updateSetting("seed", event.target.value.toUpperCase())} aria-label="World seed" />
-              <button type="button" onClick={randomize} aria-label="Randomize world seed">↻</button>
+              <button type="button" onClick={randomize} aria-label="Randomize world seed" disabled={isBusy}>↻</button>
             </span>
           </label>
 
@@ -382,7 +457,7 @@ export function MapStudio() {
                     className={active ? "active" : ""}
                     onClick={() => selectResolution(preset.width, preset.height)}
                     aria-pressed={active}
-                    disabled={isGenerating}
+                    disabled={isBusy}
                   >
                     {preset.label}
                   </button>
@@ -392,6 +467,7 @@ export function MapStudio() {
           </div>
 
           <SettingSlider label="CONTINENT MASS" value={settings.continentSize} onChange={(value) => updateSetting("continentSize", value)} />
+          <SettingSlider label="GLOBAL SEA LEVEL" value={settings.seaLevel ?? 52} onChange={(value) => updateSetting("seaLevel", value)} />
           <SettingSlider label="COASTAL COMPLEXITY" value={settings.coastDetail} onChange={(value) => updateSetting("coastDetail", value)} />
           <SettingSlider label="TECTONIC ACTIVITY" value={settings.tectonics} onChange={(value) => updateSetting("tectonics", value)} />
           <SettingSlider label="GLOBAL MOISTURE" value={settings.moisture} onChange={(value) => updateSetting("moisture", value)} />
@@ -399,15 +475,15 @@ export function MapStudio() {
           <div className="style-section">
             <span className="section-label">RENDERING STYLE</span>
             <div className="style-grid">
-              <button className={`style-card ${settings.style === "satellite" ? "active" : ""}`} type="button" onClick={() => selectStyle("satellite")} aria-pressed={settings.style === "satellite"}><i className="satellite-swatch" />Satellite</button>
-              <button className={`style-card ${settings.style === "ink" ? "active" : ""}`} type="button" onClick={() => selectStyle("ink")} aria-pressed={settings.style === "ink"}><i className="ink-swatch" />Field ink</button>
+              <button className={`style-card ${settings.style === "satellite" ? "active" : ""}`} type="button" onClick={() => selectStyle("satellite")} aria-pressed={settings.style === "satellite"} disabled={isBusy}><i className="satellite-swatch" />Satellite</button>
+              <button className={`style-card ${settings.style === "ink" ? "active" : ""}`} type="button" onClick={() => selectStyle("ink")} aria-pressed={settings.style === "ink"} disabled={isBusy}><i className="ink-swatch" />Field ink</button>
             </div>
           </div>
 
-          <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isGenerating}>
-            <span>{isGenerating ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isGenerating ? `${progress}%` : "↗"}</span>
+          <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isBusy}>
+            <span>{isBusy ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">Preview ~5s · High ~10s · Ultra ~20s</p>
+          <p className="generation-note">High builds the world model · 8K export renders it in memory-bounded strips</p>
         </aside>
 
         <div className="map-stage">
@@ -438,7 +514,7 @@ export function MapStudio() {
 
           <div className="survey-strip" aria-label="World survey">
             <div><span>LAND</span><strong>{stats.landPercent || "—"}%</strong></div>
-            <div><span>PLATES</span><strong>{stats.plateCount || "—"}</strong></div>
+            <div><span>SYSTEMS</span><strong>{stats.continentSystems || "—"}</strong></div>
             <div><span>HEADWATERS</span><strong>{stats.riverCount || "—"}</strong></div>
             <div><span>GENESIS</span><strong>{stats.generationMs ? `${(stats.generationMs / 1000).toFixed(1)}s` : "—"}</strong></div>
           </div>
@@ -446,12 +522,12 @@ export function MapStudio() {
           <div className="scale-bar"><span>0</span><i /><span>1,000 KM</span></div>
           <div className="map-caption"><span className="eyebrow">BIOME SURVEY</span><strong>{stats.survey}</strong></div>
 
-          {isGenerating && (
+          {isBusy && (
             <div className="generation-overlay" role="status" aria-live="polite">
               <div className="generation-orbit"><span /></div>
               <strong>{generationStage}</strong>
               <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
-              <span>{progress}% · deterministic from seed</span>
+              <span>{progress}% · {isExporting ? "strip-rendered 8192 × 4096 atlas" : "deterministic from seed"}</span>
             </div>
           )}
           {error && <div className="error-toast" role="alert">{error}</div>}

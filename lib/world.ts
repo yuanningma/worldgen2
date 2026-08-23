@@ -8,6 +8,7 @@ export interface WorldSettings {
   height: number;
   simulationSites?: number;
   continentSize: number;
+  seaLevel?: number;
   coastDetail: number;
   tectonics: number;
   moisture: number;
@@ -20,6 +21,7 @@ export interface WorldStats {
   landPercent: number;
   plateCount: number;
   riverCount: number;
+  continentSystems: number;
   coastlineIndex: number;
   frameClearance: number;
   focusLongitude: number;
@@ -67,6 +69,7 @@ interface TerrainCandidate {
   score: number;
   coastlineIndex: number;
   frameClearance: number;
+  continentComponents: number;
 }
 
 interface CoastPoint {
@@ -100,13 +103,22 @@ interface CrustComposition {
   period: number;
 }
 
-interface RasterTerrain {
+export interface RasterTerrain {
   elevation: Float32Array;
   coastCoverage: Float32Array;
+  coastSigned: Float32Array;
   coastlineIndex: number;
   frameClearance: number;
   rockLevel: number;
   snowLevel: number;
+}
+
+export interface WorldModel extends WorldResult {
+  settings: WorldSettings;
+  seed: number;
+  raster: RasterTerrain;
+  riverMask: Uint8Array;
+  shadeMap: Uint8Array;
 }
 
 const TAU = Math.PI * 2;
@@ -132,6 +144,11 @@ function periodicDelta(from: number, to: number, period = 1) {
 function smoothstep(value: number) {
   const t = clamp(value);
   return t * t * (3 - 2 * t);
+}
+
+function targetLandFraction(settings: WorldSettings) {
+  if (settings.seaLevel === undefined) return mix(0.16, 0.47, settings.continentSize / 100);
+  return mix(0.48, 0.19, clamp(settings.seaLevel / 100));
 }
 
 function smootherstep(value: number) {
@@ -482,9 +499,20 @@ function buildPlateAdjacency(mesh: GraphMesh, plateId: Int16Array, plateCount: n
   return adjacency;
 }
 
-function assignContinentalClusters(plates: Plate[], adjacency: Set<number>[], random: () => number, targetLand: number, aspect: number) {
-  const desired = Math.round(plates.length * clamp(targetLand * 1.06, 0.26, 0.62));
-  const rootCount = Math.min(desired, 2 + Math.floor(random() * 2));
+function assignContinentalClusters(
+  plates: Plate[],
+  adjacency: Set<number>[],
+  random: () => number,
+  continentalShare: number,
+  aspect: number,
+) {
+  const desired = Math.round(plates.length * clamp(continentalShare, 0.28, 0.58));
+  const meanAdjacency = adjacency.reduce((sum, neighbors) => sum + neighbors.size, 0) / Math.max(1, adjacency.length);
+  const mass = clamp((continentalShare - 0.28) / 0.3);
+  const expectedRoots = mix(7.1, 4.15, mass)
+    + (plates.length - 23) * 0.11
+    + (meanAdjacency - 4.5) * 0.18;
+  const rootCount = Math.min(desired, Math.round(clamp(expectedRoots + (random() - 0.5) * 2.2, 3, 8)));
   const roots: number[] = [];
   const nearest = new Float32Array(plates.length).fill(Number.POSITIVE_INFINITY);
   const first = Math.floor(random() * plates.length);
@@ -876,7 +904,7 @@ function selectThreshold(values: Float32Array, targetFraction: number) {
   return sorted[sorted.length - landCells] - 1e-6;
 }
 
-function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, targetComponents: number, desiredCoast: number) {
+function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: number) {
   const visited = new Uint8Array(mesh.cellCount);
   const componentSizes: number[] = [];
   let coastEdges = 0;
@@ -913,9 +941,12 @@ function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, targetComponents:
   const coastlineIndex = landCells ? coastEdges / Math.sqrt(landCells) : 0;
   const tinyCells = componentSizes.filter((size) => size < Math.max(5, landCells * 0.003)).reduce((sum, size) => sum + size, 0);
   const clearancePenalty = Math.max(0, 0.06 - minimumEdgeDistance) * 115;
+  const componentPenalty = meaningful.length < 4
+    ? (4 - meaningful.length) * 5.2
+    : Math.max(0, meaningful.length - 8) * 2.6;
   const score = 26
-    - Math.abs(meaningful.length - targetComponents) * 4.2
-    - Math.max(0, largestShare - 0.68) * 25
+    - componentPenalty
+    - Math.max(0, largestShare - 0.53) * 42
     - Math.abs(coastlineIndex - desiredCoast) * 0.65
     - (tinyCells / Math.max(1, landCells)) * 35
     - clearancePenalty;
@@ -942,12 +973,22 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   });
   const plateId = assignPlateOwnership(mesh, plates);
   const adjacency = buildPlateAdjacency(mesh, plateId, plateCount);
-  const targetLand = mix(0.16, 0.47, settings.continentSize / 100);
-  const continentCluster = assignContinentalClusters(plates, adjacency, random, targetLand, mesh.aspect);
+  const targetLand = targetLandFraction(settings);
+  const continentalShare = mix(0.3, 0.5, settings.continentSize / 100);
+  const continentCluster = assignContinentalClusters(
+    plates,
+    adjacency,
+    random,
+    continentalShare,
+    mesh.aspect,
+  );
   const crustComposition = buildCrustComposition(plates, continentCluster, mesh.aspect, random);
   for (const plate of plates) {
     plate.crustBias = plate.continental ? 0.12 + random() * 0.1 : -0.08 - random() * 0.08;
   }
+  const convergence = propagateBoundaryField(mesh, plateId, plates, true);
+  const divergence = propagateBoundaryField(mesh, plateId, plates, false);
+  const tectonicAmount = mix(0.25, 0.9, settings.tectonics / 100);
 
   const base = new Float32Array(mesh.cellCount);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
@@ -965,13 +1006,19 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     const edgePenalty = polarDistance < polarBand
       ? Math.pow((polarBand - polarDistance) / polarBand, 1.55) * 3.1
       : 0;
-    base[cell] = clamp(structuredCrust, -1.4, 1.1) * 0.82
+    let basePotential = clamp(structuredCrust, -1.4, 1.1) * 0.82
       + plate.crustBias
       + (plate.continental ? interior * 0.05 : -interior * 0.035)
       + macro * 0.3
       + regional * coastAmplitude
       - edgePenalty;
-    if (mesh.boundary[cell]) base[cell] = -3.5;
+    if (!plate.continental && polarDistance > 0.12 && Number.isFinite(convergence.distance[cell])) {
+      const arcInfluence = Math.exp(-convergence.distance[cell] / 0.014) * convergence.strength[cell];
+      const arcBeads = smoothstep((periodicGradientFbm(nx + 0.07, ny - 0.22, 34, seed + 181, 3) + 0.18) / 0.92);
+      const arcPotential = -0.31 + arcInfluence * tectonicAmount * mix(0.09, 0.72, arcBeads);
+      basePotential = Math.max(basePotential, arcPotential);
+    }
+    base[cell] = mesh.boundary[cell] ? -3.5 : basePotential;
   }
   const potential = smoothGraphField(mesh, base, 1, 0.84);
   const eligiblePotential: number[] = [];
@@ -987,8 +1034,6 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     landMask[cell] = potential[cell] > seaLevel && polarDistance > FRAME_OCEAN_MARGIN && !mesh.boundary[cell] ? 1 : 0;
   }
 
-  const convergence = propagateBoundaryField(mesh, plateId, plates, true);
-  const divergence = propagateBoundaryField(mesh, plateId, plates, false);
   const ridge = new Float32Array(mesh.cellCount);
   const elevation = new Float32Array(mesh.cellCount);
   let minPotential = Number.POSITIVE_INFINITY;
@@ -997,7 +1042,6 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     minPotential = Math.min(minPotential, potential[cell]);
     maxPotential = Math.max(maxPotential, potential[cell]);
   }
-  const tectonicAmount = mix(0.25, 0.9, settings.tectonics / 100);
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const nx = mesh.x[cell] / mesh.aspect;
     const ny = mesh.y[cell];
@@ -1022,7 +1066,11 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     }
   }
 
-  const measured = measureTerrain(mesh, landMask, 3, mix(11, 15.5, settings.coastDetail / 100));
+  const measured = measureTerrain(
+    mesh,
+    landMask,
+    mix(11, 16.5, settings.coastDetail / 100),
+  );
   return {
     plates,
     plateId,
@@ -1034,6 +1082,7 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     score: measured.score,
     coastlineIndex: measured.coastlineIndex,
     frameClearance: measured.frameClearance,
+    continentComponents: measured.meaningfulComponents,
   };
 }
 
@@ -1081,12 +1130,14 @@ function routeGraphRivers(mesh: GraphMesh, terrain: TerrainCandidate, settings: 
   const visited = new Uint8Array(mesh.cellCount);
   const accumulation = new Float32Array(mesh.cellCount);
   const heap = new MinHeap();
+  let landCells = 0;
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
     const nx = mesh.x[cell] / mesh.aspect;
     const ny = mesh.y[cell];
     accumulation[cell] = terrain.landMask[cell]
       ? 0.42 + clamp(periodicGradientFbm(nx + 0.31, ny - 0.27, 5.3, seed + 347, 4) * 0.5 + 0.5 + (settings.moisture - 50) / 90) * 1.35
       : 0;
+    if (terrain.landMask[cell]) landCells += 1;
     if (!terrain.landMask[cell] || mesh.boundary[cell]) {
       visited[cell] = 1;
       heap.push({ index: cell, priority: terrain.elevation[cell] });
@@ -1110,7 +1161,7 @@ function routeGraphRivers(mesh: GraphMesh, terrain: TerrainCandidate, settings: 
     const target = receiver[cell];
     if (target >= 0) accumulation[target] += accumulation[cell];
   }
-  const threshold = mesh.cellCount * mix(0.0052, 0.0024, settings.moisture / 100);
+  const threshold = landCells * mix(0.0075, 0.0038, settings.moisture / 100);
   const river = new Uint8Array(mesh.cellCount);
   for (const cell of order) {
     if (accumulation[cell] >= threshold && terrain.elevation[cell] > 0.012) river[cell] = 1;
@@ -1547,7 +1598,7 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   const ridgeMap = boxBlurField(rasterizeTriangles(mesh, terrain.ridge, width, height), width, height, Math.max(2, Math.round(reliefRadius * 0.7)), 2);
   const macroLand = new Uint8Array(width * height);
   const frameMarginX = 0;
-  const frameMarginY = 0;
+  const frameMarginY = Math.ceil(height * FRAME_OCEAN_MARGIN);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
@@ -1580,20 +1631,24 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       const baseDistance = sampleField(signedDistance, width, height, x + warpX, y + warpY, true);
       const envelope = Math.exp(-((Math.abs(baseDistance) / Math.max(4, detailAmplitude * 2.7)) ** 2));
       const fault = sampleField(faultAtlas.field, faultAtlas.width, faultAtlas.height, nx * (faultAtlas.width - 1), ny * (faultAtlas.height - 1));
-      const coastNoise = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 4.2, seed + 593, 4) * 0.31
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.17, 10.5, seed + 617, 4) * 0.28
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 25, seed + 641, 3) * 0.21
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.09, 58, seed + 673, 2) * 0.13
-        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.31, 124, seed + 691, 1) * 0.07
+      const coastNoise = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, 4.2, seed + 593, 4) * 0.22
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.17, 10.5, seed + 617, 4) * 0.24
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.23, 25, seed + 641, 3) * 0.22
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.09, 58, seed + 673, 2) * 0.16
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.31, 124, seed + 691, 1) * 0.1
+        + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.28, 268, seed + 709, 1) * 0.06
         + fault * 0.1;
       const feature = coastFeatureValue(features, nx * mesh.aspect, ny, detailAmplitude * 0.9, mesh.aspect);
-      coastalField[index] = baseDistance + (coastNoise * detailAmplitude + feature) * envelope;
+      const polarClearance = Math.min(ny, 1 - ny);
+      const polarEnvelope = smoothstep((polarClearance - FRAME_OCEAN_MARGIN * 0.45) / (FRAME_OCEAN_MARGIN * 1.35));
+      coastalField[index] = baseDistance + (coastNoise * detailAmplitude + feature) * envelope * polarEnvelope;
     }
   }
 
-  const targetLand = mix(0.16, 0.47, settings.continentSize / 100);
+  const targetLand = targetLandFraction(settings);
   const threshold = selectRasterThreshold(coastalField, width, height, targetLand, frameMarginX, frameMarginY);
   const coastCoverage = new Float32Array(width * height);
+  const coastSigned = new Float32Array(width * height);
   const elevation = new Float32Array(width * height);
   let coastEdges = 0;
   let landPixels = 0;
@@ -1609,11 +1664,12 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       const longitudeX = Math.cos(longitude);
       const longitudeY = Math.sin(longitude);
       const signed = coastalField[index] - threshold;
+      coastSigned[index] = signed;
       const horizontal = coastalField[y * width + ((x + 1) % width)] - coastalField[y * width + wrap(x - 1, width)];
       const vertical = coastalField[Math.min(height - 1, y + 1) * width + x] - coastalField[Math.max(0, y - 1) * width + x];
       const localGradient = Math.max(0.65, Math.hypot(horizontal, vertical) * 0.5);
-      const withinFrame = true;
-      const coverage = smoothstep(0.5 + signed / (localGradient * 1.65));
+      const withinFrame = y >= frameMarginY && y < height - frameMarginY;
+      const coverage = withinFrame ? smoothstep(0.5 + signed / (localGradient * 1.65)) : 0;
       coastCoverage[index] = coverage;
       if (coverage > 0.5) {
         landPixels += 1;
@@ -1651,6 +1707,7 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   return {
     elevation,
     coastCoverage,
+    coastSigned,
     coastlineIndex: landPixels ? coastEdges / Math.sqrt(landPixels) : 0,
     frameClearance: minimumClearance,
     rockLevel: elevationQuantile(elevation, coastCoverage, 0.79),
@@ -1838,6 +1895,7 @@ function renderWorld(
     }
   }
   const pixels = new Uint8ClampedArray(width * height * 4);
+  const shadeMap = new Uint8Array(width * height);
   let landPixels = 0;
   for (let y = 0; y < height; y += 1) {
     const ny = y / Math.max(1, height - 1);
@@ -1854,6 +1912,7 @@ function renderWorld(
       const moisture = clamp(0.5 + sampleField(moistureNoise, climateWidth, climateHeight, climateX, climateY, true) * 0.34
         + (settings.moisture - 50) / 95 + (1 - latitude) * 0.08);
       const shade = hillshade(heightMap, broadHeight, width, height, x, y);
+      shadeMap[index] = Math.round(clamp(shade / 1.3) * 255);
       const depth = clamp(-elevation * 2.05);
       let oceanColor: [number, number, number];
       let landColor: [number, number, number];
@@ -1899,7 +1958,150 @@ function renderWorld(
       pixels[target + 3] = 255;
     }
   }
-  return { pixels, landPixels };
+  return { pixels, landPixels, shadeMap };
+}
+
+function sampleByteField(source: Uint8Array, width: number, height: number, x: number, y: number) {
+  const wrappedX = wrap(x, width);
+  const clampedY = clamp(y, 0, height - 1);
+  const x0 = Math.floor(wrappedX);
+  const y0 = Math.floor(clampedY);
+  const x1 = (x0 + 1) % width;
+  const y1 = Math.min(height - 1, y0 + 1);
+  const fx = wrappedX - x0;
+  const fy = clampedY - y0;
+  return mix(
+    mix(source[y0 * width + x0], source[y0 * width + x1], fx),
+    mix(source[y1 * width + x0], source[y1 * width + x1], fx),
+    fy,
+  );
+}
+
+function samplePixelChannel(
+  source: Uint8ClampedArray,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  channel: number,
+) {
+  const wrappedX = wrap(x, width);
+  const clampedY = clamp(y, 0, height - 1);
+  const x0 = Math.floor(wrappedX);
+  const y0 = Math.floor(clampedY);
+  const x1 = (x0 + 1) % width;
+  const y1 = Math.min(height - 1, y0 + 1);
+  const fx = wrappedX - x0;
+  const fy = clampedY - y0;
+  return mix(
+    mix(source[(y0 * width + x0) * 4 + channel], source[(y0 * width + x1) * 4 + channel], fx),
+    mix(source[(y1 * width + x0) * 4 + channel], source[(y1 * width + x1) * 4 + channel], fx),
+    fy,
+  );
+}
+
+/**
+ * Render a memory-bounded slice of a large 2:1 atlas. The tectonic model stays
+ * modest in size; only the final RGBA strip exists at export resolution. Fine
+ * periodic detail is confined to the shoreline so 8K adds capes and coves
+ * without inventing new continental structure or breaking the longitude seam.
+ */
+export function renderCartographicStrip(
+  model: WorldModel,
+  outputWidth: number,
+  outputHeight: number,
+  startY: number,
+  stripHeight: number,
+) {
+  if (outputWidth < 2 || outputHeight < 2 || startY < 0 || stripHeight < 1 || startY + stripHeight > outputHeight) {
+    throw new Error("Invalid atlas export bounds");
+  }
+  if (outputWidth > 10000 || outputHeight > 5000) throw new Error("Atlas export exceeds the 10K × 5K safety limit");
+
+  const sourceWidth = model.width;
+  const sourceHeight = model.height;
+  const heightScale = outputHeight / sourceHeight;
+  const detailScale = outputHeight / 4096;
+  const detailControl = model.settings.coastDetail / 100;
+  const shoreRoughness = mix(0.68, 1.18, detailControl);
+  const coastBand = Math.max(3, 62 * detailScale);
+  const frequencyA = Math.min(190, outputWidth / 18);
+  const frequencyB = Math.min(470, outputWidth / 8);
+  const frequencyC = Math.min(1120, outputWidth / 4);
+  const pixels = new Uint8ClampedArray(outputWidth * stripHeight * 4);
+
+  for (let localY = 0; localY < stripHeight; localY += 1) {
+    const y = startY + localY;
+    const ny = y / Math.max(1, outputHeight - 1);
+    const sourceY = ny * (sourceHeight - 1);
+    const latitude = Math.abs(ny - 0.5) * 2;
+    for (let x = 0; x < outputWidth; x += 1) {
+      const seamX = x === outputWidth - 1 ? 0 : x;
+      const nx = seamX / Math.max(1, outputWidth - 1);
+      const sourceX = nx * (sourceWidth - 1);
+      let signed = sampleField(model.raster.coastSigned, sourceWidth, sourceHeight, sourceX, sourceY, true) * heightScale;
+
+      if (Math.abs(signed) < coastBand) {
+        const longitude = nx * TAU;
+        const longitudeX = Math.cos(longitude);
+        const longitudeY = Math.sin(longitude);
+        const envelope = Math.exp(-((Math.abs(signed) / Math.max(2, coastBand * 0.58)) ** 2));
+        const micro = periodicGradientFbmFromUnit(longitudeX, longitudeY, ny, frequencyA, model.seed + 911, 1) * 10.5
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny - 0.19, frequencyB, model.seed + 947, 1) * 4.2
+          + periodicGradientFbmFromUnit(longitudeX, longitudeY, ny + 0.27, frequencyC, model.seed + 983, 1) * 1.55;
+        signed += micro * detailScale * shoreRoughness * envelope;
+      }
+
+      const coverage = smoothstep(0.5 + signed / Math.max(0.78, 1.2 * detailScale));
+      let color: [number, number, number];
+      if (coverage < 0.01) {
+        const depth = smoothstep(-signed / Math.max(8, outputHeight * 0.055));
+        color = [mix(31, 8, depth), mix(91, 41, depth), mix(108, 63, depth)];
+      } else {
+        const elevation = Math.max(0.0025, sampleField(model.raster.elevation, sourceWidth, sourceHeight, sourceX, sourceY, true));
+        const baseCoverage = sampleField(model.raster.coastCoverage, sourceWidth, sourceHeight, sourceX, sourceY, true);
+        const guideRed = baseCoverage > 0.28 ? samplePixelChannel(model.pixels, sourceWidth, sourceHeight, sourceX, sourceY, 0) : 102;
+        const guideGreen = baseCoverage > 0.28 ? samplePixelChannel(model.pixels, sourceWidth, sourceHeight, sourceX, sourceY, 1) : 126;
+        const moisture = clamp(0.52 + (guideGreen - guideRed) / 115 + (model.settings.moisture - 50) / 150);
+        const temperature = clamp(1 - latitude * 0.88 - elevation * 0.58);
+        const natural = satelliteLandColor(elevation, temperature, moisture, model.raster.rockLevel, model.raster.snowLevel);
+        const relief = sampleByteField(model.shadeMap, sourceWidth, sourceHeight, sourceX, sourceY) / 255 * 1.3;
+        const reliefLight = clamp(0.72 + relief * 0.34, 0.69, 1.16);
+        const muted: [number, number, number] = [
+          mix(natural[0], 119, 0.24) * reliefLight,
+          mix(natural[1], 139, 0.24) * reliefLight,
+          mix(natural[2], 101, 0.24) * reliefLight,
+        ];
+        const beach = smoothstep(1 - Math.max(0, signed) / Math.max(2.2, 5.5 * detailScale));
+        const contourPhase = Math.abs(((elevation * 32) % 1) - 0.5);
+        const contour = contourPhase < 0.017 ? -7 : 0;
+        const land: [number, number, number] = [
+          mix(muted[0] + contour, 190, beach * 0.48),
+          mix(muted[1] + contour, 179, beach * 0.48),
+          mix(muted[2] + contour, 129, beach * 0.48),
+        ];
+        const depth = smoothstep(-signed / Math.max(8, outputHeight * 0.055));
+        const ocean: [number, number, number] = [mix(31, 8, depth), mix(91, 41, depth), mix(108, 63, depth)];
+        color = [mix(ocean[0], land[0], coverage), mix(ocean[1], land[1], coverage), mix(ocean[2], land[2], coverage)];
+
+        const coastLine = smoothstep(1 - Math.abs(signed) / Math.max(0.9, 1.65 * detailScale));
+        color = [mix(color[0], 48, coastLine * 0.62), mix(color[1], 62, coastLine * 0.62), mix(color[2], 57, coastLine * 0.62)];
+        const river = sampleByteField(model.riverMask, sourceWidth, sourceHeight, sourceX, sourceY) / 255;
+        if (river > 0.025 && coverage > 0.12) {
+          const riverBlend = river * smoothstep(coverage) * 0.88;
+          color = [mix(color[0], 28, riverBlend), mix(color[1], 91, riverBlend), mix(color[2], 113, riverBlend)];
+        }
+      }
+
+      const grain = (hash(seamX, y, model.seed + 1019) - 0.5) * 1.25;
+      const target = (localY * outputWidth + x) * 4;
+      pixels[target] = clamp(color[0] + grain, 0, 255);
+      pixels[target + 1] = clamp(color[1] + grain, 0, 255);
+      pixels[target + 2] = clamp(color[2] + grain, 0, 255);
+      pixels[target + 3] = 255;
+    }
+  }
+  return pixels;
 }
 
 function chooseWorldName(random: () => number) {
@@ -1930,7 +2132,7 @@ function findFocusLongitude(coverage: Float32Array, width: number, height: numbe
   return (center / width - 0.5) * TAU;
 }
 
-export function generateWorld(settings: WorldSettings, onProgress?: (stage: string, progress: number) => void): WorldResult {
+export function generateWorldModel(settings: WorldSettings, onProgress?: (stage: string, progress: number) => void): WorldModel {
   const started = performance.now();
   const seed = seedToInt(settings.seed || "ATLAS");
   onProgress?.("Sampling the dense wrapped mesh", 10);
@@ -1959,10 +2161,21 @@ export function generateWorld(settings: WorldSettings, onProgress?: (stage: stri
       landPercent,
       plateCount: terrain.plates.length,
       riverCount: routing.riverCount,
+      continentSystems: terrain.continentComponents,
       coastlineIndex: Math.round(raster.coastlineIndex * 10) / 10,
       frameClearance: Math.round(raster.frameClearance * 1000) / 10,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),
     },
+    settings: { ...settings },
+    seed,
+    raster,
+    riverMask,
+    shadeMap: rendered.shadeMap,
   };
+}
+
+export function generateWorld(settings: WorldSettings, onProgress?: (stage: string, progress: number) => void): WorldResult {
+  const model = generateWorldModel(settings, onProgress);
+  return { pixels: model.pixels, width: model.width, height: model.height, stats: model.stats };
 }
