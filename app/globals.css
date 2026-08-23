@@ -59,6 +59,12 @@ button:disabled { cursor: wait; opacity: 0.62; }
 .resolution-grid button { border: 0; border-right: 1px solid var(--line); padding: 9px 4px; background: transparent; color: var(--muted); cursor: pointer; font: 600 8px/1 var(--font-geist-mono), monospace; letter-spacing: 0.06em; }
 .resolution-grid button:last-child { border-right: 0; }
 .resolution-grid button.active { background: var(--ink); color: #f4f0e5; }
+.export-section { margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--line); }
+.export-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
+.export-grid button { display: grid; gap: 4px; border: 1px solid var(--line); padding: 9px 8px; background: transparent; text-align: left; cursor: pointer; }
+.export-grid button:hover { border-color: var(--accent); }
+.export-grid strong { font: 700 9px/1 var(--font-geist-mono), monospace; letter-spacing: 0.08em; }
+.export-grid span { color: var(--muted); font: 500 7px/1 var(--font-geist-mono), monospace; }
 .control-group { margin-top: 19px; }
 .control-label { display: flex; justify-content: space-between; font: 600 9px/1 var(--font-geist-mono), monospace; letter-spacing: 0.1em; }
 .control-label output { color: var(--muted); }

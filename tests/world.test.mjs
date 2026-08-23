@@ -53,6 +53,16 @@ test("large cartographic exports are deterministic, bounded, and seamless by str
       assert.ok(Math.abs(first[left + channel] - first[right + channel]) <= 2);
     }
   }
+  const fourKStrip = renderCartographicStrip(model, 4096, 2048, 640, 2);
+  assert.equal(fourKStrip.length, 4096 * 2 * 4);
+});
+
+test("the composition planner creates hierarchy, open ocean, and compact major landmasses", () => {
+  const world = generateWorld(base);
+  assert.ok(world.stats.largestLandmassPercent >= 25, `largest system was ${world.stats.largestLandmassPercent}%`);
+  assert.ok(world.stats.largestLandmassPercent <= 90, `largest system was ${world.stats.largestLandmassPercent}%`);
+  assert.ok(world.stats.oceanGapPercent >= 8, `open-ocean gap was ${world.stats.oceanGapPercent}%`);
+  assert.ok(world.stats.meanLandmassElongation <= 3.4, `mean elongation was ${world.stats.meanLandmassElongation}`);
 });
 
 test("the structural coast has meaningful perimeter without fragmenting the world", () => {

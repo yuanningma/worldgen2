@@ -16,7 +16,7 @@ self.onmessage = (event: MessageEvent<IncomingMessage>) => {
   const { id } = message;
   try {
     if (message.type === "export") {
-      if (!latestModel) throw new Error("Generate a world before exporting the 8K atlas");
+      if (!latestModel) throw new Error("Generate a world before exporting a high-resolution atlas");
       const stripHeight = 128;
       for (let y = 0; y < message.height; y += stripHeight) {
         const height = Math.min(stripHeight, message.height - y);

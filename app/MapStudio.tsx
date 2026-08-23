@@ -26,6 +26,9 @@ const EMPTY_STATS: WorldStats = {
   continentSystems: 0,
   coastlineIndex: 0,
   frameClearance: 0,
+  largestLandmassPercent: 0,
+  oceanGapPercent: 0,
+  meanLandmassElongation: 0,
   focusLongitude: 0,
   generationMs: 0,
 };
@@ -52,8 +55,12 @@ const RESOLUTION_PRESETS = [
   { label: "ULTRA", width: 2048, height: 1024 },
 ] as const;
 
-const EXPORT_WIDTH = 8192;
-const EXPORT_HEIGHT = 4096;
+const EXPORT_PRESETS = [
+  { label: "4K", width: 4096, height: 2048 },
+  { label: "8K", width: 8192, height: 4096 },
+] as const;
+
+type ExportPreset = (typeof EXPORT_PRESETS)[number];
 
 function freshSeed() {
   const words = ["AURELIA", "BRAMBLE", "CERULEAN", "EMBER", "HALCYON", "MISTRAL", "SABLE", "THORN", "VESPER"];
@@ -188,6 +195,7 @@ export function MapStudio() {
   const requestRef = useRef(0);
   const exportRequestRef = useRef(0);
   const exportCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const exportTargetRef = useRef<ExportPreset>(EXPORT_PRESETS[1]);
   const generatedSeedRef = useRef(DEFAULTS.seed);
   const pendingSeedRef = useRef(DEFAULTS.seed);
   const textureRef = useRef<WorldTexture | null>(null);
@@ -201,6 +209,7 @@ export function MapStudio() {
   const [stats, setStats] = useState(EMPTY_STATS);
   const [isGenerating, setIsGenerating] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
+  const [exportTarget, setExportTarget] = useState<ExportPreset>(EXPORT_PRESETS[1]);
   const [generationStage, setGenerationStage] = useState("Preparing genesis engine");
   const [progress, setProgress] = useState(6);
   const [error, setError] = useState<string | null>(null);
@@ -250,21 +259,22 @@ export function MapStudio() {
         const context = canvas?.getContext("2d");
         if (!canvas || !context) return;
         context.putImageData(new ImageData(new Uint8ClampedArray(message.pixels), message.width, message.height), 0, message.y);
-        setProgress(Math.min(96, Math.round(((message.y + message.height) / EXPORT_HEIGHT) * 96)));
+        setProgress(Math.min(96, Math.round(((message.y + message.height) / exportTargetRef.current.height) * 96)));
         return;
       }
       if (message.type === "export-complete") {
         if (message.id !== exportRequestRef.current) return;
         const canvas = exportCanvasRef.current;
         if (!canvas) return;
-        setGenerationStage("Encoding the 8K PNG");
+        const target = exportTargetRef.current;
+        setGenerationStage(`Encoding the ${target.label} PNG`);
         setProgress(98);
         canvas.toBlob((blob) => {
           if (!blob) {
-            setError("The browser could not encode the 8K atlas. Try the current-view export instead.");
+            setError(`The browser could not encode the ${target.label} atlas. Try the 4K or current-view export instead.`);
           } else {
             const link = document.createElement("a");
-            link.download = `${generatedSeedRef.current.toLowerCase()}-8k-atlas.png`;
+            link.download = `${generatedSeedRef.current.toLowerCase()}-${target.label.toLowerCase()}-atlas.png`;
             link.href = URL.createObjectURL(blob);
             link.click();
             URL.revokeObjectURL(link.href);
@@ -398,22 +408,24 @@ export function MapStudio() {
     }, "image/png");
   };
 
-  const exportHighResolution = () => {
+  const exportHighResolution = (target: ExportPreset) => {
     if (!workerRef.current || isBusy || !textureRef.current) return;
     const canvas = document.createElement("canvas");
-    canvas.width = EXPORT_WIDTH;
-    canvas.height = EXPORT_HEIGHT;
+    canvas.width = target.width;
+    canvas.height = target.height;
     if (!canvas.getContext("2d")) {
-      setError("This browser cannot allocate an 8K atlas canvas.");
+      setError(`This browser cannot allocate a ${target.label} atlas canvas.`);
       return;
     }
     exportCanvasRef.current = canvas;
+    exportTargetRef.current = target;
+    setExportTarget(target);
     const id = ++exportRequestRef.current;
     setIsExporting(true);
     setError(null);
     setProgress(1);
-    setGenerationStage("Rendering 8K cartographic strips");
-    workerRef.current.postMessage({ type: "export", id, width: EXPORT_WIDTH, height: EXPORT_HEIGHT });
+    setGenerationStage(`Rendering ${target.label} cartographic strips`);
+    workerRef.current.postMessage({ type: "export", id, width: target.width, height: target.height });
   };
 
   return (
@@ -426,7 +438,8 @@ export function MapStudio() {
         <div className="world-title"><span className="eyebrow">CURRENT WORLD</span><strong>{stats.name.toUpperCase()}</strong></div>
         <div className="topbar-actions">
           <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>EXPORT VIEW</button>
-          <button className="export-button export-primary" type="button" onClick={exportHighResolution} disabled={isBusy}>EXPORT 8K ATLAS</button>
+          <button className="export-button" type="button" onClick={() => exportHighResolution(EXPORT_PRESETS[0])} disabled={isBusy}>EXPORT 4K</button>
+          <button className="export-button export-primary" type="button" onClick={() => exportHighResolution(EXPORT_PRESETS[1])} disabled={isBusy}>EXPORT 8K</button>
         </div>
       </header>
 
@@ -434,7 +447,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 06</span>
+            <span className="version">ALPHA 07</span>
           </div>
 
           <label className="seed-field">
@@ -466,6 +479,17 @@ export function MapStudio() {
             </div>
           </div>
 
+          <div className="export-section">
+            <div className="control-label"><span>HIGH-RES ATLAS</span><output>same geography</output></div>
+            <div className="export-grid">
+              {EXPORT_PRESETS.map((preset) => (
+                <button key={preset.label} type="button" onClick={() => exportHighResolution(preset)} disabled={isBusy}>
+                  <strong>{preset.label}</strong><span>{preset.width} × {preset.height}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
           <SettingSlider label="CONTINENT MASS" value={settings.continentSize} onChange={(value) => updateSetting("continentSize", value)} />
           <SettingSlider label="GLOBAL SEA LEVEL" value={settings.seaLevel ?? 52} onChange={(value) => updateSetting("seaLevel", value)} />
           <SettingSlider label="COASTAL COMPLEXITY" value={settings.coastDetail} onChange={(value) => updateSetting("coastDetail", value)} />
@@ -483,7 +507,7 @@ export function MapStudio() {
           <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isBusy}>
             <span>{isBusy ? generationStage.toUpperCase() : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
           </button>
-          <p className="generation-note">High builds the world model · 8K export renders it in memory-bounded strips</p>
+          <p className="generation-note">Preview builds the model · 4K/8K rerender it in memory-bounded strips</p>
         </aside>
 
         <div className="map-stage">
@@ -527,7 +551,7 @@ export function MapStudio() {
               <div className="generation-orbit"><span /></div>
               <strong>{generationStage}</strong>
               <div className="progress-track"><i style={{ width: `${progress}%` }} /></div>
-              <span>{progress}% · {isExporting ? "strip-rendered 8192 × 4096 atlas" : "deterministic from seed"}</span>
+              <span>{progress}% · {isExporting ? `strip-rendered ${exportTarget.width} × ${exportTarget.height} atlas` : "deterministic from seed"}</span>
             </div>
           )}
           {error && <div className="error-toast" role="alert">{error}</div>}

@@ -24,6 +24,9 @@ export interface WorldStats {
   continentSystems: number;
   coastlineIndex: number;
   frameClearance: number;
+  largestLandmassPercent: number;
+  oceanGapPercent: number;
+  meanLandmassElongation: number;
   focusLongitude: number;
   generationMs: number;
 }
@@ -70,6 +73,9 @@ interface TerrainCandidate {
   coastlineIndex: number;
   frameClearance: number;
   continentComponents: number;
+  largestLandmassShare: number;
+  oceanGapShare: number;
+  meanLandmassElongation: number;
 }
 
 interface CoastPoint {
@@ -101,6 +107,22 @@ interface CrustComposition {
   terranes: CrustStroke[];
   cuts: CrustStroke[];
   period: number;
+}
+
+interface ContinentalSystemPlan {
+  id: number;
+  province: number;
+  targetX: number;
+  targetY: number;
+  quota: number;
+  prominence: number;
+}
+
+interface ContinentalAssignment {
+  cluster: Int16Array;
+  systems: ContinentalSystemPlan[];
+  oceanCenter: number;
+  oceanWidth: number;
 }
 
 export interface RasterTerrain {
@@ -505,31 +527,95 @@ function assignContinentalClusters(
   random: () => number,
   continentalShare: number,
   aspect: number,
-) {
+): ContinentalAssignment {
   const desired = Math.round(plates.length * clamp(continentalShare, 0.28, 0.58));
-  const meanAdjacency = adjacency.reduce((sum, neighbors) => sum + neighbors.size, 0) / Math.max(1, adjacency.length);
   const mass = clamp((continentalShare - 0.28) / 0.3);
-  const expectedRoots = mix(7.1, 4.15, mass)
-    + (plates.length - 23) * 0.11
-    + (meanAdjacency - 4.5) * 0.18;
-  const rootCount = Math.min(desired, Math.round(clamp(expectedRoots + (random() - 0.5) * 2.2, 3, 8)));
-  const roots: number[] = [];
-  const nearest = new Float32Array(plates.length).fill(Number.POSITIVE_INFINITY);
-  const first = Math.floor(random() * plates.length);
-  roots.push(first);
-  while (roots.length < rootCount) {
-    const last = roots[roots.length - 1];
-    let best = 0;
-    let bestDistance = -1;
-    for (const plate of plates) {
-      const distance = Math.hypot(periodicDelta(plates[last].x, plate.x, aspect), plate.y - plates[last].y);
-      nearest[plate.id] = Math.min(nearest[plate.id], distance);
-      if (nearest[plate.id] > bestDistance && !roots.includes(plate.id)) {
-        bestDistance = nearest[plate.id];
-        best = plate.id;
+  const expectedRoots = mix(5.9, 4.35, mass) + (plates.length - 23) * 0.055;
+  const rootCount = Math.min(desired, Math.round(clamp(expectedRoots + (random() - 0.5) * 1.7, 4, 7)));
+
+  // Compose the planet in a few unequal geographic provinces around one legible
+  // ocean basin. This is a clustered point process, rather than farthest-point
+  // sampling: neighboring systems can form an "Old World" family while another
+  // remains isolated across a broad sea. The exact continent count still emerges
+  // later when sea level cuts the continuous field.
+  const oceanCenter = random() * aspect;
+  const oceanWidth = mix(0.32, 0.48, random());
+  const landCenter = wrap(oceanCenter + aspect * 0.5, aspect);
+  const provinceCount = rootCount >= 6 && random() < 0.52 ? 3 : 2;
+  const provinceOffsets = provinceCount === 3
+    ? [-mix(0.38, 0.5, random()), (random() - 0.5) * 0.13, mix(0.34, 0.48, random())]
+    : [-mix(0.23, 0.37, random()), mix(0.25, 0.4, random())];
+  const latitudePattern = provinceCount === 3
+    ? [mix(0.3, 0.43, random()), mix(0.53, 0.68, random()), mix(0.34, 0.58, random())]
+    : [mix(0.28, 0.48, random()), mix(0.52, 0.72, random())];
+  if (random() < 0.5) latitudePattern.reverse();
+  const provinceWeights = provinceCount === 3 ? [1.7, 1.08, 0.82] : [1.62, 1.08];
+  if (random() < 0.38) provinceWeights[0] *= 1.22;
+
+  const provinceAssignments = Array.from({ length: provinceCount }, (_, index) => index);
+  while (provinceAssignments.length < rootCount) {
+    let total = 0;
+    for (const weight of provinceWeights) total += weight;
+    let draw = random() * total;
+    let selected = 0;
+    for (let province = 0; province < provinceWeights.length; province += 1) {
+      draw -= provinceWeights[province];
+      if (draw <= 0) {
+        selected = province;
+        break;
       }
     }
-    roots.push(best);
+    provinceAssignments.push(selected);
+  }
+  provinceAssignments.sort((a, b) => a - b);
+
+  const systems: ContinentalSystemPlan[] = [];
+  const roots: number[] = [];
+  for (let id = 0; id < rootCount; id += 1) {
+    const province = provinceAssignments[id];
+    const siblings = systems.filter((system) => system.province === province).length;
+    const angle = random() * TAU + siblings * 2.17;
+    const spread = siblings === 0 ? mix(0.025, 0.075, random()) : mix(0.1, 0.24, random());
+    const targetX = wrap(landCenter + provinceOffsets[province] + Math.cos(angle) * spread, aspect);
+    const targetY = clamp(latitudePattern[province] + Math.sin(angle) * spread * mix(0.48, 0.8, random()), 0.14, 0.86);
+    const prominence = id === 0
+      ? mix(1.75, 2.15, random())
+      : provinceWeights[province] * mix(0.72, 1.18, random());
+
+    let root = -1;
+    let bestScore = Number.POSITIVE_INFINITY;
+    for (const plate of plates) {
+      if (roots.includes(plate.id)) continue;
+      const targetDistance = Math.hypot(periodicDelta(targetX, plate.x, aspect), plate.y - targetY);
+      let crowding = 0;
+      for (const existing of roots) {
+        const separation = Math.hypot(periodicDelta(plates[existing].x, plate.x, aspect), plate.y - plates[existing].y);
+        if (separation < 0.16) crowding += (0.16 - separation) * 2.8;
+      }
+      const score = targetDistance + crowding + Math.abs(plate.y - 0.5) * 0.035 + random() * 0.025;
+      if (score < bestScore) {
+        bestScore = score;
+        root = plate.id;
+      }
+    }
+    if (root < 0) break;
+    roots.push(root);
+    systems.push({ id, province, targetX, targetY, quota: 1, prominence });
+  }
+
+  let quotaAssigned = systems.length;
+  while (quotaAssigned < desired) {
+    let selected = 0;
+    let bestNeed = -1;
+    for (const system of systems) {
+      const need = system.prominence / Math.pow(system.quota + 0.35, 1.18) * mix(0.9, 1.1, random());
+      if (need > bestNeed) {
+        bestNeed = need;
+        selected = system.id;
+      }
+    }
+    systems[selected].quota += 1;
+    quotaAssigned += 1;
   }
 
   const continental = new Uint8Array(plates.length);
@@ -540,17 +626,28 @@ function assignContinentalClusters(
   });
   let assigned = roots.length;
   let roundsWithoutGrowth = 0;
-  while (assigned < desired && roundsWithoutGrowth < roots.length * 3) {
+  while (assigned < desired && roundsWithoutGrowth < roots.length * 4) {
     let grew = false;
-    for (let clusterId = 0; clusterId < roots.length && assigned < desired; clusterId += 1) {
+    const growthOrder = systems
+      .filter((system) => {
+        let count = 0;
+        for (let id = 0; id < cluster.length; id += 1) if (cluster[id] === system.id) count += 1;
+        return count < system.quota;
+      })
+      .sort((a, b) => b.prominence - a.prominence || a.id - b.id);
+    for (const system of growthOrder) {
+      if (assigned >= desired) break;
+      const clusterId = system.id;
       const frontier: { plate: number; score: number }[] = [];
       for (const plate of plates) {
         if (cluster[plate.id] !== clusterId) continue;
         for (const neighbor of adjacency[plate.id]) {
           if (continental[neighbor]) continue;
           const candidate = plates[neighbor];
-          const latitudePenalty = Math.abs(candidate.y - 0.5) * 0.25;
-          frontier.push({ plate: neighbor, score: random() + latitudePenalty });
+          const targetDistance = Math.hypot(periodicDelta(system.targetX, candidate.x, aspect), candidate.y - system.targetY);
+          const rootDistance = Math.hypot(periodicDelta(plates[roots[clusterId]].x, candidate.x, aspect), candidate.y - plates[roots[clusterId]].y);
+          const latitudePenalty = Math.abs(candidate.y - 0.5) * 0.06;
+          frontier.push({ plate: neighbor, score: targetDistance * 0.7 + rootDistance * 0.34 + random() * 0.11 + latitudePenalty });
         }
       }
       frontier.sort((a, b) => a.score - b.score || a.plate - b.plate);
@@ -565,12 +662,12 @@ function assignContinentalClusters(
     roundsWithoutGrowth = grew ? 0 : roundsWithoutGrowth + 1;
   }
   plates.forEach((plate) => { plate.continental = Boolean(continental[plate.id]); });
-  return cluster;
+  return { cluster, systems, oceanCenter, oceanWidth };
 }
 
 function buildCrustComposition(
   plates: Plate[],
-  cluster: Int16Array,
+  assignment: ContinentalAssignment,
   aspect: number,
   random: () => number,
 ): CrustComposition {
@@ -578,39 +675,119 @@ function buildCrustComposition(
   const cuts: CrustStroke[] = [];
   const groups = new Map<number, Plate[]>();
   for (const plate of plates) {
-    const clusterId = cluster[plate.id];
+    const clusterId = assignment.cluster[plate.id];
     if (clusterId < 0) continue;
     const group = groups.get(clusterId) ?? [];
     group.push(plate);
     groups.set(clusterId, group);
   }
   const constrainY = (value: number) => clamp(value, 0.065, 0.935);
-  // Work in the mesh's physical metric (0..aspect by 0..1), not normalized
-  // texture UVs. Using 0..1 for both axes made every horizontal feature twice
-  // as wide on a 2:1 world texture, which produced the paddle-like continents.
   const point = (plate: Plate) => ({ x: plate.x, y: plate.y });
+  const entries = [...groups.entries()].sort((a, b) => {
+    const planA = assignment.systems[a[0]];
+    const planB = assignment.systems[b[0]];
+    return (planB?.prominence ?? 0) - (planA?.prominence ?? 0) || b[1].length - a[1].length;
+  });
 
-  for (const group of groups.values()) {
+  const addPath = (
+    target: CrustStroke[],
+    start: { x: number; y: number },
+    heading: number,
+    length: number,
+    segments: number,
+    widthA: number,
+    widthB: number,
+    strength: number,
+    curl: number,
+  ) => {
+    let previous = start;
+    let previousWidth = widthA;
+    let direction = heading;
+    for (let segment = 1; segment <= segments; segment += 1) {
+      const progress = segment / segments;
+      direction += curl / segments + (random() - 0.5) * mix(0.2, 0.07, progress);
+      const step = length / segments * mix(0.88, 1.12, random());
+      const next = {
+        x: previous.x + Math.cos(direction) * step,
+        y: constrainY(previous.y + Math.sin(direction) * step),
+      };
+      const nextWidth = mix(widthA, widthB, Math.pow(progress, 0.82)) * mix(0.9, 1.08, random());
+      target.push({
+        ax: previous.x,
+        ay: previous.y,
+        bx: next.x,
+        by: next.y,
+        radiusA: previousWidth,
+        radiusB: nextWidth,
+        strength,
+      });
+      previous = next;
+      previousWidth = nextWidth;
+    }
+    return previous;
+  };
+
+  for (let rank = 0; rank < entries.length; rank += 1) {
+    const [clusterId, group] = entries[rank];
+    const system = assignment.systems[clusterId];
     const rawNodes = group.map(point);
     const referenceX = rawNodes[0].x;
-    const nodes = rawNodes.map((node) => ({ ...node, x: referenceX + periodicDelta(referenceX, node.x, aspect) }));
+    const uncompressed = rawNodes.map((node) => ({ ...node, x: referenceX + periodicDelta(referenceX, node.x, aspect) }));
+    const rawCentroid = uncompressed.reduce((sum, node) => ({ x: sum.x + node.x / uncompressed.length, y: sum.y + node.y / uncompressed.length }), { x: 0, y: 0 });
+    const compression = rank === 0 ? mix(0.68, 0.79, random()) : mix(0.56, 0.72, random());
+    const nodes = uncompressed.map((node) => ({
+      x: rawCentroid.x + (node.x - rawCentroid.x) * compression,
+      y: constrainY(rawCentroid.y + (node.y - rawCentroid.y) * compression),
+    }));
     const centroid = nodes.reduce((sum, node) => ({ x: sum.x + node.x / nodes.length, y: sum.y + node.y / nodes.length }), { x: 0, y: 0 });
+    const prominence = clamp((system?.prominence ?? 1) / 2.1, 0.42, 1);
+    const coreScale = mix(0.9, 1.17, prominence);
+    const isDominant = rank === 0;
+    const isRifted = rank === 1 && random() < 0.62;
+    const isCrescent = rank > 0 && rank < entries.length - 1 && random() < 0.24;
+    const isArchipelagic = group.length === 1 && rank >= Math.ceil(entries.length * 0.58);
 
-    // Compact terranes and bent minimum-span links establish a connected core without
-    // turning the continental field back into a union of plate-sized circles.
+    // Broad, overlapping terranes establish compact silhouettes. Plate centers
+    // influence their placement, but are pulled toward a shared cratonic core so
+    // a three-plate system does not become a chain of paddles.
     for (let index = 0; index < nodes.length; index += 1) {
       const node = nodes[index];
-      const radius = mix(0.046, 0.078, random());
+      const radius = mix(0.067, 0.108, random()) * coreScale * (isArchipelagic ? 0.72 : 1);
       const angle = Math.atan2(group[index].vy, group[index].vx) + (random() - 0.5) * 0.75;
-      const halfLength = mix(0.026, 0.068, random());
+      const halfLength = mix(0.018, 0.052, random()) * coreScale;
       terranes.push({
         ax: node.x - Math.cos(angle) * halfLength,
         ay: constrainY(node.y - Math.sin(angle) * halfLength),
         bx: node.x + Math.cos(angle) * halfLength,
         by: constrainY(node.y + Math.sin(angle) * halfLength),
-        radiusA: radius * mix(0.72, 1, random()),
-        radiusB: radius * mix(0.72, 1, random()),
-        strength: mix(0.9, 1.08, random()),
+        radiusA: radius * mix(0.82, 1, random()),
+        radiusB: radius * mix(0.82, 1, random()),
+        strength: mix(0.96, 1.1, random()),
+      });
+    }
+
+    // A few offset lobes make shoulders, inland plains, and asymmetric capes.
+    // They are deliberately shorter and wider than the old branch grammar.
+    const lobeCount = (isDominant ? 3 : 2) + Math.floor(random() * 2);
+    const lobePhase = random() * TAU;
+    for (let lobe = 0; lobe < lobeCount; lobe += 1) {
+      const angle = lobePhase + (lobe / lobeCount) * TAU + (random() - 0.5) * 0.68;
+      const offset = mix(0.035, 0.085, random()) * coreScale;
+      const lobeCenter = {
+        x: centroid.x + Math.cos(angle) * offset,
+        y: constrainY(centroid.y + Math.sin(angle) * offset),
+      };
+      const halfLength = mix(0.025, 0.064, random()) * coreScale;
+      const width = mix(0.052, 0.086, random()) * coreScale * (isArchipelagic ? 0.68 : 1);
+      const tangent = angle + (random() - 0.5) * 0.9;
+      terranes.push({
+        ax: lobeCenter.x - Math.cos(tangent) * halfLength,
+        ay: constrainY(lobeCenter.y - Math.sin(tangent) * halfLength),
+        bx: lobeCenter.x + Math.cos(tangent) * halfLength,
+        by: constrainY(lobeCenter.y + Math.sin(tangent) * halfLength),
+        radiusA: width * mix(0.82, 1, random()),
+        radiusB: width * mix(0.76, 1, random()),
+        strength: mix(0.94, 1.08, random()),
       });
     }
 
@@ -634,150 +811,94 @@ function buildCrustComposition(
         }
         const a = nodes[bestFrom];
         const b = nodes[bestTo];
-        const bendX = (a.x + b.x) * 0.5 + (random() - 0.5) * 0.045;
-        const bendY = (a.y + b.y) * 0.5 + (random() - 0.5) * 0.045;
-        const width = mix(0.034, 0.057, random());
+        const bendX = (a.x + b.x) * 0.5 + (random() - 0.5) * 0.035;
+        const bendY = (a.y + b.y) * 0.5 + (random() - 0.5) * 0.035;
+        const width = mix(0.049, 0.075, random()) * coreScale;
         terranes.push(
-          { ax: a.x, ay: a.y, bx: bendX, by: bendY, radiusA: width, radiusB: width * mix(0.68, 1.04, random()), strength: 1.02 },
-          { ax: bendX, ay: bendY, bx: b.x, by: b.y, radiusA: width * mix(0.68, 1.04, random()), radiusB: width, strength: 1.02 },
+          { ax: a.x, ay: a.y, bx: bendX, by: bendY, radiusA: width, radiusB: width * mix(0.82, 1.04, random()), strength: 1.04 },
+          { ax: bendX, ay: bendY, bx: b.x, by: b.y, radiusA: width * mix(0.82, 1.04, random()), radiusB: width, strength: 1.04 },
         );
         connected.add(bestTo);
       }
     }
 
-    // Hooked, tapered branches create the recognizable arms and peninsula hierarchy.
-    const branchCount = 2 + nodes.length + Math.floor(random() * 2);
+    // Sparse peninsula grammar: most systems get one or two arms; only a single
+    // secondary system can become crescent-like. Fine shoreline noise supplies
+    // the many small capes instead of repeating the same macro stroke everywhere.
+    const branchCount = isArchipelagic ? 0 : isDominant ? 2 + (random() < 0.38 ? 1 : 0) : 1 + (random() < 0.4 ? 1 : 0);
+    const branchPhase = random() * TAU;
     for (let branch = 0; branch < branchCount; branch += 1) {
-      const anchor = nodes[Math.floor(random() * nodes.length)];
+      const anchor = nodes.length > 1
+        ? [...nodes].sort((a, b) => Math.hypot(b.x - centroid.x, b.y - centroid.y) - Math.hypot(a.x - centroid.x, a.y - centroid.y))[branch % nodes.length]
+        : nodes[0];
       let outwardX = anchor.x - centroid.x;
       let outwardY = anchor.y - centroid.y;
       const outwardLength = Math.hypot(outwardX, outwardY);
       if (outwardLength < 0.025) {
-        const plate = group[Math.floor(random() * group.length)];
-        outwardX = plate.vx;
-        outwardY = plate.vy;
+        outwardX = Math.cos(branchPhase + (branch / Math.max(1, branchCount)) * TAU);
+        outwardY = Math.sin(branchPhase + (branch / Math.max(1, branchCount)) * TAU);
       }
-      const baseAngle = Math.atan2(outwardY, outwardX) + (random() - 0.5) * 1.45;
-      const hook = (random() < 0.5 ? -1 : 1) * mix(0.32, 1.08, random());
-      const totalLength = mix(0.11, 0.23, random());
-      const segmentCount = 3 + Math.floor(random() * 3);
-      const rootWidth = mix(0.027, 0.047, random());
-      const tipWidth = rootWidth * mix(0.52, 0.74, random());
-      let previous = anchor;
-      let previousWidth = rootWidth;
-      let heading = baseAngle;
-      for (let segment = 1; segment <= segmentCount; segment += 1) {
-        const progress = segment / segmentCount;
-        heading += hook / segmentCount + (random() - 0.5) * mix(0.34, 0.12, progress);
-        const step = totalLength / segmentCount * mix(0.8, 1.2, random());
-        const next = {
-          x: previous.x + Math.cos(heading) * step,
-          y: constrainY(previous.y + Math.sin(heading) * step),
-        };
-        const nextWidth = mix(rootWidth, tipWidth, Math.pow(progress, 0.82)) * mix(0.84, 1.12, random());
-        terranes.push({
-          ax: previous.x, ay: previous.y, bx: next.x, by: next.y,
-          radiusA: previousWidth, radiusB: nextWidth, strength: mix(0.96, 1.1, random()),
-        });
-        previous = next;
-        previousWidth = nextWidth;
-      }
-      const end = previous;
+      const baseAngle = Math.atan2(outwardY, outwardX) + (random() - 0.5) * 0.92;
+      const totalLength = isCrescent && branch === 0 ? mix(0.12, 0.17, random()) : mix(0.055, 0.125, random());
+      const rootWidth = mix(0.029, 0.047, random());
+      const tipWidth = rootWidth * mix(0.38, 0.64, random());
+      const hook = (random() < 0.5 ? -1 : 1) * (isCrescent && branch === 0 ? mix(0.58, 0.92, random()) : mix(0.16, 0.52, random()));
+      const end = addPath(terranes, anchor, baseAngle, totalLength, 3 + Math.floor(random() * 2), rootWidth, tipWidth, mix(0.98, 1.1, random()), hook);
 
-      if (random() < 0.26) {
-        const tangent = baseAngle + hook + (random() < 0.5 ? -1 : 1) * mix(0.7, 1.15, random());
-        const fragmentStart = {
-          x: end.x + Math.cos(tangent) * mix(0.045, 0.082, random()),
-          y: constrainY(end.y + Math.sin(tangent) * mix(0.045, 0.082, random())),
-        };
-        const fragmentLength = mix(0.025, 0.07, random());
+      if (random() < (isDominant ? 0.42 : 0.28)) {
+        const tangent = baseAngle + hook + (random() < 0.5 ? -1 : 1) * mix(0.55, 0.95, random());
+        const gap = mix(0.025, 0.052, random());
+        const fragmentStart = { x: end.x + Math.cos(tangent) * gap, y: constrainY(end.y + Math.sin(tangent) * gap) };
+        const fragmentLength = mix(0.018, 0.045, random());
         terranes.push({
           ax: fragmentStart.x,
           ay: fragmentStart.y,
-          bx: fragmentStart.x + Math.cos(tangent + (random() - 0.5) * 0.65) * fragmentLength,
-          by: constrainY(fragmentStart.y + Math.sin(tangent + (random() - 0.5) * 0.65) * fragmentLength),
-          radiusA: mix(0.015, 0.026, random()),
-          radiusB: mix(0.012, 0.02, random()),
+          bx: fragmentStart.x + Math.cos(tangent + (random() - 0.5) * 0.5) * fragmentLength,
+          by: constrainY(fragmentStart.y + Math.sin(tangent + (random() - 0.5) * 0.5) * fragmentLength),
+          radiusA: mix(0.012, 0.022, random()),
+          radiusB: mix(0.01, 0.018, random()),
           strength: mix(0.9, 1.04, random()),
         });
       }
     }
 
-    // Subtractive strokes are equally important: they turn a sprawling mass into
-    // gulfs, rifts, straits, and occasional inland seas.
     const outerNodes = [...nodes].sort((a, b) => Math.hypot(b.x - centroid.x, b.y - centroid.y) - Math.hypot(a.x - centroid.x, a.y - centroid.y));
-    const inletCount = 2 + Math.floor(random() * 3);
+    const inletCount = (isDominant || isRifted ? 2 : 1) + (random() < 0.42 ? 1 : 0);
     for (let inlet = 0; inlet < inletCount; inlet += 1) {
       const anchor = outerNodes[inlet % outerNodes.length];
       let angle = Math.atan2(anchor.y - centroid.y, anchor.x - centroid.x);
-      angle += (random() - 0.5) * 0.65;
-      const outside = mix(0.09, 0.17, random());
-      const inside = mix(0.085, 0.18, random());
-      const cutSegments = 3 + Math.floor(random() * 3);
-      const mouthWidth = mix(0.042, 0.072, random());
-      const headWidth = mix(0.018, 0.032, random());
-      const cutCurl = (random() < 0.5 ? -1 : 1) * mix(0.18, 0.58, random());
-      const cutPoints = [{
-        x: anchor.x + Math.cos(angle) * outside,
-        y: constrainY(anchor.y + Math.sin(angle) * outside),
-      }];
-      let cutHeading = angle + Math.PI;
-      for (let segment = 1; segment <= cutSegments; segment += 1) {
-        cutHeading += cutCurl / cutSegments + (random() - 0.5) * 0.18;
-        const previous = cutPoints[cutPoints.length - 1];
-        const step = (outside + inside) / cutSegments * mix(0.84, 1.16, random());
-        cutPoints.push({
-          x: previous.x + Math.cos(cutHeading) * step,
-          y: constrainY(previous.y + Math.sin(cutHeading) * step),
-        });
-      }
-      for (let segment = 0; segment + 1 < cutPoints.length; segment += 1) {
-        const a = cutPoints[segment];
-        const b = cutPoints[segment + 1];
-        const progressA = segment / cutSegments;
-        const progressB = (segment + 1) / cutSegments;
-        cuts.push({
-          ax: a.x, ay: a.y, bx: b.x, by: b.y,
-          radiusA: mix(mouthWidth, headWidth, Math.pow(progressA, 0.74)),
-          radiusB: mix(mouthWidth, headWidth, Math.pow(progressB, 0.74)),
-          strength: mix(1.2, 1.54, random()),
-        });
-      }
-      if (random() < 0.72) {
-        const rootIndex = 1 + Math.floor(random() * Math.max(1, cutPoints.length - 2));
-        const root = cutPoints[rootIndex];
-        const prior = cutPoints[rootIndex - 1];
-        const branchAngle = Math.atan2(root.y - prior.y, root.x - prior.x)
-          + (random() < 0.5 ? -1 : 1) * mix(0.55, 1.05, random());
-        const branchLength = mix(0.035, 0.075, random());
-        cuts.push({
-          ax: root.x, ay: root.y,
-          bx: root.x + Math.cos(branchAngle) * branchLength,
-          by: constrainY(root.y + Math.sin(branchAngle) * branchLength),
-          radiusA: mix(0.02, 0.034, random()), radiusB: mix(0.012, 0.022, random()),
-          strength: mix(1.16, 1.48, random()),
-        });
+      angle += (random() - 0.5) * 0.58;
+      const outside = mix(0.055, 0.105, random());
+      const start = { x: anchor.x + Math.cos(angle) * outside, y: constrainY(anchor.y + Math.sin(angle) * outside) };
+      const cutLength = outside + mix(0.055, isRifted ? 0.15 : 0.11, random());
+      const mouthWidth = mix(0.03, 0.055, random());
+      const headWidth = mix(0.011, 0.026, random());
+      const cutCurl = (random() < 0.5 ? -1 : 1) * mix(0.12, 0.48, random());
+      const head = addPath(cuts, start, angle + Math.PI, cutLength, 3 + Math.floor(random() * 2), mouthWidth, headWidth, mix(1.2, 1.52, random()), cutCurl);
+      if (random() < 0.5) {
+        const branchAngle = angle + Math.PI + cutCurl + (random() < 0.5 ? -1 : 1) * mix(0.55, 0.95, random());
+        addPath(cuts, head, branchAngle, mix(0.025, 0.055, random()), 2, headWidth * 1.15, headWidth * 0.6, mix(1.12, 1.4, random()), (random() - 0.5) * 0.3);
       }
     }
 
-    const basinCount = random() < 0.78 ? 1 + (random() < 0.32 ? 1 : 0) : 0;
+    const basinCount = random() < (isRifted ? 0.68 : 0.34) ? 1 : 0;
     for (let basin = 0; basin < basinCount; basin += 1) {
       const angle = random() * TAU;
-      const offset = mix(0.018, 0.065, random());
+      const offset = mix(0.015, 0.052, random());
       const basinX = centroid.x + Math.cos(angle) * offset;
       const basinY = constrainY(centroid.y + Math.sin(angle) * offset);
       cuts.push({
         ax: basinX,
         ay: basinY,
-        bx: basinX + Math.cos(angle + Math.PI * 0.5) * mix(0.025, 0.075, random()),
-        by: constrainY(basinY + Math.sin(angle + Math.PI * 0.5) * mix(0.025, 0.075, random())),
-        radiusA: mix(0.032, 0.062, random()),
-        radiusB: mix(0.022, 0.052, random()),
-        strength: mix(1.02, 1.42, random()),
+        bx: basinX + Math.cos(angle + Math.PI * 0.5) * mix(0.022, 0.058, random()),
+        by: constrainY(basinY + Math.sin(angle + Math.PI * 0.5) * mix(0.022, 0.058, random())),
+        radiusA: mix(0.023, 0.048, random()),
+        radiusB: mix(0.018, 0.04, random()),
+        strength: mix(1.04, 1.38, random()),
       });
     }
 
-    if (outerNodes.length > 2 && random() < 0.55) {
+    if (isRifted && outerNodes.length > 1 && random() < 0.62) {
       const firstEdge = outerNodes[Math.floor(random() * outerNodes.length)];
       const opposite = [...outerNodes].sort((a, b) => {
         const first = (a.x - centroid.x) * (firstEdge.x - centroid.x) + (a.y - centroid.y) * (firstEdge.y - centroid.y);
@@ -789,9 +910,9 @@ function buildCrustComposition(
         ay: firstEdge.y,
         bx: opposite.x,
         by: opposite.y,
-        radiusA: mix(0.012, 0.024, random()),
-        radiusB: mix(0.01, 0.022, random()),
-        strength: mix(1.28, 1.68, random()),
+        radiusA: mix(0.009, 0.018, random()),
+        radiusB: mix(0.008, 0.016, random()),
+        strength: mix(1.22, 1.52, random()),
       });
     }
   }
@@ -906,12 +1027,18 @@ function selectThreshold(values: Float32Array, targetFraction: number) {
 
 function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: number) {
   const visited = new Uint8Array(mesh.cellCount);
-  const componentSizes: number[] = [];
+  const components: { size: number; elongation: number }[] = [];
+  const longitudeBins = 36;
+  const binLand = new Uint32Array(longitudeBins);
+  const binTotal = new Uint32Array(longitudeBins);
   let coastEdges = 0;
   let landCells = 0;
   let minimumEdgeDistance = 0.5;
   for (let cell = 0; cell < mesh.cellCount; cell += 1) {
+    const bin = Math.min(longitudeBins - 1, Math.floor((mesh.x[cell] / mesh.aspect) * longitudeBins));
+    binTotal[bin] += 1;
     if (!landMask[cell]) continue;
+    binLand[bin] += 1;
     landCells += 1;
     const edgeDistance = Math.min(mesh.y[cell], 1 - mesh.y[cell]);
     minimumEdgeDistance = Math.min(minimumEdgeDistance, edgeDistance);
@@ -920,11 +1047,24 @@ function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: num
     }
     if (visited[cell]) continue;
     let size = 0;
+    const anchorX = mesh.x[cell];
+    let sumX = 0;
+    let sumY = 0;
+    let sumXX = 0;
+    let sumYY = 0;
+    let sumXY = 0;
     const queue = [cell];
     visited[cell] = 1;
     for (let head = 0; head < queue.length; head += 1) {
       const current = queue[head];
       size += 1;
+      const x = anchorX + periodicDelta(anchorX, mesh.x[current], mesh.aspect);
+      const y = mesh.y[current];
+      sumX += x;
+      sumY += y;
+      sumXX += x * x;
+      sumYY += y * y;
+      sumXY += x * y;
       for (let cursor = mesh.neighborOffsets[current]; cursor < mesh.neighborOffsets[current + 1]; cursor += 1) {
         const neighbor = mesh.neighbors[cursor];
         if (landMask[neighbor] && !visited[neighbor]) {
@@ -933,24 +1073,66 @@ function measureTerrain(mesh: GraphMesh, landMask: Uint8Array, desiredCoast: num
         }
       }
     }
-    componentSizes.push(size);
+    const meanX = sumX / size;
+    const meanY = sumY / size;
+    const covarianceX = Math.max(0, sumXX / size - meanX * meanX);
+    const covarianceY = Math.max(0, sumYY / size - meanY * meanY);
+    const covarianceXY = sumXY / size - meanX * meanY;
+    const trace = covarianceX + covarianceY;
+    const root = Math.sqrt(Math.max(0, (covarianceX - covarianceY) ** 2 + 4 * covarianceXY ** 2));
+    const major = Math.max(0, (trace + root) * 0.5);
+    const minor = Math.max(0, (trace - root) * 0.5);
+    components.push({ size, elongation: Math.sqrt((major + 0.00008) / (minor + 0.00008)) });
   }
-  componentSizes.sort((a, b) => b - a);
-  const meaningful = componentSizes.filter((size) => size >= Math.max(5, landCells * 0.006));
-  const largestShare = landCells ? (componentSizes[0] ?? 0) / landCells : 1;
+  components.sort((a, b) => b.size - a.size);
+  const meaningful = components.filter((component) => component.size >= Math.max(5, landCells * 0.006));
+  const largestShare = landCells ? (components[0]?.size ?? 0) / landCells : 1;
+  const secondShare = landCells ? (components[1]?.size ?? 0) / landCells : 0;
   const coastlineIndex = landCells ? coastEdges / Math.sqrt(landCells) : 0;
-  const tinyCells = componentSizes.filter((size) => size < Math.max(5, landCells * 0.003)).reduce((sum, size) => sum + size, 0);
+  const tinyCells = components
+    .filter((component) => component.size < Math.max(5, landCells * 0.003))
+    .reduce((sum, component) => sum + component.size, 0);
+  const weightedElongation = meaningful.reduce((sum, component) => sum + component.elongation * component.size, 0)
+    / Math.max(1, meaningful.reduce((sum, component) => sum + component.size, 0));
+  const excessivelyNarrow = meaningful.filter((component) => component.elongation > 3.35).length;
+  let longestOceanRun = 0;
+  let currentOceanRun = 0;
+  for (let index = 0; index < longitudeBins * 2; index += 1) {
+    const bin = index % longitudeBins;
+    const density = binLand[bin] / Math.max(1, binTotal[bin]);
+    currentOceanRun = density < 0.115 ? Math.min(longitudeBins, currentOceanRun + 1) : 0;
+    longestOceanRun = Math.max(longestOceanRun, currentOceanRun);
+  }
+  const oceanGap = longestOceanRun / longitudeBins;
   const clearancePenalty = Math.max(0, 0.06 - minimumEdgeDistance) * 115;
-  const componentPenalty = meaningful.length < 4
-    ? (4 - meaningful.length) * 5.2
-    : Math.max(0, meaningful.length - 8) * 2.6;
-  const score = 26
+  const componentPenalty = meaningful.length < 3
+    ? (3 - meaningful.length) * 7.5
+    : Math.max(0, meaningful.length - 7) * 3.2;
+  const hierarchyPenalty = Math.max(0, 0.32 - largestShare) * 58
+    + Math.max(0, largestShare - 0.68) * 64
+    + Math.max(0, 0.1 - secondShare) * 26
+    + Math.max(0, 0.075 - (largestShare - secondShare)) * 34;
+  const oceanCompositionPenalty = Math.max(0, 0.105 - oceanGap) * 82
+    + Math.max(0, oceanGap - 0.36) * 34;
+  const shapePenalty = Math.max(0, weightedElongation - 2.7) * 4.8
+    + Math.max(0, excessivelyNarrow - 1) * 4.5;
+  const score = 38
     - componentPenalty
-    - Math.max(0, largestShare - 0.53) * 42
-    - Math.abs(coastlineIndex - desiredCoast) * 0.65
-    - (tinyCells / Math.max(1, landCells)) * 35
+    - hierarchyPenalty
+    - oceanCompositionPenalty
+    - shapePenalty
+    - Math.abs(coastlineIndex - desiredCoast) * 0.52
+    - (tinyCells / Math.max(1, landCells)) * 27
     - clearancePenalty;
-  return { score, coastlineIndex, meaningfulComponents: meaningful.length, frameClearance: minimumEdgeDistance };
+  return {
+    score,
+    coastlineIndex,
+    meaningfulComponents: meaningful.length,
+    frameClearance: minimumEdgeDistance,
+    largestLandmassShare: largestShare,
+    oceanGapShare: oceanGap,
+    meanLandmassElongation: weightedElongation,
+  };
 }
 
 function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, settings: WorldSettings): TerrainCandidate {
@@ -975,14 +1157,14 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
   const adjacency = buildPlateAdjacency(mesh, plateId, plateCount);
   const targetLand = targetLandFraction(settings);
   const continentalShare = mix(0.3, 0.5, settings.continentSize / 100);
-  const continentCluster = assignContinentalClusters(
+  const continentAssignment = assignContinentalClusters(
     plates,
     adjacency,
     random,
     continentalShare,
     mesh.aspect,
   );
-  const crustComposition = buildCrustComposition(plates, continentCluster, mesh.aspect, random);
+  const crustComposition = buildCrustComposition(plates, continentAssignment, mesh.aspect, random);
   for (const plate of plates) {
     plate.crustBias = plate.continental ? 0.12 + random() * 0.1 : -0.08 - random() * 0.08;
   }
@@ -1001,6 +1183,9 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     const macro = periodicGradientFbm(nx + attempt * 0.137, ny - attempt * 0.091, 2.45, seed + 101, 4);
     const regional = periodicGradientFbm(nx - 0.23, ny + 0.19, 7.8, seed + 149, 4);
     const coastAmplitude = mix(0.07, 0.17, settings.coastDetail / 100);
+    const oceanDistance = Math.abs(periodicDelta(continentAssignment.oceanCenter, mesh.x[cell], mesh.aspect));
+    const oceanHalfWidth = continentAssignment.oceanWidth * 0.5;
+    const oceanBasin = 1 - smoothstep((oceanDistance - oceanHalfWidth * 0.5) / Math.max(0.01, oceanHalfWidth * 0.78));
     const polarDistance = Math.min(ny, 1 - ny);
     const polarBand = 0.16;
     const edgePenalty = polarDistance < polarBand
@@ -1011,6 +1196,7 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
       + (plate.continental ? interior * 0.05 : -interior * 0.035)
       + macro * 0.3
       + regional * coastAmplitude
+      - oceanBasin * 0.24
       - edgePenalty;
     if (!plate.continental && polarDistance > 0.12 && Number.isFinite(convergence.distance[cell])) {
       const arcInfluence = Math.exp(-convergence.distance[cell] / 0.014) * convergence.strength[cell];
@@ -1083,6 +1269,9 @@ function buildTerrainCandidate(mesh: GraphMesh, seed: number, attempt: number, s
     coastlineIndex: measured.coastlineIndex,
     frameClearance: measured.frameClearance,
     continentComponents: measured.meaningfulComponents,
+    largestLandmassShare: measured.largestLandmassShare,
+    oceanGapShare: measured.oceanGapShare,
+    meanLandmassElongation: measured.meanLandmassElongation,
   };
 }
 
@@ -2164,6 +2353,9 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       continentSystems: terrain.continentComponents,
       coastlineIndex: Math.round(raster.coastlineIndex * 10) / 10,
       frameClearance: Math.round(raster.frameClearance * 1000) / 10,
+      largestLandmassPercent: Math.round(terrain.largestLandmassShare * 1000) / 10,
+      oceanGapPercent: Math.round(terrain.oceanGapShare * 1000) / 10,
+      meanLandmassElongation: Math.round(terrain.meanLandmassElongation * 100) / 100,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),
     },
