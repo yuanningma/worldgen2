@@ -39,6 +39,10 @@ const EMPTY_STATS: WorldStats = {
   landmassLatitudeDiversity: 0,
   landmassSpacingIrregularity: 0,
   verticalLandmassBias: 0,
+  meanMajorLandmassElongation: 0,
+  landCoreRetention: 0,
+  landCoreCoverage: 0,
+  neckFragmentation: 0,
   circumferenceKm: 0,
   focusLongitude: 0,
   generationMs: 0,
@@ -229,6 +233,7 @@ export function MapStudio() {
   const requestRef = useRef(0);
   const atlasRequestRef = useRef(0);
   const atlasTargetRef = useRef<AtlasPreset>(ATLAS_PRESETS[1]);
+  const atlasAfterGenerationRef = useRef<AtlasPreset | null>(null);
   const hasDetailedAtlasRef = useRef(false);
   const generatedSeedRef = useRef(DEFAULTS.seed);
   const pendingSettingsRef = useRef<WorldSettings>(DEFAULTS);
@@ -247,6 +252,7 @@ export function MapStudio() {
   const [isGenerating, setIsGenerating] = useState(true);
   const [isRenderingAtlas, setIsRenderingAtlas] = useState(false);
   const [atlasTarget, setAtlasTarget] = useState<AtlasPreset>(ATLAS_PRESETS[1]);
+  const [pendingAtlasTarget, setPendingAtlasTarget] = useState<AtlasPreset | null>(null);
   const [atlasResolution, setAtlasResolution] = useState({ label: "HIGH", width: DEFAULTS.width, height: DEFAULTS.height });
   const [generationStage, setGenerationStage] = useState("Preparing genesis engine");
   const [progress, setProgress] = useState(6);
@@ -254,7 +260,8 @@ export function MapStudio() {
   const [zoom, setZoom] = useState(1);
   const [viewMode, setViewMode] = useState<ViewMode>("globe");
   const isBusy = isGenerating || isRenderingAtlas;
-  const hasPendingChanges = !sameWorldSettings(settings, generatedSettings);
+  const hasPendingWorldChanges = !sameWorldSettings(settings, generatedSettings);
+  const hasPendingChanges = hasPendingWorldChanges || pendingAtlasTarget !== null;
 
   const renderCurrentView = useCallback(() => {
     const texture = textureRef.current;
@@ -289,6 +296,32 @@ export function MapStudio() {
     workerRef.current.postMessage({ type: "generate", id, settings: nextSettings });
   }, []);
 
+  const startAtlasRender = useCallback((target: AtlasPreset) => {
+    if (!workerRef.current || !textureRef.current) return;
+    const canvas = atlasCanvasRef.current;
+    if (!canvas) return;
+    canvas.width = target.width;
+    canvas.height = target.height;
+    if (!canvas.getContext("2d")) {
+      setError(`This browser cannot allocate a ${target.label} atlas canvas.`);
+      return;
+    }
+    hasDetailedAtlasRef.current = true;
+    atlasTargetRef.current = target;
+    setAtlasTarget(target);
+    setAtlasResolution(target);
+    viewModeRef.current = "atlas";
+    setViewMode("atlas");
+    setZoom(1);
+    zoomRef.current = 1;
+    const id = ++atlasRequestRef.current;
+    setIsRenderingAtlas(true);
+    setError(null);
+    setProgress(1);
+    setGenerationStage(`Drawing the ${target.label} atlas in browser`);
+    workerRef.current.postMessage({ type: "export", id, width: target.width, height: target.height });
+  }, []);
+
   useEffect(() => {
     const worker = new WorldWorker();
     workerRef.current = worker;
@@ -309,6 +342,7 @@ export function MapStudio() {
         setAtlasResolution(target);
         setGenerationStage(`${target.label} atlas ready in browser`);
         setProgress(100);
+        setPendingAtlasTarget(null);
         setIsRenderingAtlas(false);
         return;
       }
@@ -338,6 +372,9 @@ export function MapStudio() {
         setStats(message.stats);
         setProgress(100);
         setIsGenerating(false);
+        const queuedAtlas = atlasAfterGenerationRef.current;
+        atlasAfterGenerationRef.current = null;
+        if (queuedAtlas) startAtlasRender(queuedAtlas);
       } else {
         setError(message.message);
         setIsGenerating(false);
@@ -352,7 +389,7 @@ export function MapStudio() {
       worker.terminate();
       if (animationRef.current !== null) cancelAnimationFrame(animationRef.current);
     };
-  }, [renderCurrentView, requestWorld]);
+  }, [renderCurrentView, requestWorld, startAtlasRender]);
 
   const changeViewMode = (mode: ViewMode) => {
     viewModeRef.current = mode;
@@ -438,30 +475,20 @@ export function MapStudio() {
     }, "image/png");
   };
 
-  const renderHighResolution = (target: AtlasPreset) => {
-    if (!workerRef.current || isBusy || !textureRef.current) return;
-    const canvas = atlasCanvasRef.current;
-    if (!canvas) return;
-    canvas.width = target.width;
-    canvas.height = target.height;
-    if (!canvas.getContext("2d")) {
-      setError(`This browser cannot allocate a ${target.label} atlas canvas.`);
-      return;
+  const stageAtlasTarget = (target: AtlasPreset) => {
+    setPendingAtlasTarget(target);
+  };
+
+  const applyStagedChanges = () => {
+    if (isBusy) return;
+    if (hasPendingWorldChanges || !textureRef.current) {
+      atlasAfterGenerationRef.current = pendingAtlasTarget;
+      requestWorld(settings);
+    } else if (pendingAtlasTarget) {
+      startAtlasRender(pendingAtlasTarget);
+    } else {
+      requestWorld(settings);
     }
-    hasDetailedAtlasRef.current = true;
-    atlasTargetRef.current = target;
-    setAtlasTarget(target);
-    setAtlasResolution(target);
-    viewModeRef.current = "atlas";
-    setViewMode("atlas");
-    setZoom(1);
-    zoomRef.current = 1;
-    const id = ++atlasRequestRef.current;
-    setIsRenderingAtlas(true);
-    setError(null);
-    setProgress(1);
-    setGenerationStage(`Drawing the ${target.label} atlas in browser`);
-    workerRef.current.postMessage({ type: "export", id, width: target.width, height: target.height });
   };
 
   return (
@@ -474,9 +501,9 @@ export function MapStudio() {
         <div className="world-title"><span className="eyebrow">CURRENT WORLD</span><strong>{stats.name.toUpperCase()}</strong></div>
         <div className="topbar-actions">
           <button className="export-button" type="button" onClick={exportMap} disabled={isBusy}>DOWNLOAD VIEW</button>
-          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[0])} disabled={isBusy || hasPendingChanges}>RENDER 4K</button>
-          <button className="export-button" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[1])} disabled={isBusy || hasPendingChanges}>RENDER 8K</button>
-          <button className="export-button export-primary" type="button" onClick={() => renderHighResolution(ATLAS_PRESETS[2])} disabled={isBusy || hasPendingChanges}>RENDER 10K</button>
+          <button className={`export-button ${pendingAtlasTarget?.label === "4K" ? "export-primary" : ""}`} type="button" onClick={() => stageAtlasTarget(ATLAS_PRESETS[0])} disabled={isBusy}>STAGE 4K</button>
+          <button className={`export-button ${pendingAtlasTarget?.label === "8K" ? "export-primary" : ""}`} type="button" onClick={() => stageAtlasTarget(ATLAS_PRESETS[1])} disabled={isBusy}>STAGE 8K</button>
+          <button className={`export-button ${pendingAtlasTarget?.label === "10K" ? "export-primary" : ""}`} type="button" onClick={() => stageAtlasTarget(ATLAS_PRESETS[2])} disabled={isBusy}>STAGE 10K</button>
         </div>
       </header>
 
@@ -484,7 +511,7 @@ export function MapStudio() {
         <aside className="control-panel" aria-label="World controls">
           <div className="panel-heading">
             <div><span className="eyebrow">GENESIS ENGINE</span><h1>Shape a world.</h1></div>
-            <span className="version">ALPHA 12</span>
+            <span className="version">ALPHA 13</span>
           </div>
 
           <label className="seed-field">
@@ -517,15 +544,16 @@ export function MapStudio() {
           </div>
 
           <div className="export-section">
-            <div className="control-label"><span>OUTPUT ATLAS · CURRENT WORLD</span><output>{atlasResolution.width} × {atlasResolution.height}</output></div>
+            <div className="control-label"><span>OUTPUT ATLAS</span><output>{pendingAtlasTarget ? `${pendingAtlasTarget.width} × ${pendingAtlasTarget.height} STAGED` : `${atlasResolution.width} × ${atlasResolution.height}`}</output></div>
             <div className="export-grid">
               {ATLAS_PRESETS.map((preset) => (
                 <button
                   key={preset.label}
-                  className={atlasResolution.width === preset.width ? "active" : ""}
+                  className={(pendingAtlasTarget?.width ?? atlasResolution.width) === preset.width ? "active" : ""}
                   type="button"
-                  onClick={() => renderHighResolution(preset)}
-                  disabled={isBusy || hasPendingChanges}
+                  onClick={() => stageAtlasTarget(preset)}
+                  aria-pressed={(pendingAtlasTarget?.width ?? atlasResolution.width) === preset.width}
+                  disabled={isBusy}
                 >
                   <strong>{preset.label}</strong><span>{preset.width} × {preset.height}</span>
                 </button>
@@ -554,11 +582,11 @@ export function MapStudio() {
             </div>
           </div>
 
-          <button className="generate-button" type="button" onClick={() => requestWorld(settings)} disabled={isBusy}>
-            <span>{isBusy ? generationStage.toUpperCase() : hasPendingChanges ? "APPLY SETTINGS & GENERATE" : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
+          <button className="generate-button" type="button" onClick={applyStagedChanges} disabled={isBusy}>
+            <span>{isBusy ? generationStage.toUpperCase() : hasPendingWorldChanges && pendingAtlasTarget ? "APPLY, GENERATE & RENDER" : hasPendingWorldChanges ? "APPLY SETTINGS & GENERATE" : pendingAtlasTarget ? `RENDER ${pendingAtlasTarget.label} ATLAS` : "GENERATE THIS WORLD"}</span><span aria-hidden="true">{isBusy ? `${progress}%` : "↗"}</span>
           </button>
           <p className={`generation-note ${hasPendingChanges ? "has-pending" : ""}`}>
-            {hasPendingChanges ? "SETTINGS STAGED · SUBMIT ONCE TO UPDATE THE WORLD" : "4K/8K/10K render the current world directly in the atlas"}
+            {hasPendingChanges ? "CHANGES STAGED · SUBMIT ONCE TO APPLY EVERYTHING" : "WORLD AND OUTPUT SETTINGS ARE CURRENT"}
           </p>
         </aside>
 

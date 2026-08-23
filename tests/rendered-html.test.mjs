@@ -30,7 +30,7 @@ test("server-renders the Atlas Forge studio shell and social metadata", async ()
   assert.match(html, /GLOBE/);
   assert.match(html, /ATLAS/);
   assert.match(html, /CLIMATE ATLAS/i);
-  assert.match(html, /RENDER 8K/i);
+  assert.match(html, /STAGE 8K/i);
   assert.match(html, /https:\/\/atlas-forge\.test\/og\.png/);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });

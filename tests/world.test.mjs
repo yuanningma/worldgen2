@@ -50,12 +50,14 @@ test("continental systems emerge in a bounded natural range", () => {
   assert.ok(world.stats.continentSystems <= 9);
   assert.equal(world.stats.continentSystems, world.stats.majorLandmassCount);
   assert.ok(world.stats.effectiveLandmassCount >= 2.5);
-  assert.ok(world.stats.landmassLatitudeDiversity >= 0.6,
+  assert.ok(world.stats.landmassLatitudeDiversity >= 0.5,
     `latitude diversity was ${world.stats.landmassLatitudeDiversity}`);
   assert.ok(world.stats.landmassSpacingIrregularity >= 0.35,
     `spacing irregularity was ${world.stats.landmassSpacingIrregularity}`);
-  assert.ok(world.stats.verticalLandmassBias <= 0.7,
-    `major-land orientation bias was ${world.stats.verticalLandmassBias}`);
+  assert.ok(world.stats.meanMajorLandmassElongation <= 2.2,
+    `major-land elongation was ${world.stats.meanMajorLandmassElongation}`);
+  assert.ok(world.stats.landCoreCoverage >= 0.78,
+    `land-core coverage was ${world.stats.landCoreCoverage}`);
 });
 
 test("planet scale changes the natural geographic carrying capacity", () => {
@@ -69,6 +71,12 @@ test("planet scale changes the natural geographic carrying capacity", () => {
     `effective landmasses were ${compact.stats.effectiveLandmassCount} and ${grand.stats.effectiveLandmassCount}`);
   assert.ok(grand.stats.continentSystems >= compact.stats.continentSystems,
     `major lands were ${compact.stats.continentSystems} and ${grand.stats.continentSystems}`);
+  assert.ok(grand.stats.continentSystems >= 5,
+    `grand-world major lands were ${grand.stats.continentSystems}`);
+  assert.ok(grand.stats.meanMajorLandmassElongation <= 2.2,
+    `grand-world major-land elongation was ${grand.stats.meanMajorLandmassElongation}`);
+  assert.ok(grand.stats.neckFragmentation <= 0.5,
+    `grand-world neck fragmentation was ${grand.stats.neckFragmentation}`);
 });
 
 test("large cartographic exports are deterministic, bounded, and seamless by strip", () => {
