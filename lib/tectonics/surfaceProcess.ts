@@ -12,6 +12,10 @@ export interface SurfaceProcessOptions {
   readonly reliefAmplitudeKm?: number;
   /** Minimum contributing drainage area used to classify a river. */
   readonly minimumRiverAreaKm2?: number;
+  /** Maximum characteristic incision applied by the reduced geomorphic pass. */
+  readonly erosionStrengthKm?: number;
+  /** Drainage area below which channels do not resolve at this surface tier. */
+  readonly minimumErosionAreaKm2?: number;
 }
 
 export interface SurfaceProcessCell {
@@ -25,6 +29,8 @@ export interface SurfaceProcessCell {
   readonly temperatureC: number;
   readonly precipitationMPerYear: number;
   readonly localRunoffKm3PerYear: number;
+  readonly erodedThicknessKm: number;
+  readonly depositedThicknessKm: number;
   readonly receiverFaceId: number | null;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
@@ -49,6 +55,12 @@ export interface SurfaceProcessStats {
   readonly runoffResidualKm3PerYear: number;
   readonly maximumFillDepthKm: number;
   readonly canonicalAnchorMismatches: number;
+  readonly erodedVolumeKm3: number;
+  readonly depositedVolumeKm3: number;
+  readonly exportedSedimentVolumeKm3: number;
+  readonly sedimentResidualKm3: number;
+  readonly incisedCellCount: number;
+  readonly depositionalCellCount: number;
 }
 
 export interface SurfaceProcessWorld {
@@ -62,13 +74,30 @@ export interface SurfaceProcessWorld {
 }
 
 interface MutableSurfaceCell extends SurfaceProcessCell {
+  elevationKm: number;
   coastDistanceKm: number;
   filledElevationKm: number;
   fillDepthKm: number;
   receiverFaceId: number | null;
   drainageAreaKm2: number;
   dischargeKm3PerYear: number;
+  erodedThicknessKm: number;
+  depositedThicknessKm: number;
   floodOrder: number;
+}
+
+interface DrainageResult {
+  readonly downstreamOrder: readonly MutableSurfaceCell[];
+  readonly outletRunoffKm3PerYear: number;
+}
+
+interface SedimentBudget {
+  readonly erodedVolumeKm3: number;
+  readonly depositedVolumeKm3: number;
+  readonly exportedSedimentVolumeKm3: number;
+  readonly sedimentResidualKm3: number;
+  readonly incisedCellCount: number;
+  readonly depositionalCellCount: number;
 }
 
 interface HeapEntry {
@@ -240,6 +269,145 @@ function climateAt(point: Vec3, elevationAboveSeaKm: number, seed: number): {
   };
 }
 
+function routeSurfaceHydrology(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  radiusKm: number,
+): DrainageResult {
+  const radiusSquared = radiusKm ** 2;
+  const heap = new ElevationHeap();
+  const visited = new Uint8Array(cells.length);
+  let floodOrder = 0;
+  for (const cell of cells) {
+    cell.filledElevationKm = cell.elevationKm;
+    cell.fillDepthKm = 0;
+    cell.receiverFaceId = null;
+    cell.drainageAreaKm2 = cell.isLand ? sphere.faces[cell.faceId].areaSteradians * radiusSquared : 0;
+    cell.dischargeKm3PerYear = cell.localRunoffKm3PerYear;
+    cell.floodOrder = -1;
+    if (cell.isLand) continue;
+    visited[cell.faceId] = 1;
+    cell.floodOrder = floodOrder;
+    floodOrder += 1;
+    heap.push({ faceId: cell.faceId, priority: cell.elevationKm });
+  }
+  if (floodOrder === 0) throw new Error("surface hydrology requires at least one ocean outlet");
+  const epsilonKm = 1e-7;
+  for (let entry = heap.pop(); entry; entry = heap.pop()) {
+    for (const neighborId of adjacency[entry.faceId]) {
+      if (visited[neighborId] !== 0) continue;
+      const neighbor = cells[neighborId];
+      visited[neighborId] = 1;
+      neighbor.floodOrder = floodOrder;
+      floodOrder += 1;
+      neighbor.receiverFaceId = entry.faceId;
+      neighbor.filledElevationKm = Math.max(neighbor.elevationKm, entry.priority + epsilonKm);
+      neighbor.fillDepthKm = Math.max(0, neighbor.filledElevationKm - neighbor.elevationKm);
+      heap.push({ faceId: neighborId, priority: neighbor.filledElevationKm });
+    }
+  }
+  if (floodOrder !== cells.length) throw new Error("surface hydrology did not cover the closed sphere");
+
+  const downstreamOrder = cells
+    .filter((cell) => cell.isLand)
+    .sort((a, b) => b.floodOrder - a.floodOrder || b.faceId - a.faceId);
+  let outletRunoffKm3PerYear = 0;
+  for (const cell of downstreamOrder) {
+    if (cell.receiverFaceId === null) throw new Error(`land face ${cell.faceId} has no hydrologic receiver`);
+    const receiver = cells[cell.receiverFaceId];
+    if (receiver.isLand) {
+      receiver.drainageAreaKm2 += cell.drainageAreaKm2;
+      receiver.dischargeKm3PerYear += cell.dischargeKm3PerYear;
+    } else {
+      outletRunoffKm3PerYear += cell.dischargeKm3PerYear;
+    }
+  }
+  return { downstreamOrder, outletRunoffKm3PerYear };
+}
+
+function erodeAndRouteSediment(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  drainage: DrainageResult,
+  seaLevelKm: number,
+  radiusKm: number,
+  erosionStrengthKm: number,
+  minimumErosionAreaKm2: number,
+): SedimentBudget {
+  const sedimentFluxKm3 = new Float64Array(cells.length);
+  const erodedThicknessKm = new Float64Array(cells.length);
+  const depositedThicknessKm = new Float64Array(cells.length);
+  const maximumDischarge = cells.reduce((maximum, cell) => Math.max(maximum, cell.dischargeKm3PerYear), 0);
+  let erodedVolumeKm3 = 0;
+  let depositedVolumeKm3 = 0;
+  let exportedSedimentVolumeKm3 = 0;
+
+  for (const cell of drainage.downstreamOrder) {
+    if (cell.receiverFaceId === null) continue;
+    const receiver = cells[cell.receiverFaceId];
+    const center = sphere.faces[cell.faceId].center;
+    const receiverCenter = sphere.faces[receiver.faceId].center;
+    const distanceKm = Math.max(1, Math.acos(clamp(dot3(center, receiverCenter), -1, 1)) * radiusKm);
+    const dropKm = Math.max(0, cell.filledElevationKm - receiver.filledElevationKm);
+    const slope = dropKm / distanceKm;
+    const areaKm2 = sphere.faces[cell.faceId].areaSteradians * radiusKm ** 2;
+    const resolvedChannel = cell.drainageAreaKm2 >= minimumErosionAreaKm2;
+    const flowFactor = clamp(
+      Math.log1p(cell.drainageAreaKm2 / minimumErosionAreaKm2) / Math.log(48),
+      0,
+      1,
+    );
+    const dischargeFactor = maximumDischarge > 0
+      ? clamp((cell.dischargeKm3PerYear / maximumDischarge) ** 0.32, 0, 1)
+      : 0;
+    const slopeFactor = Math.sqrt(clamp(slope / 0.0075, 0, 1));
+    const availableRelief = Math.max(0, cell.elevationKm - seaLevelKm - 0.004);
+    const incisionKm = resolvedChannel
+      ? Math.min(
+        availableRelief,
+        erosionStrengthKm * (0.22 + flowFactor * 0.5 + dischargeFactor * 0.28) * slopeFactor,
+      )
+      : 0;
+    const erodedKm3 = incisionKm * areaKm2;
+    erodedThicknessKm[cell.faceId] = incisionKm;
+    erodedVolumeKm3 += erodedKm3;
+    let availableSedimentKm3 = sedimentFluxKm3[cell.faceId] + erodedKm3;
+
+    const lowGradient = 1 - clamp(slope / 0.0022, 0, 1);
+    const terminalFraction = receiver.isLand ? 0 : 0.24;
+    const depositionFraction = clamp(0.018 + lowGradient * 0.11 + terminalFraction, 0, 0.36);
+    const maximumDepositKm3 = areaKm2 * 0.055;
+    const depositedKm3 = Math.min(availableSedimentKm3 * depositionFraction, maximumDepositKm3);
+    availableSedimentKm3 -= depositedKm3;
+    depositedThicknessKm[cell.faceId] = depositedKm3 / areaKm2;
+    depositedVolumeKm3 += depositedKm3;
+    if (receiver.isLand) sedimentFluxKm3[receiver.faceId] += availableSedimentKm3;
+    else exportedSedimentVolumeKm3 += availableSedimentKm3;
+  }
+
+  let incisedCellCount = 0;
+  let depositionalCellCount = 0;
+  for (const cell of cells) {
+    const erosion = erodedThicknessKm[cell.faceId];
+    const deposition = depositedThicknessKm[cell.faceId];
+    if (erosion > 0) incisedCellCount += 1;
+    if (deposition > 0) depositionalCellCount += 1;
+    cell.erodedThicknessKm += erosion;
+    cell.depositedThicknessKm += deposition;
+    if (!cell.isLand) continue;
+    cell.elevationKm = Math.max(seaLevelKm + 0.002, cell.elevationKm - erosion + deposition);
+  }
+  return {
+    erodedVolumeKm3,
+    depositedVolumeKm3,
+    exportedSedimentVolumeKm3,
+    sedimentResidualKm3: erodedVolumeKm3 - depositedVolumeKm3 - exportedSedimentVolumeKm3,
+    incisedCellCount,
+    depositionalCellCount,
+  };
+}
+
 /**
  * Creates a persistent high-resolution surface-process model.
  *
@@ -307,6 +475,8 @@ export function createSurfaceProcessWorld(
       temperatureC: climate.temperatureC,
       precipitationMPerYear: climate.precipitationMPerYear,
       localRunoffKm3PerYear,
+      erodedThicknessKm: 0,
+      depositedThicknessKm: 0,
       receiverFaceId: null,
       drainageAreaKm2: refined.isLand ? areaKm2 : 0,
       dischargeKm3PerYear: localRunoffKm3PerYear,
@@ -314,32 +484,31 @@ export function createSurfaceProcessWorld(
     };
   });
 
-  const heap = new ElevationHeap();
-  const visited = new Uint8Array(cells.length);
-  let floodOrder = 0;
-  for (const cell of cells) {
-    if (cell.isLand) continue;
-    visited[cell.faceId] = 1;
-    cell.floodOrder = floodOrder;
-    floodOrder += 1;
-    heap.push({ faceId: cell.faceId, priority: cell.elevationKm });
-  }
-  if (floodOrder === 0) throw new Error("surface hydrology requires at least one ocean outlet");
-  const epsilonKm = 1e-7;
-  for (let entry = heap.pop(); entry; entry = heap.pop()) {
-    for (const neighborId of adjacency[entry.faceId]) {
-      if (visited[neighborId] !== 0) continue;
-      const neighbor = cells[neighborId];
-      visited[neighborId] = 1;
-      neighbor.floodOrder = floodOrder;
-      floodOrder += 1;
-      neighbor.receiverFaceId = entry.faceId;
-      neighbor.filledElevationKm = Math.max(neighbor.elevationKm, entry.priority + epsilonKm);
-      neighbor.fillDepthKm = Math.max(0, neighbor.filledElevationKm - neighbor.elevationKm);
-      heap.push({ faceId: neighborId, priority: neighbor.filledElevationKm });
-    }
-  }
-  if (floodOrder !== cells.length) throw new Error("surface hydrology did not cover the closed sphere");
+  const initialDrainage = routeSurfaceHydrology(
+    cells,
+    sphere,
+    adjacency,
+    tectonicWorld.recipe.radiusKm,
+  );
+  const totalSurfaceAreaKm2 = sphere.totalAreaSteradians * radiusSquared;
+  const erosionStrengthKm = clamp(options.erosionStrengthKm ?? 0.2, 0, 0.6);
+  const minimumErosionAreaKm2 = options.minimumErosionAreaKm2
+    ?? Math.max(180_000, totalSurfaceAreaKm2 / 2_500);
+  const sedimentBudget = erodeAndRouteSediment(
+    cells,
+    sphere,
+    initialDrainage,
+    tectonicWorld.seaLevelKm,
+    tectonicWorld.recipe.radiusKm,
+    erosionStrengthKm,
+    minimumErosionAreaKm2,
+  );
+  const finalDrainage = routeSurfaceHydrology(
+    cells,
+    sphere,
+    adjacency,
+    tectonicWorld.recipe.radiusKm,
+  );
 
   const coastHeap = new ElevationHeap();
   for (const cell of cells) {
@@ -362,22 +531,6 @@ export function createSurfaceProcessWorld(
     }
   }
 
-  const downstreamOrder = cells
-    .filter((cell) => cell.isLand)
-    .sort((a, b) => b.floodOrder - a.floodOrder || b.faceId - a.faceId);
-  let outletRunoff = 0;
-  for (const cell of downstreamOrder) {
-    if (cell.receiverFaceId === null) throw new Error(`land face ${cell.faceId} has no hydrologic receiver`);
-    const receiver = cells[cell.receiverFaceId];
-    if (receiver.isLand) {
-      receiver.drainageAreaKm2 += cell.drainageAreaKm2;
-      receiver.dischargeKm3PerYear += cell.dischargeKm3PerYear;
-    } else {
-      outletRunoff += cell.dischargeKm3PerYear;
-    }
-  }
-
-  const totalSurfaceAreaKm2 = sphere.totalAreaSteradians * radiusSquared;
   const minimumRiverAreaKm2 = options.minimumRiverAreaKm2
     ?? Math.max(90_000, totalSurfaceAreaKm2 / 3_500);
   const rivers: SurfaceRiverSegment[] = [];
@@ -407,6 +560,8 @@ export function createSurfaceProcessWorld(
     temperatureC: cell.temperatureC,
     precipitationMPerYear: cell.precipitationMPerYear,
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
+    erodedThicknessKm: cell.erodedThicknessKm,
+    depositedThicknessKm: cell.depositedThicknessKm,
     receiverFaceId: cell.receiverFaceId,
     drainageAreaKm2: cell.drainageAreaKm2,
     dischargeKm3PerYear: cell.dischargeKm3PerYear,
@@ -428,10 +583,11 @@ export function createSurfaceProcessWorld(
       maximumDrainageAreaKm2: cells.reduce((maximum, cell) => Math.max(maximum, cell.drainageAreaKm2), 0),
       maximumDischargeKm3PerYear: cells.reduce((maximum, cell) => Math.max(maximum, cell.dischargeKm3PerYear), 0),
       totalLocalRunoffKm3PerYear: totalRunoff,
-      totalOutletRunoffKm3PerYear: outletRunoff,
-      runoffResidualKm3PerYear: totalRunoff - outletRunoff,
+      totalOutletRunoffKm3PerYear: finalDrainage.outletRunoffKm3PerYear,
+      runoffResidualKm3PerYear: totalRunoff - finalDrainage.outletRunoffKm3PerYear,
       maximumFillDepthKm: cells.reduce((maximum, cell) => Math.max(maximum, cell.fillDepthKm), 0),
       canonicalAnchorMismatches: refinementAudit.canonicalAnchorMismatches,
+      ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],
   };

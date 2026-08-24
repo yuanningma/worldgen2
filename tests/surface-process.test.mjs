@@ -75,3 +75,26 @@ test("surface processes are deterministic for a world recipe", () => {
   assert.deepEqual(first.rivers, second.rivers);
   assert.deepEqual(first.cells, second.cells);
 });
+
+test("fluvial incision conserves sediment and preserves the canonical coast", () => {
+  const uneroded = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    erosionStrengthKm: 0,
+  });
+  const eroded = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    erosionStrengthKm: 0.2,
+  });
+  assert.deepEqual(
+    eroded.cells.map((cell) => cell.isLand),
+    uneroded.cells.map((cell) => cell.isLand),
+  );
+  assert.ok(eroded.stats.erodedVolumeKm3 > 0);
+  assert.ok(eroded.stats.depositedVolumeKm3 > 0);
+  assert.ok(eroded.stats.exportedSedimentVolumeKm3 > 0);
+  assert.ok(eroded.stats.incisedCellCount > 0);
+  assert.ok(eroded.stats.incisedCellCount < eroded.stats.landCellCount);
+  const tolerance = Math.max(1e-7, eroded.stats.erodedVolumeKm3 * 1e-12);
+  assert.ok(Math.abs(eroded.stats.sedimentResidualKm3) <= tolerance);
+  assert.ok(eroded.cells.some((cell, index) => cell.elevationKm < uneroded.cells[index].elevationKm - 1e-5));
+});

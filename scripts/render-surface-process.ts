@@ -153,6 +153,8 @@ const surface = createSurfaceProcessWorld(world, {
   subdivisions: surfaceSubdivisions,
   reliefAmplitudeKm: numberOption("relief-amplitude-km", 0.34),
   minimumRiverAreaKm2: numberOption("minimum-river-area-km2", 650_000),
+  erosionStrengthKm: numberOption("erosion-strength-km", 0.2),
+  minimumErosionAreaKm2: numberOption("minimum-erosion-area-km2", 200_000),
 });
 
 const adjacency: number[][] = surface.sphere.faces.map(() => []);
@@ -219,7 +221,7 @@ const header = Buffer.from([
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">SPHERICAL SURFACE PROCESSES · ${escapeXml(seed)}</text>`,
   `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${surface.cells.length.toLocaleString("en-US")} CELLS · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
-  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">PRIORITY-FLOOD DRAINAGE · RUNOFF RESIDUAL ${surface.stats.runoffResidualKm3PerYear.toExponential(2)} KM³/YR · CANONICAL ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
+  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">PRIORITY-FLOOD + FLUVIAL INCISION · ${surface.stats.incisedCellCount.toLocaleString("en-US")} INCISED CELLS · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));
 
