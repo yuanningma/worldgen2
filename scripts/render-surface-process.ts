@@ -225,7 +225,7 @@ const header = Buffer.from([
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${headerHeight}">`,
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">SPHERICAL SURFACE PROCESSES · ${escapeXml(seed)}</text>`,
-  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${surface.cells.length.toLocaleString("en-US")} CELLS · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
+  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
   `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">PRIORITY-FLOOD + FLUVIAL INCISION · ${surface.stats.incisedCellCount.toLocaleString("en-US")} INCISED CELLS · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));

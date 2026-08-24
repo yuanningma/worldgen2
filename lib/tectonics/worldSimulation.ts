@@ -83,6 +83,8 @@ export interface TectonicAreaBudget {
 export interface TectonicWorldStats {
   readonly landFraction: number;
   readonly continentalCrustFraction: number;
+  /** Materially resolved continental provenance provinces. */
+  readonly continentalTerraneCount: number;
   readonly minElevationKm: number;
   readonly maxElevationKm: number;
   readonly meanElevationKm: number;
@@ -293,6 +295,12 @@ class GrowthHeap {
   }
 }
 
+interface ContinentalGrowthResult {
+  readonly regions: Int32Array;
+  /** Subordinate accretion fronts retained as persistent crust provenance. */
+  readonly terranes: Int32Array;
+}
+
 function continentalGraphRegions(
   sphere: GeodesicSphere,
   plates: readonly TectonicPlateState[],
@@ -301,7 +309,7 @@ function continentalGraphRegions(
   random: RandomSource,
   seedHash: number,
   radiusKm: number,
-): Int32Array {
+): ContinentalGrowthResult {
   const plateNeighbors = plates.map(() => new Set<number>());
   const boundaryRegimes = new Map<number, BoundaryKind>();
   for (const edge of sphere.edges) {
@@ -414,6 +422,7 @@ function continentalGraphRegions(
   const budgets = frontRawWeights.map((weight) => targetArea * weight);
   const frontAreas = new Float64Array(frontFaces.length);
   const regions = new Int32Array(sphere.faces.length).fill(-1);
+  const terranes = new Int32Array(sphere.faces.length).fill(-1);
   const costs = frontFaces.map(() => new Float64Array(sphere.faces.length).fill(Infinity));
   const heap = new GrowthHeap();
   for (let frontId = 0; frontId < frontFaces.length; frontId += 1) {
@@ -427,6 +436,7 @@ function continentalGraphRegions(
     if (entry.cost !== costs[entry.regionId][entry.faceId] || regions[entry.faceId] !== -1) continue;
     if (frontAreas[entry.regionId] >= budgets[entry.regionId]) continue;
     regions[entry.faceId] = frontRegions[entry.regionId];
+    terranes[entry.faceId] = entry.regionId;
     const faceArea = sphere.faces[entry.faceId].areaSteradians;
     frontAreas[entry.regionId] += faceArea;
     claimedArea += faceArea;
@@ -470,6 +480,7 @@ function continentalGraphRegions(
     const fallback = new GrowthHeap();
     const fallbackCosts = new Float64Array(sphere.faces.length).fill(Infinity);
     const fallbackRegions = new Int32Array(sphere.faces.length).fill(-1);
+    const fallbackTerranes = new Int32Array(sphere.faces.length).fill(-1);
     const enqueue = (fromId: number, neighborId: number, baseCost: number): void => {
       if (regions[neighborId] !== -1) return;
       const regionId = regions[fromId];
@@ -482,6 +493,7 @@ function continentalGraphRegions(
       if (cost < fallbackCosts[neighborId]) {
         fallbackCosts[neighborId] = cost;
         fallbackRegions[neighborId] = regionId;
+        fallbackTerranes[neighborId] = terranes[fromId];
         fallback.push({ faceId: neighborId, regionId, cost });
       }
     };
@@ -493,11 +505,81 @@ function continentalGraphRegions(
       const entry = fallback.pop() as GrowthEntry;
       if (regions[entry.faceId] !== -1 || entry.cost !== fallbackCosts[entry.faceId]) continue;
       regions[entry.faceId] = fallbackRegions[entry.faceId];
+      terranes[entry.faceId] = fallbackTerranes[entry.faceId];
       claimedArea += sphere.faces[entry.faceId].areaSteradians;
       for (const neighborId of adjacency[entry.faceId]) enqueue(entry.faceId, neighborId, entry.cost);
     }
   }
-  return regions;
+  return { regions, terranes };
+}
+
+function continentalProvinceFields(
+  sphere: GeodesicSphere,
+  growth: ContinentalGrowthResult,
+  adjacency: readonly number[][],
+): {
+  readonly coastDistanceRings: Int16Array;
+  readonly sutureStrength: Float64Array;
+  readonly primaryTerranes: ReadonlySet<number>;
+} {
+  const coastDistanceRings = new Int16Array(sphere.faces.length).fill(-1);
+  const queue: number[] = [];
+  for (const face of sphere.faces) {
+    if (growth.regions[face.id] < 0) continue;
+    if (adjacency[face.id].some((neighbor) => growth.regions[neighbor] < 0)) {
+      coastDistanceRings[face.id] = 0;
+      queue.push(face.id);
+    }
+  }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const faceId = queue[cursor];
+    const nextDistance = coastDistanceRings[faceId] + 1;
+    for (const neighbor of adjacency[faceId]) {
+      if (growth.regions[neighbor] < 0 || coastDistanceRings[neighbor] >= 0) continue;
+      coastDistanceRings[neighbor] = nextDistance;
+      queue.push(neighbor);
+    }
+  }
+
+  let sutureStrength = Float64Array.from(sphere.faces.map((face) => {
+    const terrane = growth.terranes[face.id];
+    if (terrane < 0) return 0;
+    return adjacency[face.id].some((neighbor) => (
+      growth.regions[neighbor] === growth.regions[face.id]
+      && growth.terranes[neighbor] >= 0
+      && growth.terranes[neighbor] !== terrane
+    )) ? 1 : 0;
+  }));
+  for (let pass = 0; pass < 3; pass += 1) {
+    const next = new Float64Array(sutureStrength);
+    for (const face of sphere.faces) {
+      if (growth.regions[face.id] < 0) continue;
+      for (const neighbor of adjacency[face.id]) {
+        if (growth.regions[neighbor] !== growth.regions[face.id]) continue;
+        next[face.id] = Math.max(next[face.id], sutureStrength[neighbor] * 0.54);
+      }
+    }
+    sutureStrength = next;
+  }
+
+  const terraneAreas = new Map<number, number>();
+  const regionTerranes = new Map<number, Set<number>>();
+  for (const face of sphere.faces) {
+    const terrane = growth.terranes[face.id];
+    const region = growth.regions[face.id];
+    if (terrane < 0 || region < 0) continue;
+    terraneAreas.set(terrane, (terraneAreas.get(terrane) ?? 0) + face.areaSteradians);
+    if (!regionTerranes.has(region)) regionTerranes.set(region, new Set());
+    regionTerranes.get(region)?.add(terrane);
+  }
+  const primaryTerranes = new Set<number>();
+  for (const terraneIds of regionTerranes.values()) {
+    const primary = [...terraneIds].sort((a, b) => (
+      (terraneAreas.get(b) ?? 0) - (terraneAreas.get(a) ?? 0) || a - b
+    ))[0];
+    if (primary !== undefined) primaryTerranes.add(primary);
+  }
+  return { coastDistanceRings, sutureStrength, primaryTerranes };
 }
 
 function createInitialCells(
@@ -510,11 +592,32 @@ function createInitialCells(
   const hash = seedHashNumber(seed);
   const adjacency = buildAdjacency(sphere);
   const plateByFace = sphere.faces.map((face) => nearestPlate(face.center, plates));
-  const continentalRegions = continentalGraphRegions(sphere, plates, plateByFace, adjacency, random, hash, radiusKm);
+  const continentalGrowth = continentalGraphRegions(sphere, plates, plateByFace, adjacency, random, hash, radiusKm);
+  const provinces = continentalProvinceFields(sphere, continentalGrowth, adjacency);
   return sphere.faces.map((face) => {
     const plateId = plateByFace[face.id];
     const texture = mixedNoise(face.center, hash);
-    const continental = continentalRegions[face.id] >= 0;
+    const regionId = continentalGrowth.regions[face.id];
+    const terraneId = continentalGrowth.terranes[face.id];
+    const continental = regionId >= 0;
+    const terraneHash = seedHashNumber(`${seed}:terrane:${terraneId}`);
+    const terraneBias = continental
+      ? (terraneHash / 0xffff_ffff - 0.5) * (provinces.primaryTerranes.has(terraneId) ? 0.2 : 0.6)
+      : 0;
+    const coastRing = provinces.coastDistanceRings[face.id];
+    const shelfTaper = !continental
+      ? 0
+      : coastRing <= 0
+        ? -0.35
+        : coastRing === 1
+          ? -0.12
+          : coastRing === 2
+            ? -0.02
+            : 0;
+    const suture = provinces.sutureStrength[face.id];
+    const provinceTexture = continental
+      ? mixedNoise(face.center, hash + terraneId * 503 + 17)
+      : 0;
     const age = continental
       ? 1_250 + texture * 620 + (face.center[2] + 1) * 170
       : 75 + texture * 55;
@@ -524,11 +627,15 @@ function createInitialCells(
       crustType: continental ? "continental" : "oceanic",
       continentalFraction: continental ? 1 : 0,
       crustAgeMyr: age,
-      crustThicknessKm: continental ? 36.5 + texture * 4.2 : 7 + texture * 0.75,
+      crustThicknessKm: continental
+        ? 36.5 + texture * 4.2 + provinceTexture * 0.3 + terraneBias + shelfTaper + suture * 0.6
+        : 7 + texture * 0.75,
       densityKgM3: continental ? 2_745 - texture * 28 : 2_985 + texture * 38,
-      provenanceId: continental ? 10_000 + continentalRegions[face.id] : plateId,
-      tectonicReliefKm: 0,
-      roughnessKm: texture * (continental ? 0.12 : 0.07),
+      provenanceId: continental ? 10_000 + terraneId : plateId,
+      tectonicReliefKm: continental ? suture * 0.04 : 0,
+      roughnessKm: continental
+        ? texture * 0.12 + provinceTexture * 0.01
+        : texture * 0.07,
       riftExposureMyr: 0,
       convergenceExposureMyr: 0,
     };
@@ -802,6 +909,25 @@ function calculateAreaBudget(
     coverageResidualSteradians: sphere.totalAreaSteradians - covered,
     crustResidualSteradians: covered - continental - oceanic,
   };
+}
+
+function countContinentalTerranes(
+  sphere: GeodesicSphere,
+  cells: readonly WorldCellState[],
+): number {
+  const areas = new Map<number, number>();
+  for (const face of sphere.faces) {
+    const cell = cells[face.id];
+    const continentalFraction = cell.continentalFraction
+      ?? (cell.crustType === "continental" ? 1 : 0);
+    if (continentalFraction < 0.5) continue;
+    areas.set(
+      cell.provenanceId,
+      (areas.get(cell.provenanceId) ?? 0) + face.areaSteradians * continentalFraction,
+    );
+  }
+  const minimumArea = sphere.totalAreaSteradians * 0.0005;
+  return [...areas.values()].filter((area) => area >= minimumArea).length;
 }
 
 function applyTectonicStep(
@@ -1325,6 +1451,7 @@ export function simulateTectonicWorld(
     stats: {
       landFraction: areaBudget.landSteradians / sphere.totalAreaSteradians,
       continentalCrustFraction: areaBudget.continentalSteradians / sphere.totalAreaSteradians,
+      continentalTerraneCount: countContinentalTerranes(sphere, finalCells),
       minElevationKm: Math.min(...elevations),
       maxElevationKm: Math.max(...elevations),
       meanElevationKm: weightedElevation,
@@ -1420,6 +1547,7 @@ export function simulateMovingCrustSnapshot(
     stats: {
       landFraction: areaBudget.landSteradians / reference.sphere.totalAreaSteradians,
       continentalCrustFraction: areaBudget.continentalSteradians / reference.sphere.totalAreaSteradians,
+      continentalTerraneCount: countContinentalTerranes(reference.sphere, cells),
       minElevationKm: Math.min(...elevations),
       maxElevationKm: Math.max(...elevations),
       meanElevationKm: weightedElevation,
@@ -1597,6 +1725,7 @@ export function simulateCoupledTectonicWorld(
     stats: {
       landFraction: areaBudget.landSteradians / sphere.totalAreaSteradians,
       continentalCrustFraction: areaBudget.continentalSteradians / sphere.totalAreaSteradians,
+      continentalTerraneCount: countContinentalTerranes(sphere, finalCells),
       minElevationKm: Math.min(...elevations),
       maxElevationKm: Math.max(...elevations),
       meanElevationKm: weightedElevation,

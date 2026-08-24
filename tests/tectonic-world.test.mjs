@@ -81,6 +81,33 @@ test("crust state remains finite, positive, and carries provenance", () => {
   }
 });
 
+test("continental growth preserves a hierarchy of adjacent accreted terranes", () => {
+  const world = simulateTectonicWorld({ ...RECIPE, subdivisions: 3, historyMyr: 3 });
+  const terraneAreas = new Map();
+  for (const cell of world.cells) {
+    if (cell.crustType !== "continental") continue;
+    terraneAreas.set(
+      cell.provenanceId,
+      (terraneAreas.get(cell.provenanceId) ?? 0) + world.sphere.faces[cell.faceId].areaSteradians,
+    );
+  }
+  assert.ok(terraneAreas.size >= 8);
+  assert.ok(world.stats.continentalTerraneCount >= 8);
+  assert.ok(world.stats.continentalTerraneCount <= terraneAreas.size);
+  const sortedAreas = [...terraneAreas.values()].sort((a, b) => b - a);
+  const totalArea = sortedAreas.reduce((sum, area) => sum + area, 0);
+  assert.ok(sortedAreas.filter((area) => area >= totalArea * 0.02).length >= 4);
+  assert.ok(sortedAreas[0] > sortedAreas[Math.floor(sortedAreas.length / 2)] * 2);
+  const sutureEdges = world.sphere.edges.filter((edge) => {
+    const first = world.cells[edge.faces[0]];
+    const second = world.cells[edge.faces[1]];
+    return first.crustType === "continental"
+      && second.crustType === "continental"
+      && first.provenanceId !== second.provenanceId;
+  });
+  assert.ok(sutureEdges.length >= 20);
+});
+
 test("moving-crust snapshot is conservative and remains the canonical land authority", () => {
   const fixed = simulateTectonicWorld(RECIPE);
   const first = simulateMovingCrustSnapshot(RECIPE, 30);
