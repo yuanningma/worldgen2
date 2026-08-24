@@ -98,3 +98,41 @@ test("fluvial incision conserves sediment and preserves the canonical coast", ()
   assert.ok(Math.abs(eroded.stats.sedimentResidualKm3) <= tolerance);
   assert.ok(eroded.cells.some((cell, index) => cell.elevationKm < uneroded.cells[index].elevationKm - 1e-5));
 });
+
+test("continuous presentation sampling preserves anchors and removes cell-edge jumps", () => {
+  const surface = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    presentationSampleCount: 10,
+  });
+  for (const face of surface.sphere.faces.filter((_, index) => index % 71 === 0)) {
+    assert.equal(surface.sampleContinuous(face.center).isLand, surface.cells[face.id].isLand);
+  }
+
+  const adjacency = surface.sphere.faces.map(() => []);
+  for (const edge of surface.sphere.edges) {
+    adjacency[edge.faces[0]].push(edge.faces[1]);
+    adjacency[edge.faces[1]].push(edge.faces[0]);
+  }
+  const interior = surface.cells.find((cell) => (
+    cell.isLand && adjacency[cell.faceId].every((neighbor) => surface.cells[neighbor].isLand)
+  ));
+  assert.ok(interior);
+  const neighborId = adjacency[interior.faceId][0];
+  const a = surface.sphere.faces[interior.faceId].center;
+  const b = surface.sphere.faces[neighborId].center;
+  const midpoint = [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const magnitude = Math.hypot(...midpoint);
+  const unit = midpoint.map((value) => value / magnitude);
+  const towardA = unit.map((value, index) => value + a[index] * 1e-7);
+  const towardB = unit.map((value, index) => value + b[index] * 1e-7);
+  const first = surface.sampleContinuous(towardA);
+  const second = surface.sampleContinuous(towardB);
+  assert.equal(first.isLand, true);
+  assert.equal(second.isLand, true);
+  assert.ok(Math.abs(first.elevationKm - second.elevationKm) < 1e-4);
+  assert.ok(first.terrainGradient.every(Number.isFinite));
+  assert.ok(second.terrainGradient.every(Number.isFinite));
+
+  const repeat = surface.sampleContinuous(towardA);
+  assert.deepEqual(repeat, first);
+});

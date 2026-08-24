@@ -16,6 +16,8 @@ export interface SurfaceProcessOptions {
   readonly erosionStrengthKm?: number;
   /** Drainage area below which channels do not resolve at this surface tier. */
   readonly minimumErosionAreaKm2?: number;
+  /** Nearby same-class cells blended by the resolution-independent sampler. */
+  readonly presentationSampleCount?: number;
 }
 
 export interface SurfaceProcessCell {
@@ -41,6 +43,20 @@ export interface SurfaceRiverSegment {
   readonly toFaceId: number;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
+}
+
+export interface SurfacePresentationSample {
+  /** Nearest process cell; retained for diagnostics and river lookup only. */
+  readonly faceId: number;
+  readonly canonicalFaceId: number;
+  readonly isLand: boolean;
+  readonly elevationKm: number;
+  readonly coastDistanceKm: number;
+  readonly temperatureC: number;
+  readonly precipitationMPerYear: number;
+  /** Tangential rise/run vector used for continuous hill shading. */
+  readonly terrainGradient: Vec3;
+  readonly presentationOnly: true;
 }
 
 export interface SurfaceProcessStats {
@@ -71,6 +87,8 @@ export interface SurfaceProcessWorld {
   readonly rivers: readonly SurfaceRiverSegment[];
   readonly stats: SurfaceProcessStats;
   readonly sample: (direction: Vec3) => SurfaceProcessCell;
+  /** Continuous render sample whose output does not depend on raster size. */
+  readonly sampleContinuous: (direction: Vec3) => SurfacePresentationSample;
 }
 
 interface MutableSurfaceCell extends SurfaceProcessCell {
@@ -214,6 +232,47 @@ function nearestFace(root: KdNode, centers: readonly Vec3[], point: Vec3): numbe
   };
   visit(root);
   return bestFace;
+}
+
+function nearestFaces(
+  root: KdNode,
+  centers: readonly Vec3[],
+  point: Vec3,
+  count: number,
+): readonly number[] {
+  const best: { faceId: number; distance: number }[] = [];
+  let worstDistance = Infinity;
+  const updateWorst = (): void => {
+    worstDistance = best.length < count
+      ? Infinity
+      : best.reduce((worst, candidate) => Math.max(worst, candidate.distance), 0);
+  };
+  const visit = (node: KdNode | null): void => {
+    if (!node) return;
+    const center = centers[node.faceId];
+    const dx = point[0] - center[0];
+    const dy = point[1] - center[1];
+    const dz = point[2] - center[2];
+    const distance = dx * dx + dy * dy + dz * dz;
+    if (best.length < count) {
+      best.push({ faceId: node.faceId, distance });
+      updateWorst();
+    } else if (distance < worstDistance) {
+      let worstIndex = 0;
+      for (let index = 1; index < best.length; index += 1) {
+        if (best[index].distance > best[worstIndex].distance) worstIndex = index;
+      }
+      best[worstIndex] = { faceId: node.faceId, distance };
+      updateWorst();
+    }
+    const delta = point[node.axis] - center[node.axis];
+    visit(delta < 0 ? node.left : node.right);
+    if (delta * delta <= worstDistance) visit(delta < 0 ? node.right : node.left);
+  };
+  visit(root);
+  return best
+    .sort((a, b) => a.distance - b.distance || a.faceId - b.faceId)
+    .map((candidate) => candidate.faceId);
 }
 
 function containsPoint(sphere: GeodesicSphere, faceId: number, point: Vec3): boolean {
@@ -569,6 +628,78 @@ export function createSurfaceProcessWorld(
   const centers = sphere.faces.map((face) => face.center);
   const root = buildKdTree(sphere.faces.map((face) => face.id), centers);
   if (!root) throw new Error("surface process grid must contain faces");
+  const presentationSampleCount = Math.round(clamp(options.presentationSampleCount ?? 12, 6, 24));
+  const presentationCandidateCount = presentationSampleCount * 4;
+  const characteristicRadians = Math.sqrt(sphere.totalAreaSteradians / sphere.faces.length);
+  const kernelSharpness = 1.7 / characteristicRadians ** 2;
+  const sampleContinuous = (direction: Vec3): SurfacePresentationSample => {
+    const point = normalize3(direction);
+    const refined = refinement.sample(point);
+    const candidateIds = nearestFaces(root, centers, point, presentationCandidateCount);
+    const candidates = candidateIds
+      .filter((faceId) => immutableCells[faceId].isLand === refined.isLand)
+      .slice(0, presentationSampleCount);
+    const fallbackId = exactFaceAtPoint(sphere, root, centers, adjacency, point);
+    if (candidates.length === 0) candidates.push(fallbackId);
+    let totalWeight = 0;
+    let elevationKm = 0;
+    let coastDistanceKm = 0;
+    let temperatureC = 0;
+    let precipitationMPerYear = 0;
+    for (const faceId of candidates) {
+      const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
+      const cell = immutableCells[faceId];
+      totalWeight += weight;
+      elevationKm += cell.elevationKm * weight;
+      coastDistanceKm += (Number.isFinite(cell.coastDistanceKm) ? cell.coastDistanceKm : 0) * weight;
+      temperatureC += cell.temperatureC * weight;
+      precipitationMPerYear += cell.precipitationMPerYear * weight;
+    }
+    elevationKm /= totalWeight;
+    coastDistanceKm /= totalWeight;
+    temperatureC /= totalWeight;
+    precipitationMPerYear /= totalWeight;
+    const gradient: [number, number, number] = [0, 0, 0];
+    for (const faceId of candidates) {
+      const center = centers[faceId];
+      const cosine = clamp(dot3(center, point), -1, 1);
+      const distanceRadians = Math.acos(cosine);
+      if (distanceRadians < 1e-8) continue;
+      const tangentVector: Vec3 = [
+        center[0] - point[0] * cosine,
+        center[1] - point[1] * cosine,
+        center[2] - point[2] * cosine,
+      ];
+      if (dot3(tangentVector, tangentVector) < 1e-18) continue;
+      const tangent = normalize3(tangentVector);
+      const weight = Math.exp((cosine - 1) * kernelSharpness);
+      const riseOverRun = (immutableCells[faceId].elevationKm - elevationKm)
+        / (distanceRadians * tectonicWorld.recipe.radiusKm);
+      gradient[0] += tangent[0] * riseOverRun * weight;
+      gradient[1] += tangent[1] * riseOverRun * weight;
+      gradient[2] += tangent[2] * riseOverRun * weight;
+    }
+    gradient[0] /= totalWeight;
+    gradient[1] /= totalWeight;
+    gradient[2] /= totalWeight;
+    const fineRelief = sphericalNoise(point, hashedSeed + 2_119)
+      * reliefAmplitudeKm * (refined.isLand ? 0.055 : 0.018);
+    elevationKm = refined.isLand
+      ? Math.max(tectonicWorld.seaLevelKm + 0.001, elevationKm + fineRelief)
+      : Math.min(tectonicWorld.seaLevelKm - 0.001, elevationKm + fineRelief);
+    const nearestMatchingId = candidates[0];
+    return {
+      faceId: nearestMatchingId,
+      canonicalFaceId: immutableCells[nearestMatchingId].canonicalFaceId,
+      isLand: refined.isLand,
+      elevationKm,
+      coastDistanceKm: refined.isLand ? 0 : coastDistanceKm,
+      temperatureC,
+      precipitationMPerYear,
+      terrainGradient: gradient,
+      presentationOnly: true,
+    };
+  };
   return {
     version: 1,
     tectonicWorld,
@@ -590,5 +721,6 @@ export function createSurfaceProcessWorld(
       ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],
+    sampleContinuous,
   };
 }

@@ -22,6 +22,12 @@ type SharpFactory = {
 
 const image = sharp as unknown as SharpFactory;
 
+const QUALITY_WIDTHS = {
+  preview: 2048,
+  high: 4096,
+  ultra: 8192,
+} as const;
+
 function option(name: string): string | undefined {
   const prefix = `--${name}=`;
   return process.argv.slice(2).find((argument) => argument.startsWith(prefix))?.slice(prefix.length);
@@ -133,7 +139,10 @@ function drawRiver(
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(projectRoot, option("output") ?? "outputs/tectonics/surface-process-world.png");
-const width = Math.max(512, Math.round(numberOption("width", 2048)));
+const quality = option("quality") ?? "high";
+if (!(quality in QUALITY_WIDTHS)) throw new RangeError("--quality must be preview, high, or ultra");
+const qualityWidth = QUALITY_WIDTHS[quality as keyof typeof QUALITY_WIDTHS];
+const width = Math.max(512, Math.round(numberOption("width", qualityWidth)));
 const height = Math.max(256, Math.round(numberOption("height", width / 2)));
 const seed = option("seed") ?? "ATLAS-TECTONIC-35";
 const subdivisions = Math.round(numberOption("subdivisions", 5));
@@ -155,29 +164,8 @@ const surface = createSurfaceProcessWorld(world, {
   minimumRiverAreaKm2: numberOption("minimum-river-area-km2", 650_000),
   erosionStrengthKm: numberOption("erosion-strength-km", 0.2),
   minimumErosionAreaKm2: numberOption("minimum-erosion-area-km2", 200_000),
+  presentationSampleCount: numberOption("presentation-samples", 12),
 });
-
-const adjacency: number[][] = surface.sphere.faces.map(() => []);
-for (const edge of surface.sphere.edges) {
-  adjacency[edge.faces[0]].push(edge.faces[1]);
-  adjacency[edge.faces[1]].push(edge.faces[0]);
-}
-const shade = new Float32Array(surface.cells.length);
-for (const cell of surface.cells) {
-  const center = surface.sphere.faces[cell.faceId].center;
-  let directional = 0;
-  let localMean = 0;
-  for (const neighborId of adjacency[cell.faceId]) {
-    const neighbor = surface.cells[neighborId];
-    const neighborCenter = surface.sphere.faces[neighborId].center;
-    const delta = neighbor.elevationKm - cell.elevationKm;
-    directional += delta * ((neighborCenter[0] - center[0]) * -0.7 + (neighborCenter[2] - center[2]) * -0.6);
-    localMean += delta;
-  }
-  shade[cell.faceId] = cell.isLand
-    ? clamp(0.96 + directional * 1.9 + localMean * 0.025, 0.68, 1.18)
-    : clamp(0.98 + directional * 0.18 + localMean * 0.004, 0.91, 1.04);
-}
 
 const pixels = Buffer.allocUnsafe(width * height * 4);
 for (let y = 0; y < height; y += 1) {
@@ -185,18 +173,31 @@ for (let y = 0; y < height; y += 1) {
   const radial = Math.cos(latitude);
   for (let x = 0; x < width; x += 1) {
     const longitude = (x + 0.5) / width * Math.PI * 2 - Math.PI;
-    const cell = surface.sample([
+    const point: readonly [number, number, number] = [
       radial * Math.cos(longitude),
       radial * Math.sin(longitude),
       Math.sin(latitude),
-    ]);
+    ];
+    const cell = surface.sampleContinuous(point);
+    const east: readonly [number, number, number] = [-Math.sin(longitude), Math.cos(longitude), 0];
+    const north: readonly [number, number, number] = [
+      -Math.sin(latitude) * Math.cos(longitude),
+      -Math.sin(latitude) * Math.sin(longitude),
+      Math.cos(latitude),
+    ];
+    const lightSlope = cell.terrainGradient[0] * (east[0] * -0.58 + north[0] * 0.82)
+      + cell.terrainGradient[1] * (east[1] * -0.58 + north[1] * 0.82)
+      + cell.terrainGradient[2] * (east[2] * -0.58 + north[2] * 0.82);
+    const terrainShade = cell.isLand
+      ? clamp(0.98 - lightSlope * 13, 0.7, 1.2)
+      : clamp(0.99 - lightSlope * 2.2, 0.92, 1.05);
     const rgb = color(
       cell.isLand,
       cell.elevationKm - world.seaLevelKm,
       cell.coastDistanceKm,
       cell.temperatureC,
       cell.precipitationMPerYear,
-      shade[cell.faceId],
+      terrainShade,
     );
     const index = (y * width + x) * 4;
     pixels[index] = rgb[0];
@@ -220,7 +221,7 @@ const header = Buffer.from([
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${headerHeight}">`,
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">SPHERICAL SURFACE PROCESSES · ${escapeXml(seed)}</text>`,
-  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${surface.cells.length.toLocaleString("en-US")} CELLS · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
+  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${surface.cells.length.toLocaleString("en-US")} CELLS · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
   `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">PRIORITY-FLOOD + FLUVIAL INCISION · ${surface.stats.incisedCellCount.toLocaleString("en-US")} INCISED CELLS · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));

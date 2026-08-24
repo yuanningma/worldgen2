@@ -97,6 +97,7 @@ export {
   createSurfaceProcessWorld,
   type SurfaceProcessCell,
   type SurfaceProcessOptions,
+  type SurfacePresentationSample,
   type SurfaceProcessStats,
   type SurfaceProcessWorld,
   type SurfaceRiverSegment,
