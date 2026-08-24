@@ -85,3 +85,19 @@ export {
   type ParcelTransportResult,
   type RemappedParcelFace,
 } from "./parcelTransport.ts";
+
+export {
+  createSurfaceRefinement,
+  type RefinedSurfaceSample,
+  type SurfaceRefinementAudit,
+  type SurfaceRefinementOptions,
+} from "./surfaceRefinement.ts";
+
+export {
+  createSurfaceProcessWorld,
+  type SurfaceProcessCell,
+  type SurfaceProcessOptions,
+  type SurfaceProcessStats,
+  type SurfaceProcessWorld,
+  type SurfaceRiverSegment,
+} from "./surfaceProcess.ts";

@@ -40,7 +40,8 @@ The replacement geology core is being developed separately from the current visu
 - plate-aware irregular continental graph growth without a user-facing continent-count control;
 - spherical hard gates for ribbons, isthmuses, gulfs, lakes, elongation, canonical border stability, and multiscale coastline richness;
 - deterministic multi-seed evaluation and accepted-only ranking;
-- exact scientific and smoothed presentation atlas renderers.
+- exact scientific and smoothed presentation atlas renderers;
+- a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, latitude-aware precipitation, conservative runoff, Priority-Flood drainage, and resolved river networks.
 
 Generate and evaluate worlds without starting or deploying the web app:
 
@@ -53,9 +54,10 @@ npm run render:tectonic-surface -- --model=coupled --history-myr=120 --seed=ATLA
 npm run render:tectonic-atlas -- --seed=ATLAS-A --subdivisions=5 --output=outputs/tectonics/world.png
 npm run render:tectonic-candidates -- --seeds=ATLAS-A,ATLAS-B,ATLAS-C,ATLAS-D
 npm run render:tectonic-surface -- --seed=ATLAS-A --subdivisions=5
+npm run render:surface-process -- --model=coupled --seed=ATLAS-A --subdivisions=5 --surface-subdivisions=6
 ```
 
-The implementation roadmap is in [the comprehensive simulator plan](./docs/COMPREHENSIVE_WORLD_SIMULATOR_PLAN.md). The fixed history remains the stable reference, and `simulateMovingCrustSnapshot` remains the exact parcel-remap conformance path. `simulateCoupledTectonicWorld` is the first feedback model: an explicit finite-volume step transports material only across adjacent spherical faces, retains fractional continental and plate mixtures, feeds moved state into later rifting/collision, reports ridge-creation and subduction budgets, and applies area-preserving VOF interface compression to limit long-horizon diffusion. The evaluator now rejects nonlocal parcel transport, fine-only coast noise, insufficient continent hierarchy, oversized dominant landmasses, polar land concentration, and near-circumpolar zonal belts. The coupled model is still a reduced prototype: it lacks persistent parcel identities through creation/destruction, overlap-area remapping, plate splits/mergers, erosion, climate, and drainage.
+The implementation roadmap is in [the comprehensive simulator plan](./docs/COMPREHENSIVE_WORLD_SIMULATOR_PLAN.md). The fixed history remains the stable reference, and `simulateMovingCrustSnapshot` remains the exact parcel-remap conformance path. `simulateCoupledTectonicWorld` is the first feedback model: an explicit finite-volume step transports material only across adjacent spherical faces, retains fractional continental and plate mixtures, feeds moved state into later rifting/collision, reports ridge-creation and subduction budgets, and applies area-preserving VOF interface compression to limit long-horizon diffusion. The evaluator rejects nonlocal parcel transport, fine-only coast noise, insufficient continent hierarchy, oversized dominant landmasses, polar land concentration, and near-circumpolar zonal belts. `createSurfaceProcessWorld` promotes an accepted tectonic state to a nested spherical process mesh and derives a closed drainage graph without changing canonical topology. Climate is currently a reduced latitude/elevation precipitation field, not atmospheric circulation; rivers route water conservatively but do not yet erode terrain or transport sediment. The coupled model also still lacks persistent parcel identities through creation/destruction, overlap-area remapping, and plate splits/mergers.
 
 ## Run locally
 

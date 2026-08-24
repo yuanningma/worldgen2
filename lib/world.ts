@@ -1771,12 +1771,15 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
   // the same scale profile used for the final map. This is resolution-stable
   // and prevents fine noise from gaming a single perimeter score.
   const finalists = candidates.sort((a, b) => b.score - a.score);
-  if (settings.width < 512 || settings.height < 256) {
-    const best = finalists[0];
-    thermalErodeGraph(mesh, best.elevation, best.landMask, 2);
-    return best;
-  }
-  const coarseSettings = { ...settings, width: 512, height: 256 };
+  // Small previews still need raster-space selection. The previous shortcut
+  // chose only graph metrics below 512 px, allowing islands that existed on the
+  // irregular mesh to disappear after rasterization. Evaluate at the actual
+  // preview size there; larger worlds retain the fixed 512 px audit grid.
+  const coarseSettings = {
+    ...settings,
+    width: Math.min(512, settings.width),
+    height: Math.min(256, settings.height),
+  };
   const planet = planetScaleMetrics(settings);
   const desiredHierarchy = mix(11.2, 15.6, settings.coastDetail / 100);
   const desiredMajorLands = mix(3.2, 7.5, planet.control);
