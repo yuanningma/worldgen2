@@ -9,6 +9,7 @@ export interface WorldSettings {
   simulationSites?: number;
   planetScale?: number;
   continentSize: number;
+  oceanCoverage?: number;
   seaLevel?: number;
   coastDetail: number;
   tectonics: number;
@@ -38,9 +39,12 @@ export interface WorldStats {
   landmassSpacingIrregularity: number;
   verticalLandmassBias: number;
   meanMajorLandmassElongation: number;
+  maxSubstantialLandmassElongation: number;
   landCoreRetention: number;
   landCoreCoverage: number;
   neckFragmentation: number;
+  inlandWaterPercent: number;
+  largestInlandWaterPercent: number;
   circumferenceKm: number;
   focusLongitude: number;
   generationMs: number;
@@ -182,9 +186,12 @@ export interface RasterTerrain {
   landmassSpacingIrregularity: number;
   verticalLandmassBias: number;
   meanMajorLandmassElongation: number;
+  maxSubstantialLandmassElongation: number;
   landCoreRetention: number;
   landCoreCoverage: number;
   neckFragmentation: number;
+  inlandWaterPercent: number;
+  largestInlandWaterPercent: number;
   rockLevel: number;
   snowLevel: number;
 }
@@ -223,6 +230,7 @@ function smoothstep(value: number) {
 }
 
 function targetLandFraction(settings: WorldSettings) {
+  if (settings.oceanCoverage !== undefined) return clamp(1 - settings.oceanCoverage / 100, 0.14, 0.5);
   if (settings.seaLevel === undefined) return mix(0.16, 0.47, settings.continentSize / 100);
   return mix(0.48, 0.19, clamp(settings.seaLevel / 100));
 }
@@ -1174,25 +1182,25 @@ function buildCrustComposition(
     }
 
     const outerNodes = [...nodes].sort((a, b) => Math.hypot(b.x - centroid.x, b.y - centroid.y) - Math.hypot(a.x - centroid.x, a.y - centroid.y));
-    const inletCount = (isRifted ? 2 : isDominant ? 2 : 1) + (random() < 0.3 ? 1 : 0);
+    const inletCount = (isRifted || isDominant ? 1 : 0) + (random() < 0.22 ? 1 : 0);
     for (let inlet = 0; inlet < inletCount; inlet += 1) {
       const anchor = outerNodes[inlet % outerNodes.length];
       let angle = Math.atan2(anchor.y - centroid.y, anchor.x - centroid.x);
       angle += (random() - 0.5) * 0.58;
       const outside = mix(0.05, 0.1, random()) * geographyScale;
       const start = { x: anchor.x + Math.cos(angle) * outside, y: constrainY(anchor.y + Math.sin(angle) * outside) };
-      const cutLength = outside + mix(0.035, isRifted ? 0.105 : 0.078, random()) * geographyScale;
-      const mouthWidth = mix(0.027, 0.052, random()) * geographyScale;
-      const headWidth = mix(0.013, 0.025, random()) * geographyScale;
+      const cutLength = outside + mix(0.03, isRifted ? 0.085 : 0.064, random()) * geographyScale;
+      const mouthWidth = mix(0.026, 0.046, random()) * geographyScale;
+      const headWidth = mix(0.016, 0.029, random()) * geographyScale;
       const cutCurl = (random() < 0.5 ? -1 : 1) * mix(0.12, 0.48, random());
       const head = addPath(cuts, start, angle + Math.PI, cutLength, 3 + Math.floor(random() * 2), mouthWidth, headWidth, mix(1.2, 1.52, random()), cutCurl);
-      if (random() < 0.5) {
+      if (random() < 0.25) {
         const branchAngle = angle + Math.PI + cutCurl + (random() < 0.5 ? -1 : 1) * mix(0.55, 0.95, random());
-        addPath(cuts, head, branchAngle, mix(0.025, 0.055, random()) * geographyScale, 2, headWidth * 1.15, headWidth * 0.6, mix(1.12, 1.4, random()), (random() - 0.5) * 0.3);
+        addPath(cuts, head, branchAngle, mix(0.018, 0.038, random()) * geographyScale, 2, headWidth * 1.08, headWidth * 0.74, mix(1.04, 1.24, random()), (random() - 0.5) * 0.3);
       }
     }
 
-    const basinCount = random() < (isRifted ? 0.68 : 0.34) ? 1 : 0;
+    const basinCount = random() < (isRifted ? 0.22 : 0.08) ? 1 : 0;
     for (let basin = 0; basin < basinCount; basin += 1) {
       const angle = random() * TAU;
       const offset = mix(0.015, 0.052, random()) * geographyScale;
@@ -1201,15 +1209,15 @@ function buildCrustComposition(
       cuts.push({
         ax: basinX,
         ay: basinY,
-        bx: basinX + Math.cos(angle + Math.PI * 0.5) * mix(0.022, 0.058, random()) * geographyScale,
-        by: constrainY(basinY + Math.sin(angle + Math.PI * 0.5) * mix(0.022, 0.058, random()) * geographyScale),
-        radiusA: mix(0.023, 0.048, random()) * geographyScale,
-        radiusB: mix(0.018, 0.04, random()) * geographyScale,
-        strength: mix(1.04, 1.38, random()),
+        bx: basinX + Math.cos(angle + Math.PI * 0.5) * mix(0.015, 0.038, random()) * geographyScale,
+        by: constrainY(basinY + Math.sin(angle + Math.PI * 0.5) * mix(0.015, 0.038, random()) * geographyScale),
+        radiusA: mix(0.016, 0.032, random()) * geographyScale,
+        radiusB: mix(0.014, 0.028, random()) * geographyScale,
+        strength: mix(0.9, 1.15, random()),
       });
     }
 
-    if (isRifted && outerNodes.length > 1 && random() < 0.62) {
+    if (isRifted && outerNodes.length > 1 && random() < 0.24) {
       const firstEdge = outerNodes[Math.floor(random() * outerNodes.length)];
       const opposite = [...outerNodes].sort((a, b) => {
         const first = (a.x - centroid.x) * (firstEdge.x - centroid.x) + (a.y - centroid.y) * (firstEdge.y - centroid.y);
@@ -1221,9 +1229,9 @@ function buildCrustComposition(
         ay: firstEdge.y,
         bx: opposite.x,
         by: opposite.y,
-        radiusA: mix(0.009, 0.018, random()) * geographyScale,
-        radiusB: mix(0.008, 0.016, random()) * geographyScale,
-        strength: mix(1.22, 1.52, random()),
+        radiusA: mix(0.006, 0.012, random()) * geographyScale,
+        radiusB: mix(0.006, 0.011, random()) * geographyScale,
+        strength: mix(1.05, 1.24, random()),
       });
     }
   }
@@ -1794,9 +1802,12 @@ function createGraphTerrain(mesh: GraphMesh, seed: number, settings: WorldSettin
       - Math.max(0, desiredLatitudeDiversity - morphology.landmassLatitudeDiversity) * 13.5
       - Math.max(0, desiredSpacingIrregularity - morphology.landmassSpacingIrregularity) * 14.5
       - Math.max(0, morphology.meanMajorLandmassElongation - 1.85) * 25
+      - Math.max(0, morphology.maxSubstantialLandmassElongation - 2.65) * 22
       - Math.max(0, morphology.neckFragmentation - 0.18) * 60
       - Math.max(0, morphology.neckFragmentation - 0.55) * 90
       - Math.max(0, 0.82 - morphology.landCoreCoverage) * 18
+      - Math.max(0, morphology.inlandWaterPercent - 0.8) * 11
+      - Math.max(0, morphology.largestInlandWaterPercent - 0.45) * 18
       - Math.max(0, desiredMajorLands + 1 - morphology.meaningfulLandmassCount) * 2.8;
     if (visualScore > bestVisualScore) {
       bestVisualScore = visualScore;
@@ -2153,11 +2164,11 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
   );
   const createSystem = (candidate: CoastCandidate, band: "regional" | "meso") => {
     const regional = band === "regional";
-    const peninsula = random() < (regional ? 0.38 : 0.44);
+    const peninsula = random() < (regional ? 0.48 : 0.5);
     const slender = !peninsula && regional && random() < 0.06;
     const sign = peninsula ? 1 : -1;
     const featureLength = (regional
-      ? peninsula ? mix(0.034, 0.074, random()) : mix(0.035, 0.078, random())
+      ? peninsula ? mix(0.034, 0.074, random()) : mix(0.034, 0.068, random())
       : peninsula ? mix(0.008, 0.029, random()) : mix(0.008, 0.028, random()))
       * mix(0.82, 1.14, coastControl) * geographyScale;
     const rootWidth = featureLength * (regional
@@ -2184,7 +2195,7 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
       points.push({ x: px, y: py, width });
     }
     selected.push(makeFeature(points, sign * (regional
-      ? peninsula ? mix(0.7, 1.02, random()) : mix(0.62, 0.88, random())
+      ? peninsula ? mix(0.7, 1.02, random()) : mix(0.55, 0.8, random())
       : mix(0.34, 0.68, random()))));
     anchors.push(candidate);
 
@@ -2192,7 +2203,7 @@ function buildCoastFeatures(mesh: GraphMesh, terrain: TerrainCandidate, settings
     // important part: a large gulf can contain coves and drowned valleys, while
     // a major cape can fork into two asymmetric headlands.
     const branchCount = regional
-      ? peninsula ? (random() < 0.26 ? 1 : 0) : (random() < 0.55 ? 1 : 0)
+      ? peninsula ? (random() < 0.26 ? 1 : 0) : (random() < 0.3 ? 1 : 0)
       : 0;
     for (let branch = 0; branch < branchCount; branch += 1) {
       const rootIndex = Math.min(points.length - 2, 1 + Math.floor(mix(0.25, 0.68, random()) * (points.length - 1)));
@@ -2489,6 +2500,10 @@ function rasterMorphologyMetrics(
   const meanMajorLandmassElongation = majorComponents.reduce((sum, component) => (
     sum + component.elongation * component.area
   ), 0) / Math.max(1, majorArea);
+  const substantialComponents = components.filter((component) => component.area >= landPixels * 0.015);
+  const maxSubstantialLandmassElongation = substantialComponents.reduce((maximum, component) => (
+    Math.max(maximum, component.elongation)
+  ), 0);
   const continentalAreas = areas.filter((area) => area >= landPixels * 0.004);
   const continentalPixels = continentalAreas.reduce((sum, area) => sum + area, 0);
   let concentration = 0;
@@ -2564,6 +2579,39 @@ function rasterMorphologyMetrics(
   const substantialCoreCount = rasterLandmassComponents(neckCoreMask, width, height)
     .filter((component) => component.area >= landPixels * 0.012).length;
   const neckFragmentation = Math.max(0, substantialCoreCount - majorLandmassCount) / Math.max(1, majorLandmassCount);
+  const openWater = new Uint8Array(landMask.length);
+  const waterQueue = new Uint32Array(landMask.length);
+  let waterHead = 0;
+  let waterTail = 0;
+  const enqueueWater = (index: number) => {
+    if (landMask[index] || openWater[index]) return;
+    openWater[index] = 1;
+    waterQueue[waterTail++] = index;
+  };
+  for (let x = 0; x < width; x += 1) {
+    enqueueWater(x);
+    enqueueWater((height - 1) * width + x);
+  }
+  while (waterHead < waterTail) {
+    const current = waterQueue[waterHead++];
+    const x = current % width;
+    const y = Math.floor(current / width);
+    enqueueWater(y * width + wrap(x - 1, width));
+    enqueueWater(y * width + wrap(x + 1, width));
+    if (y > 0) enqueueWater(current - width);
+    if (y + 1 < height) enqueueWater(current + width);
+  }
+  const inlandWaterMask = new Uint8Array(landMask.length);
+  let inlandWaterPixels = 0;
+  for (let index = 0; index < landMask.length; index += 1) {
+    if (!landMask[index] && !openWater[index]) {
+      inlandWaterMask[index] = 1;
+      inlandWaterPixels += 1;
+    }
+  }
+  const inlandWaterComponents = rasterLandmassComponents(inlandWaterMask, width, height);
+  const inlandWaterPercent = inlandWaterPixels / Math.max(1, landMask.length) * 100;
+  const largestInlandWaterPercent = (inlandWaterComponents[0]?.area ?? 0) / Math.max(1, landMask.length) * 100;
   const islandMinimum = Math.max(3, landPixels * 0.000025);
   const islandMaximum = landPixels * 0.006;
   const islands = areas.filter((area) => area >= islandMinimum && area < islandMaximum);
@@ -2598,9 +2646,12 @@ function rasterMorphologyMetrics(
     landmassSpacingIrregularity,
     verticalLandmassBias,
     meanMajorLandmassElongation,
+    maxSubstantialLandmassElongation,
     landCoreRetention,
     landCoreCoverage,
     neckFragmentation,
+    inlandWaterPercent,
+    largestInlandWaterPercent,
   };
 }
 
@@ -2631,6 +2682,7 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
       macroLand[index] = potentialMap[index] > terrain.seaLevel && !reserved ? 1 : 0;
     }
   }
+  const planet = planetScaleMetrics(settings);
   const signedDistance = signedEuclideanDistance(macroLand, width, height, true);
   const features = buildCoastFeatures(mesh, terrain, settings, seed);
   const faultAtlas = buildFaultAtlas(seed);
@@ -2638,7 +2690,6 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
   const warpXField = new Float32Array(width * height);
   const warpYField = new Float32Array(width * height);
   const detailControl = settings.coastDetail / 100;
-  const planet = planetScaleMetrics(settings);
   const frequencyScale = 1 / planet.featureScale;
   const detailAmplitude = mix(14, 84, detailControl) * pixelScale;
   const warpAmplitude = mix(4, 15, detailControl) * pixelScale;
@@ -2765,9 +2816,12 @@ function buildRasterTerrain(mesh: GraphMesh, terrain: TerrainCandidate, settings
     landmassSpacingIrregularity: morphology.landmassSpacingIrregularity,
     verticalLandmassBias: morphology.verticalLandmassBias,
     meanMajorLandmassElongation: morphology.meanMajorLandmassElongation,
+    maxSubstantialLandmassElongation: morphology.maxSubstantialLandmassElongation,
     landCoreRetention: morphology.landCoreRetention,
     landCoreCoverage: morphology.landCoreCoverage,
     neckFragmentation: morphology.neckFragmentation,
+    inlandWaterPercent: morphology.inlandWaterPercent,
+    largestInlandWaterPercent: morphology.largestInlandWaterPercent,
     rockLevel: elevationQuantile(elevation, coastCoverage, 0.87),
     snowLevel: elevationQuantile(elevation, coastCoverage, 0.98),
   };
@@ -3281,9 +3335,12 @@ export function generateWorldModel(settings: WorldSettings, onProgress?: (stage:
       landmassSpacingIrregularity: Math.round(raster.landmassSpacingIrregularity * 100) / 100,
       verticalLandmassBias: Math.round(raster.verticalLandmassBias * 100) / 100,
       meanMajorLandmassElongation: Math.round(raster.meanMajorLandmassElongation * 100) / 100,
+      maxSubstantialLandmassElongation: Math.round(raster.maxSubstantialLandmassElongation * 100) / 100,
       landCoreRetention: Math.round(raster.landCoreRetention * 100) / 100,
       landCoreCoverage: Math.round(raster.landCoreCoverage * 100) / 100,
       neckFragmentation: Math.round(raster.neckFragmentation * 100) / 100,
+      inlandWaterPercent: Math.round(raster.inlandWaterPercent * 100) / 100,
+      largestInlandWaterPercent: Math.round(raster.largestInlandWaterPercent * 100) / 100,
       circumferenceKm: Math.round(planet.circumferenceKm / 100) * 100,
       focusLongitude: findFocusLongitude(raster.coastCoverage, settings.width, settings.height),
       generationMs: Math.round(performance.now() - started),

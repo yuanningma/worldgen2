@@ -8,8 +8,14 @@
   "scripts": {
     "dev": "vinext dev",
     "build": "vinext build",
+    "debug:tectonics": "node --experimental-strip-types scripts/render-tectonic-debug.ts",
+    "evaluate:tectonics": "node --experimental-strip-types scripts/evaluate-tectonic-worlds.ts",
+    "render:tectonic-atlas": "node --experimental-strip-types scripts/render-tectonic-atlas.ts",
+    "render:tectonic-candidates": "node --experimental-strip-types scripts/render-tectonic-candidates.ts",
+    "render:tectonic-surface": "node --experimental-strip-types scripts/render-tectonic-surface.ts",
     "start": "vinext start",
     "test": "npm run build && node --experimental-strip-types --test tests/*.test.mjs",
+    "test:tectonics": "node --experimental-strip-types --test tests/tectonics.test.mjs tests/tectonics-debug.test.mjs tests/parcel-transport.test.mjs tests/parcel-remap-conformance.test.mjs tests/tectonic-world.test.mjs tests/tectonic-surface-refinement.test.mjs tests/spherical-metrics.test.mjs tests/tectonic-world-evaluation.test.mjs tests/refinement-gate.test.mjs tests/tectonic-atlas.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "typecheck": "tsc --noEmit"
   },
@@ -35,6 +41,7 @@
     "eslint-plugin-react-hooks": "7.1.1",
     "globals": "16.4.0",
     "react-server-dom-webpack": "19.2.6",
+    "sharp": "0.34.5",
     "tailwindcss": "4.2.1",
     "typescript": "5.9.3",
     "typescript-eslint": "8.59.3",

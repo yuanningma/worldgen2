@@ -27,6 +27,36 @@ Atlas Forge is a deterministic browser-based fantasy world generator focused on 
 - Reproducible controls, zoom, optional PNG download, and responsive Web Worker generation
 - Persistent in-browser 4096 × 2048 and 8192 × 4096 atlases with render-scale shoreline detail
 
+## Tectonic simulator prototype
+
+The replacement geology core is being developed separately from the current visual generator under `lib/tectonics/`, `lib/spherical/`, and `lib/evaluation/`. It now generates deterministic whole-sphere prototype worlds with:
+
+- a closed subdivided icosphere with exact spherical areas;
+- plate domains, Euler-pole boundary kinematics, and persistent boundary history;
+- persistent continental and oceanic crust state with age, thickness, density, provenance, uplift, rifting, and arc accretion;
+- persistent Lagrangian parcel IDs, exact Euler advection, and conservative local capacitated-flow remapping with explicit gap/overlap and transport-distance diagnostics;
+- an opt-in coupled finite-volume history where plate mixtures, fractional continental material, provenance, relief, and deformation memory cross only adjacent geodesic edges and feed back into the next tectonic step;
+- isostatic elevation, age-dependent ocean depth, and one area-weighted canonical sea level shared by every projection;
+- plate-aware irregular continental graph growth without a user-facing continent-count control;
+- spherical hard gates for ribbons, isthmuses, gulfs, lakes, elongation, canonical border stability, and multiscale coastline richness;
+- deterministic multi-seed evaluation and accepted-only ranking;
+- exact scientific and smoothed presentation atlas renderers.
+
+Generate and evaluate worlds without starting or deploying the web app:
+
+```bash
+npm run debug:tectonics -- --seed=RIFT-02 --subdivisions=3 --plates=8
+npm run evaluate:tectonics -- --seeds=ATLAS-A,ATLAS-B,ATLAS-C --subdivisions=4
+npm run evaluate:tectonics -- --seeds=ATLAS-A,ATLAS-B,ATLAS-C --subdivisions=5 --moving-myr=2
+npm run evaluate:tectonics -- --model=coupled --history-myr=120 --seeds=ATLAS-A,ATLAS-B --subdivisions=5
+npm run render:tectonic-surface -- --model=coupled --history-myr=120 --seed=ATLAS-A --subdivisions=5
+npm run render:tectonic-atlas -- --seed=ATLAS-A --subdivisions=5 --output=outputs/tectonics/world.png
+npm run render:tectonic-candidates -- --seeds=ATLAS-A,ATLAS-B,ATLAS-C,ATLAS-D
+npm run render:tectonic-surface -- --seed=ATLAS-A --subdivisions=5
+```
+
+The implementation roadmap is in [the comprehensive simulator plan](./docs/COMPREHENSIVE_WORLD_SIMULATOR_PLAN.md). The fixed history remains the stable reference, and `simulateMovingCrustSnapshot` remains the exact parcel-remap conformance path. `simulateCoupledTectonicWorld` is the first feedback model: an explicit finite-volume step transports material only across adjacent spherical faces, retains fractional continental and plate mixtures, feeds moved state into later rifting/collision, reports ridge-creation and subduction budgets, and applies area-preserving VOF interface compression to limit long-horizon diffusion. The evaluator now rejects nonlocal parcel transport, fine-only coast noise, insufficient continent hierarchy, oversized dominant landmasses, polar land concentration, and near-circumpolar zonal belts. The coupled model is still a reduced prototype: it lacks persistent parcel identities through creation/destruction, overlap-area remapping, plate splits/mergers, erosion, climate, and drainage.
+
 ## Run locally
 
 ```bash
@@ -40,6 +70,7 @@ Open `http://localhost:3000`.
 
 ```bash
 npm run typecheck
+npm run test:tectonics
 npm test
 npm run lint
 ```
