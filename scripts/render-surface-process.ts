@@ -56,6 +56,7 @@ function color(
   temperatureC: number,
   precipitationMPerYear: number,
   shade: number,
+  surfaceTexture: number,
 ): readonly [number, number, number] {
   let base: readonly [number, number, number];
   if (!isLand) {
@@ -76,7 +77,8 @@ function color(
   } else {
     base = [137, 166, 105];
   }
-  return base.map((channel) => Math.round(clamp(channel * shade, 0, 255))) as unknown as readonly [number, number, number];
+  const textureShade = 1 + surfaceTexture * (isLand ? 0.026 : 0.008);
+  return base.map((channel) => Math.round(clamp(channel * shade * textureShade, 0, 255))) as unknown as readonly [number, number, number];
 }
 
 function escapeXml(value: string): string {
@@ -161,6 +163,7 @@ const world = coupled ? simulateCoupledTectonicWorld(recipe) : simulateTectonicW
 const surface = createSurfaceProcessWorld(world, {
   subdivisions: surfaceSubdivisions,
   reliefAmplitudeKm: numberOption("relief-amplitude-km", 0.34),
+  coastOctaves: numberOption("coast-octaves", 5),
   minimumRiverAreaKm2: numberOption("minimum-river-area-km2", 650_000),
   erosionStrengthKm: numberOption("erosion-strength-km", 0.2),
   minimumErosionAreaKm2: numberOption("minimum-erosion-area-km2", 200_000),
@@ -198,6 +201,7 @@ for (let y = 0; y < height; y += 1) {
       cell.temperatureC,
       cell.precipitationMPerYear,
       terrainShade,
+      cell.surfaceTexture,
     );
     const index = (y * width + x) * 4;
     pixels[index] = rgb[0];

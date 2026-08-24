@@ -42,7 +42,8 @@ The replacement geology core is being developed separately from the current visu
 - deterministic multi-seed evaluation and accepted-only ranking;
 - exact scientific and smoothed presentation atlas renderers;
 - a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, latitude-aware precipitation, conservative runoff, Priority-Flood drainage, resolved river networks, bounded stream-power incision, and conservative downstream sediment transfer.
-- a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size.
+- a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
+- five bounded coastline wavelength bands plus deterministic world-space fine relief and albedo detail that reveal smaller features at larger output sizes without introducing raster-dependent geography.
 
 Generate and evaluate worlds without starting or deploying the web app:
 
@@ -58,6 +59,7 @@ npm run render:tectonic-surface -- --seed=ATLAS-A --subdivisions=5
 npm run render:surface-process -- --model=coupled --seed=ATLAS-A --subdivisions=5 --surface-subdivisions=6
 npm run render:surface-process -- --quality=high --model=coupled --seed=ATLAS-A
 npm run render:surface-process -- --quality=ultra --model=coupled --seed=ATLAS-A
+npm run render:surface-process -- --quality=ultra --coast-octaves=5 --presentation-samples=12 --seed=ATLAS-A
 ```
 
 The implementation roadmap is in [the comprehensive simulator plan](./docs/COMPREHENSIVE_WORLD_SIMULATOR_PLAN.md). The fixed history remains the stable reference, and `simulateMovingCrustSnapshot` remains the exact parcel-remap conformance path. `simulateCoupledTectonicWorld` is the first feedback model: an explicit finite-volume step transports material only across adjacent spherical faces, retains fractional continental and plate mixtures, feeds moved state into later rifting/collision, reports ridge-creation and subduction budgets, and applies area-preserving VOF interface compression to limit long-horizon diffusion. The evaluator rejects nonlocal parcel transport, fine-only coast noise, insufficient continent hierarchy, oversized dominant landmasses, polar land concentration, and near-circumpolar zonal belts. `createSurfaceProcessWorld` promotes an accepted tectonic state to a nested spherical process mesh and derives a closed drainage graph without changing canonical topology. Its continuous sampler decouples output resolution from process-cell density; `preview`, `high`, and `ultra` currently mean 2048×1024, 4096×2048, and 8192×4096. High-resolution rendering adds resolved visual detail but intentionally does not invent new continents or alter drainage topology. Climate is currently a reduced latitude/elevation precipitation field, not atmospheric circulation. The first geomorphic pass carves resolved channels, deposits sediment in low-gradient and terminal reaches, and closes its sediment budget, but it does not yet model time-varying climate, lithology, hillslope diffusion, flexural/isostatic feedback, lakes, or dynamic deltas. The coupled model also still lacks persistent parcel identities through creation/destruction, overlap-area remapping, and plate splits/mergers.

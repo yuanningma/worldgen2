@@ -14,6 +14,8 @@ export interface SurfaceRefinementOptions {
   /** Width of the presentation-only coastal band, in edge lengths. */
   coastalBand?: number;
   reliefPasses?: number;
+  /** Edge-detail bands retained in the continuous coast, from 3 through 5. */
+  coastOctaves?: number;
 }
 
 export interface RefinedSurfaceSample {
@@ -39,7 +41,7 @@ interface CoastEdge {
   readonly vertices: readonly [Vec3, Vec3];
   readonly faces: readonly [number, number];
   readonly length: number;
-  readonly phase: readonly [number, number, number];
+  readonly phase: readonly number[];
 }
 
 interface KdNode {
@@ -181,13 +183,19 @@ function closestOnEdge(point: Vec3, edge: CoastEdge): { distance: number; along:
   return distanceA <= distanceB ? { distance: distanceA, along: 0 } : { distance: distanceB, along: 1 };
 }
 
+const COAST_FREQUENCIES = [1, 3, 7, 17, 37] as const;
+const COAST_WEIGHTS = {
+  3: [0.68, 0.22, 0.1],
+  4: [0.62, 0.2, 0.1, 0.08],
+  5: [0.57, 0.19, 0.1, 0.08, 0.06],
+} as const;
+
 function edgeOffset(edge: CoastEdge, along: number, amplitude: number): number {
   const endpointFade = Math.sin(Math.PI * clamp(along)) ** 2;
-  const waves = (
-    Math.sin(Math.PI * 2 * (along + edge.phase[0])) * 0.68
-    + Math.sin(Math.PI * 2 * (along * 3 + edge.phase[1])) * 0.22
-    + Math.sin(Math.PI * 2 * (along * 7 + edge.phase[2])) * 0.1
-  );
+  const weights = COAST_WEIGHTS[edge.phase.length as keyof typeof COAST_WEIGHTS];
+  const waves = edge.phase.reduce((sum, phase, octave) => (
+    sum + Math.sin(Math.PI * 2 * (along * COAST_FREQUENCIES[octave] + phase)) * weights[octave]
+  ), 0);
   return waves * endpointFade * amplitude * edge.length;
 }
 
@@ -207,6 +215,7 @@ export function createSurfaceRefinement(
   readonly audit: () => SurfaceRefinementAudit;
 } {
   const requestedAmplitude = clamp(options.coastAmplitude ?? 0.21, 0, 0.24);
+  const coastOctaves = Math.round(clamp(options.coastOctaves ?? 3, 3, 5));
   const bandRatio = clamp(options.coastalBand ?? 0.34, requestedAmplitude + 0.04, 0.45);
   const cellsByFace = new Map(model.cells.map((cell) => [cell.faceId, cell]));
   const cells = model.sphere.faces.map((face) => {
@@ -236,7 +245,10 @@ export function createSurfaceRefinement(
       vertices: edge.vertices.map((id) => model.sphere.vertices[id].position) as unknown as readonly [Vec3, Vec3],
       faces: edge.faces,
       length: edge.arcLengthRadians,
-      phase: [0, 1, 2].map((octave) => hashUnit(model.recipe.seed, edge.id, octave)) as unknown as readonly [number, number, number],
+      phase: Array.from(
+        { length: coastOctaves },
+        (_, octave) => hashUnit(model.recipe.seed, edge.id, octave),
+      ),
     };
     coastEdges.push(coast);
     coastByFace[edge.faces[0]].push(coast);

@@ -8,6 +8,7 @@ export interface SurfaceProcessOptions {
   readonly subdivisions?: number;
   readonly coastAmplitude?: number;
   readonly coastalBand?: number;
+  readonly coastOctaves?: number;
   /** Geology-conditioned sub-cell relief amplitude. */
   readonly reliefAmplitudeKm?: number;
   /** Minimum contributing drainage area used to classify a river. */
@@ -54,6 +55,8 @@ export interface SurfacePresentationSample {
   readonly coastDistanceKm: number;
   readonly temperatureC: number;
   readonly precipitationMPerYear: number;
+  /** Stable world-space detail used for albedo modulation, in [-1, 1]. */
+  readonly surfaceTexture: number;
   /** Tangential rise/run vector used for continuous hill shading. */
   readonly terrainGradient: Vec3;
   readonly presentationOnly: true;
@@ -130,6 +133,15 @@ interface KdNode {
   readonly right: KdNode | null;
 }
 
+interface PresentationDetailBand {
+  readonly directionA: Vec3;
+  readonly directionB: Vec3;
+  readonly frequency: number;
+  readonly phaseA: number;
+  readonly phaseB: number;
+  readonly weight: number;
+}
+
 class ElevationHeap {
   private readonly values: HeapEntry[] = [];
 
@@ -188,6 +200,42 @@ function sphericalNoise(point: Vec3, seed: number): number {
   const second = Math.sin((point[0] * -0.29 + point[1] * 0.81 + point[2] * 0.39) * 79 + phase * 1.91);
   const third = Math.cos((point[0] * 0.61 + point[1] * 0.22 + point[2] * -0.76) * 151 + phase * 3.17);
   return first * 0.52 + second * 0.31 + third * 0.17;
+}
+
+function createPresentationDetailBands(seed: number): readonly PresentationDetailBand[] {
+  const frequencies = [173, 347, 691, 1_381, 2_767];
+  const weights = [0.34, 0.25, 0.19, 0.13, 0.09];
+  return frequencies.map((frequency, octave) => {
+    const direction = (index: number): Vec3 => normalize3([0, 1, 2].map((axis) => (
+      seedHash(`${seed}:presentation:${octave}:${index}:${axis}`) / 0x1_0000_0000 * 2 - 1
+    )) as unknown as Vec3);
+    const phase = (index: number): number => (
+      seedHash(`${seed}:presentation:${octave}:phase:${index}`) / 0x1_0000_0000 * Math.PI * 2
+    );
+    return {
+      directionA: direction(0),
+      directionB: direction(1),
+      frequency,
+      phaseA: phase(0),
+      phaseB: phase(1),
+      weight: weights[octave],
+    };
+  });
+}
+
+function samplePresentationDetail(
+  point: Vec3,
+  bands: readonly PresentationDetailBand[],
+): number {
+  let value = 0;
+  for (const band of bands) {
+    const argumentA = dot3(point, band.directionA) * band.frequency + band.phaseA;
+    const argumentB = dot3(point, band.directionB) * band.frequency * 0.79 + band.phaseB;
+    const sineA = Math.sin(argumentA);
+    const sineB = Math.sin(argumentB);
+    value += sineA * sineB * band.weight;
+  }
+  return value;
 }
 
 function buildAdjacency(sphere: GeodesicSphere): readonly number[][] {
@@ -490,6 +538,7 @@ export function createSurfaceProcessWorld(
   const refinement = createSurfaceRefinement(tectonicWorld, {
     coastAmplitude: options.coastAmplitude,
     coastalBand: options.coastalBand,
+    coastOctaves: options.coastOctaves ?? 5,
     reliefPasses: 2,
   });
   const refinementAudit = refinement.audit();
@@ -498,6 +547,7 @@ export function createSurfaceProcessWorld(
   }
   const reliefAmplitudeKm = clamp(options.reliefAmplitudeKm ?? 0.34, 0, 1.25);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
+  const presentationDetailBands = createPresentationDetailBands(hashedSeed);
   const radiusSquared = tectonicWorld.recipe.radiusKm ** 2;
   const cells: MutableSurfaceCell[] = sphere.faces.map((face) => {
     const refined = refinement.sample(face.center);
@@ -682,8 +732,15 @@ export function createSurfaceProcessWorld(
     gradient[0] /= totalWeight;
     gradient[1] /= totalWeight;
     gradient[2] /= totalWeight;
-    const fineRelief = sphericalNoise(point, hashedSeed + 2_119)
-      * reliefAmplitudeKm * (refined.isLand ? 0.055 : 0.018);
+    const surfaceTexture = samplePresentationDetail(point, presentationDetailBands);
+    const elevationAboveSeaKm = elevationKm - tectonicWorld.seaLevelKm;
+    const detailAmplitudeKm = reliefAmplitudeKm * (refined.isLand
+      ? 0.055 + clamp(elevationAboveSeaKm / 5, 0, 1) * 0.075
+      : 0.018);
+    const fineRelief = surfaceTexture * detailAmplitudeKm;
+    // Keep analytical lighting on the resolved process relief. The finer
+    // bands remain in elevation/albedo, but shading them directly at world
+    // scale creates directional aliasing before a tiled normal map exists.
     elevationKm = refined.isLand
       ? Math.max(tectonicWorld.seaLevelKm + 0.001, elevationKm + fineRelief)
       : Math.min(tectonicWorld.seaLevelKm - 0.001, elevationKm + fineRelief);
@@ -696,6 +753,7 @@ export function createSurfaceProcessWorld(
       coastDistanceKm: refined.isLand ? 0 : coastDistanceKm,
       temperatureC,
       precipitationMPerYear,
+      surfaceTexture,
       terrainGradient: gradient,
       presentationOnly: true,
     };

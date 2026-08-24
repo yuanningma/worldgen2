@@ -58,3 +58,29 @@ test("non-coastal canonical faces are never reclassified", () => {
     assert.equal(sample.signedCoastDistanceRadians, null);
   }
 });
+
+test("additional coast bands add bounded deterministic detail without moving anchors", () => {
+  const cells = new Map(world.cells.map((cell) => [cell.faceId, cell]));
+  const coast = world.sphere.edges.find((edge) => cells.get(edge.faces[0]).isLand !== cells.get(edge.faces[1]).isLand);
+  assert.ok(coast);
+  const threeBand = createSurfaceRefinement(world, { coastOctaves: 3 });
+  const fiveBand = createSurfaceRefinement(world, { coastOctaves: 5 });
+  const [a, b] = coast.vertices.map((vertexId) => world.sphere.vertices[vertexId].position);
+  let difference = 0;
+  for (let step = 0; step <= 128; step += 1) {
+    const progress = step / 128;
+    const direction = normalize3([
+      a[0] * (1 - progress) + b[0] * progress,
+      a[1] * (1 - progress) + b[1] * progress,
+      a[2] * (1 - progress) + b[2] * progress,
+    ]);
+    difference += Math.abs(
+      fiveBand.sample(direction).coastOffsetRadians
+      - threeBand.sample(direction).coastOffsetRadians,
+    );
+  }
+  assert.ok(difference > 1e-7);
+  assert.equal(threeBand.audit().topologyAnchorsPreserved, true);
+  assert.equal(fiveBand.audit().topologyAnchorsPreserved, true);
+  assert.ok(fiveBand.audit().maximumOffsetRatio <= 0.2400001);
+});
