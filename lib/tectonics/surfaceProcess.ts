@@ -21,6 +21,23 @@ export interface SurfaceProcessOptions {
   readonly presentationSampleCount?: number;
 }
 
+export type SurfaceLithology =
+  | "oceanic-basalt"
+  | "crystalline"
+  | "metamorphic"
+  | "volcanic"
+  | "carbonate"
+  | "sedimentary";
+
+const SURFACE_LITHOLOGIES: readonly SurfaceLithology[] = [
+  "oceanic-basalt",
+  "crystalline",
+  "metamorphic",
+  "volcanic",
+  "carbonate",
+  "sedimentary",
+];
+
 export interface SurfaceProcessCell {
   readonly faceId: number;
   readonly canonicalFaceId: number;
@@ -31,6 +48,9 @@ export interface SurfaceProcessCell {
   readonly fillDepthKm: number;
   readonly temperatureC: number;
   readonly precipitationMPerYear: number;
+  readonly lithology: SurfaceLithology;
+  /** Dimensionless resistance to fluvial and diffusive erosion, in [0, 1]. */
+  readonly erosionResistance: number;
   readonly localRunoffKm3PerYear: number;
   readonly erodedThicknessKm: number;
   readonly depositedThicknessKm: number;
@@ -55,6 +75,8 @@ export interface SurfacePresentationSample {
   readonly coastDistanceKm: number;
   readonly temperatureC: number;
   readonly precipitationMPerYear: number;
+  readonly lithology: SurfaceLithology;
+  readonly erosionResistance: number;
   /** Stable world-space detail used for albedo modulation, in [-1, 1]. */
   readonly surfaceTexture: number;
   /** Tangential rise/run vector used for continuous hill shading. */
@@ -80,6 +102,9 @@ export interface SurfaceProcessStats {
   readonly sedimentResidualKm3: number;
   readonly incisedCellCount: number;
   readonly depositionalCellCount: number;
+  readonly meanLandErosionResistance: number;
+  readonly lithologyAreaKm2: Readonly<Record<SurfaceLithology, number>>;
+  readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
 }
 
 export interface SurfaceProcessWorld {
@@ -119,6 +144,7 @@ interface SedimentBudget {
   readonly sedimentResidualKm3: number;
   readonly incisedCellCount: number;
   readonly depositionalCellCount: number;
+  readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
 }
 
 interface HeapEntry {
@@ -245,6 +271,126 @@ function buildAdjacency(sphere: GeodesicSphere): readonly number[][] {
     result[edge.faces[1]].push(edge.faces[0]);
   }
   return result;
+}
+
+function emptyLithologyRecord(): Record<SurfaceLithology, number> {
+  return Object.fromEntries(
+    SURFACE_LITHOLOGIES.map((lithology) => [lithology, 0]),
+  ) as Record<SurfaceLithology, number>;
+}
+
+function diffuseCanonicalField(
+  source: Float64Array,
+  adjacency: readonly number[][],
+  passes: number,
+  decay: number,
+  allowed: (faceId: number) => boolean,
+): Float64Array {
+  let field = source;
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = new Float64Array(field);
+    for (let faceId = 0; faceId < field.length; faceId += 1) {
+      if (!allowed(faceId)) continue;
+      for (const neighbor of adjacency[faceId]) {
+        if (!allowed(neighbor)) continue;
+        next[faceId] = Math.max(next[faceId], field[neighbor] * decay);
+      }
+    }
+    field = next;
+  }
+  return field;
+}
+
+function canonicalGeologyContext(world: TectonicWorldModel): {
+  readonly sutureStrength: Float64Array;
+  readonly activeMarginStrength: Float64Array;
+} {
+  const adjacency = buildAdjacency(world.sphere);
+  const continental = (faceId: number): boolean => {
+    const cell = world.cells[faceId];
+    return (cell.continentalFraction ?? (cell.crustType === "continental" ? 1 : 0)) >= 0.5;
+  };
+  const sutureSeeds = new Float64Array(world.cells.length);
+  for (const edge of world.sphere.edges) {
+    const [firstId, secondId] = edge.faces;
+    const first = world.cells[firstId];
+    const second = world.cells[secondId];
+    if (!continental(firstId) || !continental(secondId) || first.provenanceId === second.provenanceId) continue;
+    sutureSeeds[firstId] = 1;
+    sutureSeeds[secondId] = 1;
+  }
+  const sutureStrength = diffuseCanonicalField(sutureSeeds, adjacency, 4, 0.58, continental);
+
+  const activeSeeds = new Float64Array(world.cells.length);
+  for (const boundary of world.boundaries) {
+    const edge = world.sphere.edges[boundary.edgeId];
+    const strength = boundary.kind === "convergent"
+      ? 1
+      : boundary.kind === "divergent"
+        ? 0.72
+        : boundary.kind === "transform"
+          ? 0.42
+          : 0;
+    activeSeeds[edge.faces[0]] = Math.max(activeSeeds[edge.faces[0]], strength);
+    activeSeeds[edge.faces[1]] = Math.max(activeSeeds[edge.faces[1]], strength);
+  }
+  const activeMarginStrength = diffuseCanonicalField(
+    activeSeeds,
+    adjacency,
+    5,
+    0.64,
+    () => true,
+  );
+  return { sutureStrength, activeMarginStrength };
+}
+
+function surfaceGeology(
+  isLand: boolean,
+  point: Vec3,
+  elevationAboveSeaKm: number,
+  canonicalFaceId: number,
+  world: TectonicWorldModel,
+  sutureStrength: number,
+  activeMarginStrength: number,
+  seed: number,
+): { readonly lithology: SurfaceLithology; readonly erosionResistance: number } {
+  if (!isLand) return { lithology: "oceanic-basalt", erosionResistance: 0.78 };
+  const canonical = world.cells[canonicalFaceId];
+  const continentalFraction = clamp(canonical.continentalFraction
+    ?? (canonical.crustType === "continental" ? 1 : 0));
+  const province = seedHash(`${seed}:lithology:${canonical.provenanceId}`) / 0x1_0000_0000;
+  const local = sphericalNoise(point, seed + canonical.provenanceId * 31 + 4_099);
+  const carbonateSignal = province * 0.38 + (local * 0.5 + 0.5) * 0.62;
+  const warmLatitude = Math.abs(point[2]) < 0.72;
+  let lithology: SurfaceLithology;
+  let baseResistance: number;
+  if (sutureStrength > 0.34 || (elevationAboveSeaKm > 2.4 && continentalFraction > 0.55)) {
+    lithology = "metamorphic";
+    baseResistance = 0.86;
+  } else if (canonical.crustAgeMyr < 320
+    || (activeMarginStrength > 0.68 && elevationAboveSeaKm > 0.35)) {
+    lithology = "volcanic";
+    baseResistance = 0.66;
+  } else if (elevationAboveSeaKm < 0.38
+    && warmLatitude
+    && carbonateSignal > 0.68
+    && activeMarginStrength < 0.42) {
+    lithology = "carbonate";
+    baseResistance = 0.46;
+  } else if (elevationAboveSeaKm < 0.62
+    && (elevationAboveSeaKm < 0.24 || local < 0.28)
+    && sutureStrength < 0.24
+    && activeMarginStrength < 0.48) {
+    lithology = "sedimentary";
+    baseResistance = 0.31;
+  } else {
+    lithology = "crystalline";
+    baseResistance = 0.77;
+  }
+  return {
+    lithology,
+    erosionResistance: clamp(baseResistance + local * 0.055, 0.18, 0.94),
+  };
 }
 
 function buildKdTree(faceIds: number[], centers: readonly Vec3[], depth = 0): KdNode | null {
@@ -449,6 +595,7 @@ function erodeAndRouteSediment(
   let erodedVolumeKm3 = 0;
   let depositedVolumeKm3 = 0;
   let exportedSedimentVolumeKm3 = 0;
+  const erodedVolumeByLithologyKm3 = emptyLithologyRecord();
 
   for (const cell of drainage.downstreamOrder) {
     if (cell.receiverFaceId === null) continue;
@@ -470,15 +617,20 @@ function erodeAndRouteSediment(
       : 0;
     const slopeFactor = Math.sqrt(clamp(slope / 0.0075, 0, 1));
     const availableRelief = Math.max(0, cell.elevationKm - seaLevelKm - 0.004);
+    const erodibility = 0.48 + (1 - cell.erosionResistance) * 1.18;
     const incisionKm = resolvedChannel
       ? Math.min(
         availableRelief,
-        erosionStrengthKm * (0.22 + flowFactor * 0.5 + dischargeFactor * 0.28) * slopeFactor,
+        erosionStrengthKm
+          * (0.22 + flowFactor * 0.5 + dischargeFactor * 0.28)
+          * slopeFactor
+          * erodibility,
       )
       : 0;
     const erodedKm3 = incisionKm * areaKm2;
     erodedThicknessKm[cell.faceId] = incisionKm;
     erodedVolumeKm3 += erodedKm3;
+    erodedVolumeByLithologyKm3[cell.lithology] += erodedKm3;
     let availableSedimentKm3 = sedimentFluxKm3[cell.faceId] + erodedKm3;
 
     const lowGradient = 1 - clamp(slope / 0.0022, 0, 1);
@@ -512,6 +664,7 @@ function erodeAndRouteSediment(
     sedimentResidualKm3: erodedVolumeKm3 - depositedVolumeKm3 - exportedSedimentVolumeKm3,
     incisedCellCount,
     depositionalCellCount,
+    erodedVolumeByLithologyKm3,
   };
 }
 
@@ -547,6 +700,7 @@ export function createSurfaceProcessWorld(
   }
   const reliefAmplitudeKm = clamp(options.reliefAmplitudeKm ?? 0.34, 0, 1.25);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
+  const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
   const radiusSquared = tectonicWorld.recipe.radiusKm ** 2;
   const cells: MutableSurfaceCell[] = sphere.faces.map((face) => {
@@ -557,11 +711,23 @@ export function createSurfaceProcessWorld(
     const mountainEnvelope = clamp((aboveSea - 0.25) / 4.5);
     const continentalEnvelope = clamp(canonical.continentalFraction
       ?? (canonical.crustType === "continental" ? 1 : 0));
+    const geology = surfaceGeology(
+      refined.isLand,
+      face.center,
+      aboveSea,
+      canonicalFaceId,
+      tectonicWorld,
+      geologyContext.sutureStrength[canonicalFaceId],
+      geologyContext.activeMarginStrength[canonicalFaceId],
+      hashedSeed,
+    );
     const noise = sphericalNoise(face.center, hashedSeed);
     const ridge = 1 - Math.abs(sphericalNoise(face.center, hashedSeed + 337));
     const detail = refined.isLand
       ? (noise * 0.48 + (ridge - 0.5) * (0.28 + mountainEnvelope * 0.72))
-        * reliefAmplitudeKm * (0.35 + continentalEnvelope * 0.25 + mountainEnvelope * 0.9)
+        * reliefAmplitudeKm
+        * (0.35 + continentalEnvelope * 0.25 + mountainEnvelope * 0.9)
+        * (0.72 + geology.erosionResistance * 0.42)
       : noise * reliefAmplitudeKm * 0.16;
     const elevationKm = refined.isLand
       ? Math.max(tectonicWorld.seaLevelKm + 0.002, refined.elevationKm + detail)
@@ -583,6 +749,8 @@ export function createSurfaceProcessWorld(
       fillDepthKm: 0,
       temperatureC: climate.temperatureC,
       precipitationMPerYear: climate.precipitationMPerYear,
+      lithology: geology.lithology,
+      erosionResistance: geology.erosionResistance,
       localRunoffKm3PerYear,
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
@@ -668,6 +836,8 @@ export function createSurfaceProcessWorld(
     fillDepthKm: cell.fillDepthKm,
     temperatureC: cell.temperatureC,
     precipitationMPerYear: cell.precipitationMPerYear,
+    lithology: cell.lithology,
+    erosionResistance: cell.erosionResistance,
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
     erodedThicknessKm: cell.erodedThicknessKm,
     depositedThicknessKm: cell.depositedThicknessKm,
@@ -696,6 +866,7 @@ export function createSurfaceProcessWorld(
     let coastDistanceKm = 0;
     let temperatureC = 0;
     let precipitationMPerYear = 0;
+    let erosionResistance = 0;
     for (const faceId of candidates) {
       const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
       const cell = immutableCells[faceId];
@@ -704,11 +875,13 @@ export function createSurfaceProcessWorld(
       coastDistanceKm += (Number.isFinite(cell.coastDistanceKm) ? cell.coastDistanceKm : 0) * weight;
       temperatureC += cell.temperatureC * weight;
       precipitationMPerYear += cell.precipitationMPerYear * weight;
+      erosionResistance += cell.erosionResistance * weight;
     }
     elevationKm /= totalWeight;
     coastDistanceKm /= totalWeight;
     temperatureC /= totalWeight;
     precipitationMPerYear /= totalWeight;
+    erosionResistance /= totalWeight;
     const gradient: [number, number, number] = [0, 0, 0];
     for (const faceId of candidates) {
       const center = centers[faceId];
@@ -735,7 +908,8 @@ export function createSurfaceProcessWorld(
     const surfaceTexture = samplePresentationDetail(point, presentationDetailBands);
     const elevationAboveSeaKm = elevationKm - tectonicWorld.seaLevelKm;
     const detailAmplitudeKm = reliefAmplitudeKm * (refined.isLand
-      ? 0.055 + clamp(elevationAboveSeaKm / 5, 0, 1) * 0.075
+      ? (0.055 + clamp(elevationAboveSeaKm / 5, 0, 1) * 0.075)
+        * (0.72 + erosionResistance * 0.42)
       : 0.018);
     const fineRelief = surfaceTexture * detailAmplitudeKm;
     // Keep analytical lighting on the resolved process relief. The finer
@@ -753,6 +927,8 @@ export function createSurfaceProcessWorld(
       coastDistanceKm: refined.isLand ? 0 : coastDistanceKm,
       temperatureC,
       precipitationMPerYear,
+      lithology: immutableCells[nearestMatchingId].lithology,
+      erosionResistance,
       surfaceTexture,
       terrainGradient: gradient,
       presentationOnly: true,
@@ -776,6 +952,16 @@ export function createSurfaceProcessWorld(
       runoffResidualKm3PerYear: totalRunoff - finalDrainage.outletRunoffKm3PerYear,
       maximumFillDepthKm: cells.reduce((maximum, cell) => Math.max(maximum, cell.fillDepthKm), 0),
       canonicalAnchorMismatches: refinementAudit.canonicalAnchorMismatches,
+      meanLandErosionResistance: cells.reduce(
+        (sum, cell) => sum + (cell.isLand
+          ? cell.erosionResistance * sphere.faces[cell.faceId].areaSteradians
+          : 0),
+        0,
+      ) / Math.max(landArea, Number.EPSILON),
+      lithologyAreaKm2: cells.reduce((areas, cell) => {
+        areas[cell.lithology] += sphere.faces[cell.faceId].areaSteradians * radiusSquared;
+        return areas;
+      }, emptyLithologyRecord()),
       ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],

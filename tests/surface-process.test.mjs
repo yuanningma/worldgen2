@@ -20,10 +20,32 @@ test("nested surface grid retains canonical ancestry and topology anchors", () =
     assert.equal(cell.canonicalFaceId, Math.floor(cell.faceId / 4));
     assert.ok(Number.isFinite(cell.coastDistanceKm));
     assert.ok(cell.coastDistanceKm >= 0);
+    assert.ok(Number.isFinite(cell.erosionResistance));
+    assert.ok(cell.erosionResistance >= 0 && cell.erosionResistance <= 1);
   }
   for (const face of surface.sphere.faces.filter((_, index) => index % 97 === 0)) {
     assert.equal(surface.sample(face.center).faceId, face.id);
   }
+});
+
+test("terrane geology produces distinct rock provinces with closed area accounting", () => {
+  const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
+  const landLithologies = new Set(
+    surface.cells.filter((cell) => cell.isLand).map((cell) => cell.lithology),
+  );
+  assert.ok(landLithologies.size >= 3);
+  assert.ok(surface.cells.filter((cell) => !cell.isLand).every((cell) => cell.lithology === "oceanic-basalt"));
+  assert.ok(surface.stats.meanLandErosionResistance > 0.2);
+  assert.ok(surface.stats.meanLandErosionResistance < 0.95);
+
+  const expectedAreaKm2 = surface.sphere.totalAreaSteradians * tectonic.recipe.radiusKm ** 2;
+  const lithologyAreaKm2 = Object.values(surface.stats.lithologyAreaKm2)
+    .reduce((sum, area) => sum + area, 0);
+  assert.ok(Math.abs(lithologyAreaKm2 - expectedAreaKm2) <= expectedAreaKm2 * 1e-12);
+  const erosionByLithology = Object.values(surface.stats.erodedVolumeByLithologyKm3)
+    .reduce((sum, volume) => sum + volume, 0);
+  assert.ok(Math.abs(erosionByLithology - surface.stats.erodedVolumeKm3)
+    <= Math.max(1e-9, surface.stats.erodedVolumeKm3 * 1e-12));
 });
 
 test("Priority-Flood drainage is local, acyclic, and reaches the ocean", () => {

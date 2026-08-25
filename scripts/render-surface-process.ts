@@ -2,7 +2,10 @@ import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import sharp from "sharp";
-import { createSurfaceProcessWorld } from "../lib/tectonics/surfaceProcess.ts";
+import {
+  createSurfaceProcessWorld,
+  type SurfaceLithology,
+} from "../lib/tectonics/surfaceProcess.ts";
 import {
   simulateCoupledTectonicWorld,
   simulateTectonicWorld,
@@ -27,6 +30,15 @@ const QUALITY_WIDTHS = {
   high: 4096,
   ultra: 8192,
 } as const;
+
+const LITHOLOGY_TINTS: Readonly<Record<SurfaceLithology, readonly [number, number, number]>> = {
+  "oceanic-basalt": [78, 103, 111],
+  crystalline: [124, 142, 112],
+  metamorphic: [154, 130, 112],
+  volcanic: [103, 116, 99],
+  carbonate: [188, 181, 137],
+  sedimentary: [169, 153, 112],
+};
 
 function option(name: string): string | undefined {
   const prefix = `--${name}=`;
@@ -55,6 +67,8 @@ function color(
   coastDistanceKm: number,
   temperatureC: number,
   precipitationMPerYear: number,
+  lithology: SurfaceLithology,
+  erosionResistance: number,
   shade: number,
   surfaceTexture: number,
 ): readonly [number, number, number] {
@@ -77,7 +91,12 @@ function color(
   } else {
     base = [137, 166, 105];
   }
-  const textureShade = 1 + surfaceTexture * (isLand ? 0.026 : 0.008);
+  if (isLand) {
+    const snowOrIce = elevationAboveSeaKm > 4.8 || temperatureC < -13;
+    base = mix(base, LITHOLOGY_TINTS[lithology], snowOrIce ? 0.045 : 0.14);
+  }
+  const textureShade = 1 + surfaceTexture
+    * (isLand ? 0.021 + erosionResistance * 0.014 : 0.008);
   return base.map((channel) => Math.round(clamp(channel * shade * textureShade, 0, 255))) as unknown as readonly [number, number, number];
 }
 
@@ -169,6 +188,9 @@ const surface = createSurfaceProcessWorld(world, {
   minimumErosionAreaKm2: numberOption("minimum-erosion-area-km2", 200_000),
   presentationSampleCount: numberOption("presentation-samples", 12),
 });
+const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
+  .filter(([lithology, area]) => lithology !== "oceanic-basalt" && area > 0)
+  .length;
 
 const pixels = Buffer.allocUnsafe(width * height * 4);
 for (let y = 0; y < height; y += 1) {
@@ -200,6 +222,8 @@ for (let y = 0; y < height; y += 1) {
       cell.coastDistanceKm,
       cell.temperatureC,
       cell.precipitationMPerYear,
+      cell.lithology,
+      cell.erosionResistance,
       terrainShade,
       cell.surfaceTexture,
     );
@@ -225,8 +249,8 @@ const header = Buffer.from([
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${headerHeight}">`,
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">SPHERICAL SURFACE PROCESSES · ${escapeXml(seed)}</text>`,
-  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
-  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">PRIORITY-FLOOD + FLUVIAL INCISION · ${surface.stats.incisedCellCount.toLocaleString("en-US")} INCISED CELLS · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
+  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
+  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">LITHOLOGY-AWARE FLUVIAL INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVER SEGMENTS · MEAN ROCK RESISTANCE ${surface.stats.meanLandErosionResistance.toFixed(2)} · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));
 

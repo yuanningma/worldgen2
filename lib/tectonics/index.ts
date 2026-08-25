@@ -95,6 +95,7 @@ export {
 
 export {
   createSurfaceProcessWorld,
+  type SurfaceLithology,
   type SurfaceProcessCell,
   type SurfaceProcessOptions,
   type SurfacePresentationSample,
