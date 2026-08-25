@@ -37,6 +37,7 @@ const MAP_MODES = [
   "climate",
   "precipitation",
   "temperature",
+  "continentality",
   "wind",
   "lithology",
 ] as const;
@@ -76,7 +77,6 @@ function mix(a: readonly number[], b: readonly number[], amount: number): readon
 function hsvToRgb(hue: number, saturation: number, value: number): readonly [number, number, number] {
   const h = ((hue % 1) + 1) % 1 * 6;
   const sector = Math.floor(h);
-  const fraction = h - sector;
   const chroma = value * saturation;
   const x = chroma * (1 - Math.abs((h % 2) - 1));
   const offset = value - chroma;
@@ -111,6 +111,7 @@ function color(
   elevationAboveSeaKm: number,
   coastDistanceKm: number,
   temperatureC: number,
+  seasonalTemperatureRangeC: number,
   precipitationMPerYear: number,
   lithology: SurfaceLithology,
   erosionResistance: number,
@@ -132,6 +133,12 @@ function color(
     return normalized < 0.5
       ? mix([35, 75, 145], [229, 235, 218], normalized * 2)
       : mix([229, 235, 218], [183, 55, 39], (normalized - 0.5) * 2);
+  }
+  if (mapMode === "continentality") {
+    const normalized = clamp((seasonalTemperatureRangeC - 3) / 52);
+    return normalized < 0.5
+      ? mix([20, 14, 53], [158, 54, 128], normalized * 2)
+      : mix([158, 54, 128], [248, 230, 152], (normalized - 0.5) * 2);
   }
   if (mapMode === "precipitation") {
     const normalized = clamp(Math.log1p(precipitationMPerYear * 2.2) / Math.log1p(4.8 * 2.2));
@@ -320,6 +327,7 @@ for (let y = 0; y < height; y += 1) {
       cell.elevationKm - world.seaLevelKm,
       cell.coastDistanceKm,
       cell.temperatureC,
+      cell.seasonalTemperatureRangeC,
       cell.precipitationMPerYear,
       cell.lithology,
       cell.erosionResistance,

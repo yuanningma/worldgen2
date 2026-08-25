@@ -55,6 +55,17 @@ test("spherical circulation creates longitudinal rainfall structure and orograph
     && cell.atmosphericMoisture >= 0
     && cell.atmosphericMoisture <= 1));
   assert.ok(land.every((cell) => Number.isFinite(cell.orographicLiftKm) && cell.orographicLiftKm >= 0));
+  assert.ok(land.every((cell) => Number.isFinite(cell.continentality)
+    && cell.continentality >= 0
+    && cell.continentality <= 1));
+  assert.ok(land.every((cell) => Number.isFinite(cell.seasonalTemperatureRangeC)
+    && cell.seasonalTemperatureRangeC >= 4
+    && cell.seasonalTemperatureRangeC <= 60));
+  assert.ok(surface.cells.filter((cell) => !cell.isLand).every((cell) => cell.continentality === 0));
+  assert.ok(surface.stats.meanLandSeasonalTemperatureRangeC > 6);
+  assert.ok(surface.stats.meanLandSeasonalTemperatureRangeC < 55);
+  assert.ok(Math.max(...land.map((cell) => cell.coastDistanceKm)) > 200);
+  assert.ok(Math.max(...land.map((cell) => cell.continentality)) > 0.15);
   assert.ok(surface.stats.meanLandPrecipitationMPerYear > 0.2);
   assert.ok(surface.stats.meanLandPrecipitationMPerYear < 2.5);
   assert.ok(surface.stats.aridLandFraction > 0 && surface.stats.aridLandFraction < 0.9);
@@ -189,6 +200,8 @@ test("continuous presentation sampling preserves anchors and removes cell-edge j
   assert.ok(second.terrainGradient.every(Number.isFinite));
   assert.ok(first.prevailingWind.every(Number.isFinite));
   assert.ok(Math.abs(Math.hypot(...first.prevailingWind) - 1) < 1e-10);
+  assert.ok(Number.isFinite(first.seasonalTemperatureRangeC));
+  assert.ok(first.continentality >= 0 && first.continentality <= 1);
   assert.ok(Number.isFinite(first.surfaceTexture));
   assert.ok(Math.abs(first.surfaceTexture) <= 1.0000001);
   assert.ok(Math.abs(first.surfaceTexture - second.surfaceTexture) > 1e-10);

@@ -46,7 +46,7 @@ The replacement geology core is being developed separately from the current visu
 - exact scientific and smoothed presentation atlas renderers;
 - a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, spherical moisture circulation, conservative runoff, Priority-Flood drainage, resolved river networks, bounded stream-power incision, and conservative downstream sediment transfer.
 - a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
-- synchronized natural, heightmap, climate, precipitation, temperature, wind, and lithology diagnostics that all read the same canonical world instead of regenerating geography;
+- synchronized natural, heightmap, climate, precipitation, temperature, continentality, wind, and lithology diagnostics that all read the same canonical world instead of regenerating geography;
 - five bounded coastline wavelength bands plus deterministic world-space fine relief and albedo detail that reveal smaller features at larger output sizes without introducing raster-dependent geography.
 
 Generate and evaluate worlds without starting or deploying the web app:
@@ -66,6 +66,7 @@ npm run render:surface-process -- --quality=ultra --model=coupled --seed=ATLAS-A
 npm run render:surface-process -- --quality=ultra --coast-octaves=5 --presentation-samples=12 --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=heightmap --quality=preview --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=climate --quality=preview --seed=ATLAS-A
+npm run render:surface-process -- --map-mode=continentality --quality=preview --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=wind --quality=preview --seed=ATLAS-A
 ```
 

@@ -13,8 +13,11 @@ The first deterministic whole-world slice is now implemented independently of th
 - `lib/spherical/` and `lib/evaluation/` contain exact spherical raster areas, canonical-mask comparison, and multiscale ribbon, neck, gulf, lake, elongation, solidity, perimeter-retention, peninsula/bay, and coastline-richness metrics.
 - `npm run evaluate:tectonics` performs deterministic multi-seed hard-gate evaluation and ranks accepted candidates only.
 - `npm run render:tectonic-atlas` and `npm run render:tectonic-candidates` render exact scientific or presentation-smoothed atlases without running or deploying the web app.
+- `lib/tectonics/surfaceProcess.ts` promotes a tectonic snapshot to a nested spherical surface mesh with geology-conditioned relief, same-medium distance-to-coast, continentality and seasonal-temperature range, spherical annual moisture circulation, orographic precipitation, conservative runoff, Priority-Flood drainage, resolved rivers, lithology-aware incision, and conservative sediment transfer.
+- The resolution-independent surface sampler exposes one canonical world through synchronized natural, heightmap, climate, precipitation, temperature, continentality, wind, and lithology modes. Presentation resolution and style do not reclassify the coast.
+- The external capability references supplied on 2026-08-24 are catalogued in `docs/references/reddit-world-simulator/README.md`. They are design targets, not generated fixtures and not licensed product assets.
 
-This slice now generates complete flooded planets and is suitable for testing macro organization and causal geology. `fixed-geodesic-control-volume-v1` remains the reference history and `lagrangian-parcel-snapshot-v1` remains the exact remap conformance path. The new `coupled-conservative-cell-history-v1` performs explicit adjacent-edge finite-volume transport every timestep, carries fractional continental and plate mixtures plus deformation memory, and lets moved state change later boundary forcing. Ridge underfill and convergent overfill are explicit paired creation/subduction budgets; continental material is shortened rather than preferentially subducted. Area-preserving VOF compression limits first-order interface diffusion. Current coupled runs are deliberately evaluated at both their simulation subdivision and target raster tier because coarse winners are not assumed to remain valid at high detail. Placement gates now cover effective continent count, dominant land share, polar land share, and zonal/circumpolar occupancy in addition to earlier elongation, neck, gulf, and scale-space coastline metrics. This remains a reduced prototype rather than a final mantle/lithosphere solver: persistent parcel identities through material creation, overlap-area remapping, splits/mergers, erosion, climate, and drainage are still absent.
+This slice now generates complete flooded planets and is suitable for testing macro organization, causal geology, first-order surface processes, and annual climate. `fixed-geodesic-control-volume-v1` remains the reference history and `lagrangian-parcel-snapshot-v1` remains the exact remap conformance path. `coupled-conservative-cell-history-v1` performs explicit adjacent-edge finite-volume transport every timestep, carries fractional continental and plate mixtures plus deformation memory, and lets moved state change later boundary forcing. Ridge underfill and convergent overfill are explicit paired creation/subduction budgets; continental material is shortened rather than preferentially subducted. Area-preserving VOF compression limits first-order interface diffusion. Current coupled runs are evaluated at both their simulation subdivision and target raster tier because coarse winners are not assumed to remain valid at high detail. Placement gates cover effective continent count, dominant land share, polar land share, zonal/circumpolar occupancy, elongation, necks, gulfs, and scale-space coastline richness. This remains a reduced prototype rather than a final mantle/lithosphere or climate solver: persistent parcel identities through creation/destruction, overlap-area remapping, plate splits/mergers, seasonal circulation, ocean heat transport, hillslope diffusion, explicit lake evolution, and dynamic deltas remain incomplete.
 
 ## Decision
 
@@ -500,6 +503,8 @@ The older `worldgen/IMPLEMENTATION_PLAN.md` is a good engineering scaffold, but 
 
 ### Phase 0: independent evaluation harness
 
+**Status: implemented and active.** The spherical morphology, placement, canonical-mask, refinement, and remap conformance suites are required by `npm test`; human preference calibration still needs a larger blinded dataset.
+
 Implement the pathology fixtures, spherical shape metrics, canonical mask comparison, reference ingestion, and contact-sheet runner before the new simulator.
 
 Collect a blinded pilot of at least 100–200 pairwise judgments across current outputs, synthetic pathologies, Earth epochs, and private fantasy references before metrics drive candidate selection. Metric directions and composite decisions must agree with held-out human labels; repeat this audit whenever a new metric begins influencing selection.
@@ -508,11 +513,15 @@ Exit gate: the harness reliably ranks compact versus stringy fixtures, detects n
 
 ### Phase 1: spherical model and deterministic engine
 
+**Status: TypeScript reference implemented.** Closed geodesic topology, exact rotations, stable deterministic state, debug layers, and atlas/globe agreement tests exist. Rust/WASM remains an optimization decision rather than a prerequisite.
+
 Create the Rust/WASM workspace, geodesic topology, solid-angle areas, stable material IDs, event log, serialization, worker protocol, and reference TypeScript path.
 
 Exit gate: topology and rotation fixtures pass; repeated runs hash identically; atlas/globe/tile queries agree.
 
 ### Phase 2: moving plates and oceanic crust
+
+**Status: reduced reference paths implemented; production coupling incomplete.** Fixed history, exact parcel snapshot transport, and local conservative coupled transport exist. Persistent created/destroyed parcel identities and overlap-area remapping remain open.
 
 Implement Euler motion, closed dynamic boundaries, divergence, new crust insertion, transforms, ocean-floor age, thermal subsidence, and temporally correlated mantle-frame motion.
 
@@ -520,11 +529,15 @@ Exit gate: ridges create age-zero crust; ages and depths progress correctly; mat
 
 ### Phase 3: continental cycle
 
+**Status: partial.** Rifting, convergence, arcs, accreted terranes, sutures, and unequal cratonic assemblies exist in reduced form. Dynamic plate topology, mature slab feedback, and calibrated split/merge histories remain open.
+
 Implement continental extension, failed rifts, breakup, passive margins, persistent subduction polarity, slabs, arcs, terrane accretion, collision, suturing, plate splits, and mergers. Add reduced coarse erosion/sediment/isostatic feedback at tectonic checkpoints. Only after stable slab, rift, and collision state exists, enable slab pull, ridge push, collision resistance, and coupled torque feedback; retain the prescribed-motion path as a reference.
 
 Exit gate: controlled fixtures behave causally and a multi-epoch suite produces cratons, oceans, arcs, sutures, and failed rifts without a final continent-count parameter.
 
 ### Phase 4: physical topography and water
+
+**Status: first-order implementation complete, calibration ongoing.** Crustal elevation, age-dependent bathymetry, one area-weighted sea level, shelves, flooded land authority, and geology-conditioned relief exist. Flexure, dynamic topography, and empirical hypsometry calibration remain open.
 
 Implement crust-thickness isostasy, ocean-age bathymetry, broad flexure/dynamic terms, water inventory, basin flooding, shelves, and hypsometry.
 
@@ -532,11 +545,15 @@ Exit gate: Earth-like presets fall within selected ETOPO-derived distribution ba
 
 ### Phase 5: surface grid and level-of-detail infrastructure
 
+**Status: partial.** A persistent nested geodesic process grid, canonical ancestry, continuous presentation sampler, and 1K–8K resolution-independent rendering exist. Cubed-sphere tiles, mipmapped browser caches, progressive cancellation, and production 10K rendering remain open.
+
 Implement the cubed-sphere process grid, conservative parcel/geodesic/raster remapping, signed-distance coast, tile boundaries, mipmaps, and level-of-detail infrastructure before full surface processes depend on them.
 
 Exit gate: round-trip remapping meets conservation and diffusion bounds; tile seams are absent; the canonical coast is identical across grids and supported resolutions.
 
 ### Phase 6: climate, hydrology, erosion, and sediment
+
+**Status: first annualized slice implemented.** Reduced spherical prevailing winds, moisture advection, orographic loss, land distance-to-ocean, continentality, seasonal-temperature range, runoff closure, Priority-Flood routing, river hierarchy, stream-power incision, lithology resistance, and sediment budgets exist. Seasonal pressure/circulation, denser channel extraction, hillslope diffusion, explicit lakes, deltas, and biome calibration remain open.
 
 Implement atmospheric circulation at an appropriate reduced fidelity, moisture/orography, runoff, Priority-Flood, rivers, stream-power incision, hillslope diffusion, sediment, lakes, deltas, and high-resolution geomorphic amplification on the established process grid.
 
@@ -544,9 +561,23 @@ Exit gate: water and sediment conserve; drainage tests pass; rivers have plausib
 
 ### Phase 7: browser renderer and aesthetic calibration
 
+**Status: diagnostic rendering underway.** Natural, heightmap, climate, precipitation, temperature, continentality, wind, and lithology modes share one canonical world in offline renders. The new simulator is not deployed or wired into the legacy studio; retained-model browser switching and progressive tiled rendering remain open.
+
 Implement progressive 1K–10K rendering, model/tile caches, style separation, and export encoding. Run the public and hidden suites, human pairwise tests, Earth epochs, and private fantasy-reference analysis. Tune initial-condition priors and snapshot selection without violating physical gates.
 
 Exit gate: an 8K view renders progressively in-browser within measured budgets; all styles share a canonical border; zoom reveals resolved detail rather than enlarged blur; and the new engine beats the present Atlas Forge baseline on held-out whole-world composition and silhouette preference while passing causal and conservation tests.
+
+## Immediate execution order (current checkpoint)
+
+The near-term product spine is deliberately narrower than the complete reference set:
+
+1. Improve canonical surface elevation, bathymetry, shelves, coast antialiasing, and drainage density without changing macro-land authority.
+2. Calibrate the implemented land distance-to-ocean and continentality fields; improve pressure-informed winds and orographic precipitation while retaining an explicitly reduced climate fidelity label.
+3. Derive inspectable aridity and biome classes from continuous annual fields, with classification tests that cannot mutate climate or coast state.
+4. Retain one simulated surface in a worker and switch diagnostic modes, atlas/globe projection, and style without regeneration.
+5. Calibrate whole-world composition and resolved detail against Earth epochs, synthetic fixtures, the Malazan-inspired private aesthetic targets, and the catalogued external simulator references.
+
+Seasonal climate, wind-driven ocean currents, sea-surface-temperature transport, and settlement suitability remain later phases. They should consume the validated fields above rather than becoming parallel generators.
 
 ## First prototype slice
 

@@ -43,10 +43,15 @@ export interface SurfaceProcessCell {
   readonly canonicalFaceId: number;
   readonly isLand: boolean;
   readonly elevationKm: number;
+  /** Shortest same-medium surface distance to the canonical coast. */
   readonly coastDistanceKm: number;
   readonly filledElevationKm: number;
   readonly fillDepthKm: number;
   readonly temperatureC: number;
+  /** Difference between the reduced warmest- and coldest-month temperatures. */
+  readonly seasonalTemperatureRangeC: number;
+  /** Maritime-to-continental interior index in [0, 1]. */
+  readonly continentality: number;
   readonly precipitationMPerYear: number;
   /** Advected atmospheric moisture after local precipitation loss, in [0, 1]. */
   readonly atmosphericMoisture: number;
@@ -78,6 +83,8 @@ export interface SurfacePresentationSample {
   readonly elevationKm: number;
   readonly coastDistanceKm: number;
   readonly temperatureC: number;
+  readonly seasonalTemperatureRangeC: number;
+  readonly continentality: number;
   readonly precipitationMPerYear: number;
   readonly atmosphericMoisture: number;
   readonly orographicLiftKm: number;
@@ -114,6 +121,7 @@ export interface SurfaceProcessStats {
   readonly lithologyAreaKm2: Readonly<Record<SurfaceLithology, number>>;
   readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
   readonly meanLandTemperatureC: number;
+  readonly meanLandSeasonalTemperatureRangeC: number;
   readonly meanLandPrecipitationMPerYear: number;
   readonly aridLandFraction: number;
   readonly humidLandFraction: number;
@@ -143,6 +151,8 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   erodedThicknessKm: number;
   depositedThicknessKm: number;
   temperatureC: number;
+  seasonalTemperatureRangeC: number;
+  continentality: number;
   precipitationMPerYear: number;
   atmosphericMoisture: number;
   orographicLiftKm: number;
@@ -152,6 +162,7 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
 
 interface SurfaceClimateStats {
   readonly meanLandTemperatureC: number;
+  readonly meanLandSeasonalTemperatureRangeC: number;
   readonly meanLandPrecipitationMPerYear: number;
   readonly aridLandFraction: number;
   readonly humidLandFraction: number;
@@ -588,6 +599,36 @@ function createUpwindTransport(
   });
 }
 
+function computeCoastDistances(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  radiusKm: number,
+): void {
+  const coastHeap = new ElevationHeap();
+  for (const cell of cells) {
+    cell.coastDistanceKm = Infinity;
+    if (!adjacency[cell.faceId].some((neighbor) => cells[neighbor].isLand !== cell.isLand)) continue;
+    cell.coastDistanceKm = 0;
+    coastHeap.push({ faceId: cell.faceId, priority: 0 });
+  }
+  for (let entry = coastHeap.pop(); entry; entry = coastHeap.pop()) {
+    if (entry.priority > cells[entry.faceId].coastDistanceKm + 1e-9) continue;
+    const cell = cells[entry.faceId];
+    const center = sphere.faces[entry.faceId].center;
+    for (const neighborId of adjacency[entry.faceId]) {
+      const neighbor = cells[neighborId];
+      if (neighbor.isLand !== cell.isLand) continue;
+      const neighborCenter = sphere.faces[neighborId].center;
+      const edgeKm = Math.acos(clamp(dot3(center, neighborCenter), -1, 1)) * radiusKm;
+      const distance = entry.priority + edgeKm;
+      if (distance >= neighbor.coastDistanceKm) continue;
+      neighbor.coastDistanceKm = distance;
+      coastHeap.push({ faceId: neighborId, priority: distance });
+    }
+  }
+}
+
 function simulateSurfaceClimate(
   cells: MutableSurfaceCell[],
   sphere: GeodesicSphere,
@@ -609,10 +650,25 @@ function simulateSurfaceClimate(
   for (const cell of cells) {
     const latitude = Math.asin(clamp(sphere.faces[cell.faceId].center[2], -1, 1));
     const absoluteLatitude = Math.abs(latitude);
+    const latitudeFraction = absoluteLatitude / (Math.PI / 2);
+    const distanceToOceanKm = cell.isLand ? cell.coastDistanceKm : 0;
+    cell.continentality = cell.isLand
+      ? clamp(1 - Math.exp(-distanceToOceanKm / 850), 0, 1)
+      : 0;
+    cell.seasonalTemperatureRangeC = cell.isLand
+      ? clamp(
+        5
+          + latitudeFraction ** 1.25 * 25
+          + cell.continentality * (9 + latitudeFraction * 23),
+        4,
+        60,
+      )
+      : clamp(2.5 + latitudeFraction * 7, 2.5, 10);
     const temperatureNoise = sphericalNoise(sphere.faces[cell.faceId].center, seed + 12_421) * 1.45;
     cell.temperatureC = 29.5
-      - Math.abs(latitude) / (Math.PI / 2) * 51.5
+      - latitudeFraction * 51.5
       - elevationAboveSea[cell.faceId] * 6.05
+      - cell.continentality * latitudeFraction * 2.2
       + temperatureNoise;
     saturation[cell.faceId] = clamp(0.62 + cell.temperatureC * 0.011, 0.34, 0.96);
     humidity[cell.faceId] = cell.isLand ? saturation[cell.faceId] * 0.18 : saturation[cell.faceId];
@@ -660,6 +716,7 @@ function simulateSurfaceClimate(
 
   let landArea = 0;
   let temperatureAreaSum = 0;
+  let seasonalRangeAreaSum = 0;
   let precipitationAreaSum = 0;
   let aridArea = 0;
   let humidArea = 0;
@@ -704,12 +761,14 @@ function simulateSurfaceClimate(
     const area = sphere.faces[cell.faceId].areaSteradians;
     landArea += area;
     temperatureAreaSum += cell.temperatureC * area;
+    seasonalRangeAreaSum += cell.seasonalTemperatureRangeC * area;
     precipitationAreaSum += precipitation * area;
     if (precipitation < 0.42) aridArea += area;
     if (precipitation > 1.55) humidArea += area;
   }
   return {
     meanLandTemperatureC: temperatureAreaSum / Math.max(landArea, Number.EPSILON),
+    meanLandSeasonalTemperatureRangeC: seasonalRangeAreaSum / Math.max(landArea, Number.EPSILON),
     meanLandPrecipitationMPerYear: precipitationAreaSum / Math.max(landArea, Number.EPSILON),
     aridLandFraction: aridArea / Math.max(landArea, Number.EPSILON),
     humidLandFraction: humidArea / Math.max(landArea, Number.EPSILON),
@@ -933,10 +992,12 @@ export function createSurfaceProcessWorld(
       canonicalFaceId,
       isLand: refined.isLand,
       elevationKm,
-      coastDistanceKm: refined.isLand ? 0 : Infinity,
+      coastDistanceKm: Infinity,
       filledElevationKm: elevationKm,
       fillDepthKm: 0,
       temperatureC: 0,
+      seasonalTemperatureRangeC: 0,
+      continentality: 0,
       precipitationMPerYear: 0,
       atmosphericMoisture: 0,
       orographicLiftKm: 0,
@@ -952,6 +1013,12 @@ export function createSurfaceProcessWorld(
     };
   });
 
+  computeCoastDistances(
+    cells,
+    sphere,
+    adjacency,
+    tectonicWorld.recipe.radiusKm,
+  );
   const climateStats = simulateSurfaceClimate(
     cells,
     sphere,
@@ -987,27 +1054,6 @@ export function createSurfaceProcessWorld(
     tectonicWorld.recipe.radiusKm,
   );
 
-  const coastHeap = new ElevationHeap();
-  for (const cell of cells) {
-    if (cell.isLand || !adjacency[cell.faceId].some((neighbor) => cells[neighbor].isLand)) continue;
-    cell.coastDistanceKm = 0;
-    coastHeap.push({ faceId: cell.faceId, priority: 0 });
-  }
-  for (let entry = coastHeap.pop(); entry; entry = coastHeap.pop()) {
-    if (entry.priority > cells[entry.faceId].coastDistanceKm + 1e-9) continue;
-    const center = sphere.faces[entry.faceId].center;
-    for (const neighborId of adjacency[entry.faceId]) {
-      const neighbor = cells[neighborId];
-      if (neighbor.isLand) continue;
-      const neighborCenter = sphere.faces[neighborId].center;
-      const edgeKm = Math.acos(clamp(dot3(center, neighborCenter), -1, 1)) * tectonicWorld.recipe.radiusKm;
-      const distance = entry.priority + edgeKm;
-      if (distance >= neighbor.coastDistanceKm) continue;
-      neighbor.coastDistanceKm = distance;
-      coastHeap.push({ faceId: neighborId, priority: distance });
-    }
-  }
-
   const minimumRiverAreaKm2 = options.minimumRiverAreaKm2
     ?? Math.max(90_000, totalSurfaceAreaKm2 / 3_500);
   const rivers: SurfaceRiverSegment[] = [];
@@ -1035,6 +1081,8 @@ export function createSurfaceProcessWorld(
     filledElevationKm: cell.filledElevationKm,
     fillDepthKm: cell.fillDepthKm,
     temperatureC: cell.temperatureC,
+    seasonalTemperatureRangeC: cell.seasonalTemperatureRangeC,
+    continentality: cell.continentality,
     precipitationMPerYear: cell.precipitationMPerYear,
     atmosphericMoisture: cell.atmosphericMoisture,
     orographicLiftKm: cell.orographicLiftKm,
@@ -1067,6 +1115,8 @@ export function createSurfaceProcessWorld(
     let elevationKm = 0;
     let coastDistanceKm = 0;
     let temperatureC = 0;
+    let seasonalTemperatureRangeC = 0;
+    let continentality = 0;
     let precipitationMPerYear = 0;
     let atmosphericMoisture = 0;
     let orographicLiftKm = 0;
@@ -1078,6 +1128,8 @@ export function createSurfaceProcessWorld(
       elevationKm += cell.elevationKm * weight;
       coastDistanceKm += (Number.isFinite(cell.coastDistanceKm) ? cell.coastDistanceKm : 0) * weight;
       temperatureC += cell.temperatureC * weight;
+      seasonalTemperatureRangeC += cell.seasonalTemperatureRangeC * weight;
+      continentality += cell.continentality * weight;
       precipitationMPerYear += cell.precipitationMPerYear * weight;
       atmosphericMoisture += cell.atmosphericMoisture * weight;
       orographicLiftKm += cell.orographicLiftKm * weight;
@@ -1086,6 +1138,8 @@ export function createSurfaceProcessWorld(
     elevationKm /= totalWeight;
     coastDistanceKm /= totalWeight;
     temperatureC /= totalWeight;
+    seasonalTemperatureRangeC /= totalWeight;
+    continentality /= totalWeight;
     precipitationMPerYear /= totalWeight;
     atmosphericMoisture /= totalWeight;
     orographicLiftKm /= totalWeight;
@@ -1132,8 +1186,10 @@ export function createSurfaceProcessWorld(
       canonicalFaceId: immutableCells[nearestMatchingId].canonicalFaceId,
       isLand: refined.isLand,
       elevationKm,
-      coastDistanceKm: refined.isLand ? 0 : coastDistanceKm,
+      coastDistanceKm,
       temperatureC,
+      seasonalTemperatureRangeC,
+      continentality,
       precipitationMPerYear,
       atmosphericMoisture,
       orographicLiftKm,
