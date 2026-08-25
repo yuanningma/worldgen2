@@ -44,3 +44,10 @@ export {
   type CanonicalLandSampler,
   type ParcelRemapAudit,
 } from "./parcelRemapConformance.ts";
+
+export {
+  compareSurfaceResolutions,
+  DEFAULT_SURFACE_RESOLUTION_THRESHOLDS,
+  type SurfaceResolutionComparison,
+  type SurfaceResolutionThresholds,
+} from "./surfaceResolutionComparison.ts";
