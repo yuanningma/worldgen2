@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import sharp from "sharp";
 import {
   createSurfaceProcessWorld,
+  type SurfaceBiome,
   type SurfaceLithology,
 } from "../lib/tectonics/surfaceProcess.ts";
 import {
@@ -35,7 +36,9 @@ const MAP_MODES = [
   "natural",
   "heightmap",
   "climate",
+  "biomes",
   "precipitation",
+  "aridity",
   "temperature",
   "continentality",
   "drainage",
@@ -52,6 +55,25 @@ const LITHOLOGY_TINTS: Readonly<Record<SurfaceLithology, readonly [number, numbe
   volcanic: [103, 116, 99],
   carbonate: [188, 181, 137],
   sedimentary: [169, 153, 112],
+};
+
+const BIOME_COLORS: Readonly<Record<SurfaceBiome, readonly [number, number, number]>> = {
+  "open-ocean": [29, 67, 111],
+  "shelf-sea": [65, 127, 170],
+  "sea-ice": [217, 232, 232],
+  "freshwater-lake": [73, 145, 184],
+  "ice-cap": [241, 242, 235],
+  alpine: [183, 181, 169],
+  tundra: [170, 179, 151],
+  "boreal-forest": [74, 112, 89],
+  "cold-steppe": [166, 160, 108],
+  desert: [218, 190, 118],
+  "temperate-grassland": [157, 177, 93],
+  "temperate-forest": [91, 142, 80],
+  "temperate-rainforest": [51, 113, 76],
+  savanna: [185, 166, 77],
+  "tropical-seasonal-forest": [71, 137, 67],
+  "tropical-rainforest": [35, 101, 58],
 };
 
 function option(name: string): string | undefined {
@@ -109,12 +131,15 @@ function climateBucketColor(
 function color(
   mapMode: SurfaceMapMode,
   isLand: boolean,
+  isLake: boolean,
   elevationAboveSeaKm: number,
   coastDistanceKm: number,
   temperatureC: number,
   seasonalTemperatureRangeC: number,
   precipitationMPerYear: number,
+  aridityIndex: number,
   drainageAreaKm2: number,
+  biome: SurfaceBiome,
   lithology: SurfaceLithology,
   erosionResistance: number,
   atmosphericMoisture: number,
@@ -148,8 +173,16 @@ function color(
       ? mix([191, 154, 91], [102, 165, 153], normalized / 0.45)
       : mix([102, 165, 153], [25, 62, 128], (normalized - 0.45) / 0.55);
   }
+  if (mapMode === "aridity") {
+    if (!isLand || isLake) return [247, 248, 244];
+    const normalized = clamp(aridityIndex / 2.25);
+    return normalized < 0.45
+      ? mix([142, 91, 34], [239, 226, 186], normalized / 0.45)
+      : mix([239, 226, 186], [17, 105, 88], (normalized - 0.45) / 0.55);
+  }
   if (mapMode === "drainage") {
     if (!isLand) return [246, 248, 246];
+    if (isLake) return BIOME_COLORS["freshwater-lake"];
     const normalized = clamp((Math.log10(Math.max(100, drainageAreaKm2)) - 2) / 5.4);
     return normalized < 0.48
       ? mix([241, 247, 248], [151, 210, 232], normalized / 0.48)
@@ -160,7 +193,11 @@ function color(
     return hsvToRgb(angle / (Math.PI * 2) + 0.5, 0.68, 0.52 + atmosphericMoisture * 0.34);
   }
   if (mapMode === "climate") {
+    if (isLake) return BIOME_COLORS["freshwater-lake"];
     return climateBucketColor(isLand, temperatureC, precipitationMPerYear);
+  }
+  if (mapMode === "biomes") {
+    return BIOME_COLORS[biome];
   }
   if (mapMode === "lithology") {
     const base = LITHOLOGY_TINTS[lithology];
@@ -168,7 +205,9 @@ function color(
     return base.map((channel) => Math.round(clamp(channel * thematicShade, 0, 255))) as unknown as readonly [number, number, number];
   }
   let base: readonly [number, number, number];
-  if (!isLand) {
+  if (isLake) {
+    base = mix([91, 163, 194], [36, 102, 151], clamp(elevationAboveSeaKm / 4));
+  } else if (!isLand) {
     const shelf = clamp(coastDistanceKm / 520);
     base = shelf < 0.42
       ? mix([128, 185, 207], [42, 108, 151], shelf / 0.42)
@@ -186,12 +225,12 @@ function color(
   } else {
     base = [137, 166, 105];
   }
-  if (isLand) {
+  if (isLand && !isLake) {
     const snowOrIce = elevationAboveSeaKm > 4.8 || temperatureC < -13;
     base = mix(base, LITHOLOGY_TINTS[lithology], snowOrIce ? 0.045 : 0.14);
   }
   const textureShade = 1 + surfaceTexture
-    * (isLand ? 0.021 + erosionResistance * 0.014 : 0.008);
+    * (isLand && !isLake ? 0.021 + erosionResistance * 0.014 : 0.008);
   return base.map((channel) => Math.round(clamp(channel * shade * textureShade, 0, 255))) as unknown as readonly [number, number, number];
 }
 
@@ -258,6 +297,59 @@ function drawAntiAliasedSegment(
     blendPixel(pixels, width, height, ix + 1, iy, fx * (1 - fy) * strength, ink);
     blendPixel(pixels, width, height, ix, iy + 1, (1 - fx) * fy * strength, ink);
     blendPixel(pixels, width, height, ix + 1, iy + 1, fx * fy * strength, ink);
+  }
+}
+
+function unwrapX(x: number, reference: number, width: number): number {
+  let result = x;
+  while (result - reference > width / 2) result -= width;
+  while (result - reference < -width / 2) result += width;
+  return result;
+}
+
+function drawRiverCurve(
+  pixels: Buffer,
+  width: number,
+  height: number,
+  previous: readonly [number, number] | null,
+  from: readonly [number, number],
+  to: readonly [number, number],
+  next: readonly [number, number] | null,
+  strength: number,
+): void {
+  const p1: readonly [number, number] = from;
+  const p2: readonly [number, number] = [unwrapX(to[0], p1[0], width), to[1]];
+  const p0: readonly [number, number] = previous
+    ? [unwrapX(previous[0], p1[0], width), previous[1]]
+    : [p1[0] * 2 - p2[0], p1[1] * 2 - p2[1]];
+  const p3: readonly [number, number] = next
+    ? [unwrapX(next[0], p2[0], width), next[1]]
+    : [p2[0] * 2 - p1[0], p2[1] * 2 - p1[1]];
+  const tangentScale = 0.34;
+  const m1: readonly [number, number] = [
+    (p2[0] - p0[0]) * tangentScale,
+    (p2[1] - p0[1]) * tangentScale,
+  ];
+  const m2: readonly [number, number] = [
+    (p3[0] - p1[0]) * tangentScale,
+    (p3[1] - p1[1]) * tangentScale,
+  ];
+  const steps = Math.max(3, Math.ceil(Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * 1.5));
+  let last = p1;
+  for (let step = 1; step <= steps; step += 1) {
+    const t = step / steps;
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const h00 = 2 * t3 - 3 * t2 + 1;
+    const h10 = t3 - 2 * t2 + t;
+    const h01 = -2 * t3 + 3 * t2;
+    const h11 = t3 - t2;
+    const point: readonly [number, number] = [
+      h00 * p1[0] + h10 * m1[0] + h01 * p2[0] + h11 * m2[0],
+      h00 * p1[1] + h10 * m1[1] + h01 * p2[1] + h11 * m2[1],
+    ];
+    drawAntiAliasedSegment(pixels, width, height, last, point, strength);
+    last = point;
   }
 }
 
@@ -339,12 +431,15 @@ function renderColorAt(longitude: number, latitude: number): {
     rgb: color(
       mapMode,
       cell.isLand,
+      cell.isLake,
       cell.elevationKm - world.seaLevelKm,
       cell.coastDistanceKm,
       cell.temperatureC,
       cell.seasonalTemperatureRangeC,
       cell.precipitationMPerYear,
+      cell.aridityIndex,
       cell.drainageAreaKm2,
+      cell.biome,
       cell.lithology,
       cell.erosionResistance,
       cell.atmosphericMoisture,
@@ -401,16 +496,42 @@ for (let y = 0; y < height; y += 1) {
   if (y > 0 && y % 128 === 0) process.stdout.write(`sampled ${y}/${height} rows\n`);
 }
 
-if (mapMode === "natural" || mapMode === "climate" || mapMode === "lithology" || mapMode === "drainage") {
+if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage") {
+  const outgoing = new Map<number, (typeof surface.rivers)[number]>();
+  const dominantIncoming = new Map<number, (typeof surface.rivers)[number]>();
+  for (const river of surface.rivers) {
+    outgoing.set(river.fromFaceId, river);
+    const incumbent = dominantIncoming.get(river.toFaceId);
+    if (!incumbent || river.drainageAreaKm2 > incumbent.drainageAreaKm2) {
+      dominantIncoming.set(river.toFaceId, river);
+    }
+  }
   for (const river of surface.rivers) {
     const from = surface.sphere.faces[river.fromFaceId].center;
     const to = surface.sphere.faces[river.toFaceId].center;
+    const previousRiver = dominantIncoming.get(river.fromFaceId);
+    const nextRiver = outgoing.get(river.toFaceId);
+    const previous = previousRiver
+      ? longitudeLatitude(surface.sphere.faces[previousRiver.fromFaceId].center, width, height)
+      : null;
+    const next = nextRiver
+      ? longitudeLatitude(surface.sphere.faces[nextRiver.toFaceId].center, width, height)
+      : null;
     const strength = clamp(
       0.34 + Math.log2(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2)) * 0.085,
       0.34,
       0.82,
     );
-    drawAntiAliasedSegment(pixels, width, height, longitudeLatitude(from, width, height), longitudeLatitude(to, width, height), strength);
+    drawRiverCurve(
+      pixels,
+      width,
+      height,
+      previous,
+      longitudeLatitude(from, width, height),
+      longitudeLatitude(to, width, height),
+      next,
+      strength,
+    );
   }
 }
 
@@ -465,7 +586,7 @@ const header = Buffer.from([
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">${mapMode.toUpperCase()} MODE · ${escapeXml(seed)}</text>`,
   `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
-  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE TRANSPORT + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
+  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));
 

@@ -48,6 +48,32 @@ test("terrane geology produces distinct rock provinces with closed area accounti
     <= Math.max(1e-9, surface.stats.erodedVolumeKm3 * 1e-12));
 });
 
+test("annual physical atlas derives closed biome areas and inland lakes", () => {
+  const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
+  const expectedAreaKm2 = surface.sphere.totalAreaSteradians * tectonic.recipe.radiusKm ** 2;
+  const biomeAreaKm2 = Object.values(surface.stats.biomeAreaKm2)
+    .reduce((sum, area) => sum + area, 0);
+  assert.ok(Math.abs(biomeAreaKm2 - expectedAreaKm2) <= expectedAreaKm2 * 1e-12);
+  assert.ok(Object.values(surface.stats.biomeAreaKm2).filter((area) => area > 0).length >= 9);
+  assert.ok(surface.cells.every((cell) => Number.isFinite(cell.aridityIndex)
+    && cell.aridityIndex >= 0
+    && cell.aridityIndex <= 3));
+  const lakes = surface.cells.filter((cell) => cell.isLake);
+  assert.equal(lakes.length, surface.stats.lakeCellCount);
+  assert.ok(lakes.every((cell) => cell.isLand
+    && cell.biome === "freshwater-lake"
+    && cell.lakeDepthKm >= 0.13));
+  assert.ok(surface.cells.filter((cell) => !cell.isLake)
+    .every((cell) => cell.biome !== "freshwater-lake"));
+  const expectedLakeAreaKm2 = lakes.reduce(
+    (sum, cell) => sum + surface.sphere.faces[cell.faceId].areaSteradians * tectonic.recipe.radiusKm ** 2,
+    0,
+  );
+  assert.ok(Math.abs(expectedLakeAreaKm2 - surface.stats.lakeAreaKm2)
+    <= Math.max(1e-9, expectedLakeAreaKm2 * 1e-12));
+  assert.equal(surface.stats.biomeAreaKm2["freshwater-lake"], surface.stats.lakeAreaKm2);
+});
+
 test("spherical circulation creates longitudinal rainfall structure and orographic enhancement", () => {
   const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
   const land = surface.cells.filter((cell) => cell.isLand);

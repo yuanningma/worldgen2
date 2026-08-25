@@ -38,6 +38,43 @@ const SURFACE_LITHOLOGIES: readonly SurfaceLithology[] = [
   "sedimentary",
 ];
 
+export type SurfaceBiome =
+  | "open-ocean"
+  | "shelf-sea"
+  | "sea-ice"
+  | "freshwater-lake"
+  | "ice-cap"
+  | "alpine"
+  | "tundra"
+  | "boreal-forest"
+  | "cold-steppe"
+  | "desert"
+  | "temperate-grassland"
+  | "temperate-forest"
+  | "temperate-rainforest"
+  | "savanna"
+  | "tropical-seasonal-forest"
+  | "tropical-rainforest";
+
+const SURFACE_BIOMES: readonly SurfaceBiome[] = [
+  "open-ocean",
+  "shelf-sea",
+  "sea-ice",
+  "freshwater-lake",
+  "ice-cap",
+  "alpine",
+  "tundra",
+  "boreal-forest",
+  "cold-steppe",
+  "desert",
+  "temperate-grassland",
+  "temperate-forest",
+  "temperate-rainforest",
+  "savanna",
+  "tropical-seasonal-forest",
+  "tropical-rainforest",
+];
+
 export interface SurfaceProcessCell {
   readonly faceId: number;
   readonly canonicalFaceId: number;
@@ -53,6 +90,12 @@ export interface SurfaceProcessCell {
   /** Maritime-to-continental interior index in [0, 1]. */
   readonly continentality: number;
   readonly precipitationMPerYear: number;
+  /** Annual precipitation divided by a reduced potential-evapotranspiration threshold. */
+  readonly aridityIndex: number;
+  readonly biome: SurfaceBiome;
+  /** A derived inland-water cover; canonical crust remains land. */
+  readonly isLake: boolean;
+  readonly lakeDepthKm: number;
   /** Advected atmospheric moisture after local precipitation loss, in [0, 1]. */
   readonly atmosphericMoisture: number;
   /** Positive upwind terrain rise used by the reduced orographic model. */
@@ -86,6 +129,10 @@ export interface SurfacePresentationSample {
   readonly seasonalTemperatureRangeC: number;
   readonly continentality: number;
   readonly precipitationMPerYear: number;
+  readonly aridityIndex: number;
+  readonly biome: SurfaceBiome;
+  readonly isLake: boolean;
+  readonly lakeDepthKm: number;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
   readonly atmosphericMoisture: number;
@@ -105,6 +152,8 @@ export interface SurfaceProcessStats {
   readonly landFraction: number;
   readonly landCellCount: number;
   readonly oceanCellCount: number;
+  readonly lakeCellCount: number;
+  readonly lakeAreaKm2: number;
   readonly riverSegmentCount: number;
   readonly maximumDrainageAreaKm2: number;
   readonly maximumDischargeKm3PerYear: number;
@@ -121,6 +170,7 @@ export interface SurfaceProcessStats {
   readonly depositionalCellCount: number;
   readonly meanLandErosionResistance: number;
   readonly lithologyAreaKm2: Readonly<Record<SurfaceLithology, number>>;
+  readonly biomeAreaKm2: Readonly<Record<SurfaceBiome, number>>;
   readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
   readonly meanLandTemperatureC: number;
   readonly meanLandSeasonalTemperatureRangeC: number;
@@ -156,6 +206,10 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   seasonalTemperatureRangeC: number;
   continentality: number;
   precipitationMPerYear: number;
+  aridityIndex: number;
+  biome: SurfaceBiome;
+  isLake: boolean;
+  lakeDepthKm: number;
   atmosphericMoisture: number;
   orographicLiftKm: number;
   localRunoffKm3PerYear: number;
@@ -316,6 +370,35 @@ function emptyLithologyRecord(): Record<SurfaceLithology, number> {
   return Object.fromEntries(
     SURFACE_LITHOLOGIES.map((lithology) => [lithology, 0]),
   ) as Record<SurfaceLithology, number>;
+}
+
+function emptyBiomeRecord(): Record<SurfaceBiome, number> {
+  return Object.fromEntries(
+    SURFACE_BIOMES.map((biome) => [biome, 0]),
+  ) as Record<SurfaceBiome, number>;
+}
+
+function classifySurfaceBiome(cell: MutableSurfaceCell, seaLevelKm: number): SurfaceBiome {
+  if (!cell.isLand) {
+    if (cell.temperatureC < -4) return "sea-ice";
+    if (cell.coastDistanceKm < 320) return "shelf-sea";
+    return "open-ocean";
+  }
+  if (cell.isLake) return "freshwater-lake";
+  const elevationAboveSeaKm = Math.max(0, cell.elevationKm - seaLevelKm);
+  if (cell.temperatureC < -12) return "ice-cap";
+  if (elevationAboveSeaKm > 3.6 || (elevationAboveSeaKm > 2.5 && cell.temperatureC < 3)) return "alpine";
+  if (cell.temperatureC < 0) return "tundra";
+  if (cell.temperatureC < 6) return cell.aridityIndex > 0.82 ? "boreal-forest" : "cold-steppe";
+  if (cell.aridityIndex < 0.5) return "desert";
+  if (cell.temperatureC > 21) {
+    if (cell.aridityIndex > 1.75) return "tropical-rainforest";
+    if (cell.aridityIndex > 1.05) return "tropical-seasonal-forest";
+    return "savanna";
+  }
+  if (cell.aridityIndex < 0.88) return "temperate-grassland";
+  if (cell.precipitationMPerYear > 1.55 && cell.temperatureC < 15) return "temperate-rainforest";
+  return "temperate-forest";
 }
 
 function diffuseCanonicalField(
@@ -747,6 +830,12 @@ function simulateSurfaceClimate(
     cell.atmosphericMoisture = humidity[cell.faceId];
     cell.orographicLiftKm = lift;
     cell.precipitationMPerYear = precipitation;
+    const potentialEvapotranspirationMPerYear = clamp(
+      0.22 + Math.max(0, cell.temperatureC + 5) * 0.04,
+      0.14,
+      2.1,
+    );
+    cell.aridityIndex = clamp(precipitation / potentialEvapotranspirationMPerYear, 0, 3);
     maximumOrographicLiftKm = Math.max(maximumOrographicLiftKm, lift);
     const areaKm2 = sphere.faces[cell.faceId].areaSteradians * radiusSquared;
     const frozenFraction = clamp((-cell.temperatureC + 2) / 22, 0, 0.72);
@@ -765,8 +854,8 @@ function simulateSurfaceClimate(
     temperatureAreaSum += cell.temperatureC * area;
     seasonalRangeAreaSum += cell.seasonalTemperatureRangeC * area;
     precipitationAreaSum += precipitation * area;
-    if (precipitation < 0.42) aridArea += area;
-    if (precipitation > 1.55) humidArea += area;
+    if (cell.aridityIndex < 0.75) aridArea += area;
+    if (cell.aridityIndex > 1.4) humidArea += area;
   }
   return {
     meanLandTemperatureC: temperatureAreaSum / Math.max(landArea, Number.EPSILON),
@@ -1001,6 +1090,10 @@ export function createSurfaceProcessWorld(
       seasonalTemperatureRangeC: 0,
       continentality: 0,
       precipitationMPerYear: 0,
+      aridityIndex: 0,
+      biome: refined.isLand ? "temperate-grassland" : "open-ocean",
+      isLake: false,
+      lakeDepthKm: 0,
       atmosphericMoisture: 0,
       orographicLiftKm: 0,
       lithology: geology.lithology,
@@ -1056,6 +1149,16 @@ export function createSurfaceProcessWorld(
     tectonicWorld.recipe.radiusKm,
   );
 
+  const minimumLakeCatchmentKm2 = Math.max(500_000, totalSurfaceAreaKm2 / 1_200);
+  for (const cell of cells) {
+    cell.lakeDepthKm = cell.isLand ? Math.max(0, cell.fillDepthKm) : 0;
+    cell.isLake = cell.isLand
+      && cell.lakeDepthKm >= 0.13
+      && cell.drainageAreaKm2 >= minimumLakeCatchmentKm2
+      && cell.filledElevationKm >= tectonicWorld.seaLevelKm + 0.01;
+    cell.biome = classifySurfaceBiome(cell, tectonicWorld.seaLevelKm);
+  }
+
   const minimumRiverAreaKm2 = options.minimumRiverAreaKm2
     ?? Math.max(90_000, totalSurfaceAreaKm2 / 3_500);
   const rivers: SurfaceRiverSegment[] = [];
@@ -1086,6 +1189,10 @@ export function createSurfaceProcessWorld(
     seasonalTemperatureRangeC: cell.seasonalTemperatureRangeC,
     continentality: cell.continentality,
     precipitationMPerYear: cell.precipitationMPerYear,
+    aridityIndex: cell.aridityIndex,
+    biome: cell.biome,
+    isLake: cell.isLake,
+    lakeDepthKm: cell.lakeDepthKm,
     atmosphericMoisture: cell.atmosphericMoisture,
     orographicLiftKm: cell.orographicLiftKm,
     lithology: cell.lithology,
@@ -1120,6 +1227,8 @@ export function createSurfaceProcessWorld(
     let seasonalTemperatureRangeC = 0;
     let continentality = 0;
     let precipitationMPerYear = 0;
+    let aridityIndex = 0;
+    let lakeDepthKm = 0;
     let drainageAreaKm2 = 0;
     let dischargeKm3PerYear = 0;
     let atmosphericMoisture = 0;
@@ -1135,6 +1244,8 @@ export function createSurfaceProcessWorld(
       seasonalTemperatureRangeC += cell.seasonalTemperatureRangeC * weight;
       continentality += cell.continentality * weight;
       precipitationMPerYear += cell.precipitationMPerYear * weight;
+      aridityIndex += cell.aridityIndex * weight;
+      lakeDepthKm += cell.lakeDepthKm * weight;
       drainageAreaKm2 += cell.drainageAreaKm2 * weight;
       dischargeKm3PerYear += cell.dischargeKm3PerYear * weight;
       atmosphericMoisture += cell.atmosphericMoisture * weight;
@@ -1147,6 +1258,8 @@ export function createSurfaceProcessWorld(
     seasonalTemperatureRangeC /= totalWeight;
     continentality /= totalWeight;
     precipitationMPerYear /= totalWeight;
+    aridityIndex /= totalWeight;
+    lakeDepthKm /= totalWeight;
     drainageAreaKm2 /= totalWeight;
     dischargeKm3PerYear /= totalWeight;
     atmosphericMoisture /= totalWeight;
@@ -1189,6 +1302,7 @@ export function createSurfaceProcessWorld(
       ? Math.max(tectonicWorld.seaLevelKm + 0.001, elevationKm + fineRelief)
       : Math.min(tectonicWorld.seaLevelKm - 0.001, elevationKm + fineRelief);
     const nearestMatchingId = candidates[0];
+    const nearestMatchingCell = immutableCells[nearestMatchingId];
     return {
       faceId: nearestMatchingId,
       canonicalFaceId: immutableCells[nearestMatchingId].canonicalFaceId,
@@ -1199,12 +1313,16 @@ export function createSurfaceProcessWorld(
       seasonalTemperatureRangeC,
       continentality,
       precipitationMPerYear,
+      aridityIndex,
+      biome: nearestMatchingCell.biome,
+      isLake: nearestMatchingCell.isLake,
+      lakeDepthKm,
       drainageAreaKm2,
       dischargeKm3PerYear,
       atmosphericMoisture,
       orographicLiftKm,
       prevailingWind: prevailingWindAt(point),
-      lithology: immutableCells[nearestMatchingId].lithology,
+      lithology: nearestMatchingCell.lithology,
       erosionResistance,
       surfaceTexture,
       terrainGradient: gradient,
@@ -1221,6 +1339,11 @@ export function createSurfaceProcessWorld(
       landFraction: landArea / sphere.totalAreaSteradians,
       landCellCount: cells.filter((cell) => cell.isLand).length,
       oceanCellCount: cells.filter((cell) => !cell.isLand).length,
+      lakeCellCount: cells.filter((cell) => cell.isLake).length,
+      lakeAreaKm2: cells.reduce(
+        (sum, cell) => sum + (cell.isLake ? sphere.faces[cell.faceId].areaSteradians * radiusSquared : 0),
+        0,
+      ),
       riverSegmentCount: rivers.length,
       maximumDrainageAreaKm2: cells.reduce((maximum, cell) => Math.max(maximum, cell.drainageAreaKm2), 0),
       maximumDischargeKm3PerYear: cells.reduce((maximum, cell) => Math.max(maximum, cell.dischargeKm3PerYear), 0),
@@ -1239,6 +1362,10 @@ export function createSurfaceProcessWorld(
         areas[cell.lithology] += sphere.faces[cell.faceId].areaSteradians * radiusSquared;
         return areas;
       }, emptyLithologyRecord()),
+      biomeAreaKm2: cells.reduce((areas, cell) => {
+        areas[cell.biome] += sphere.faces[cell.faceId].areaSteradians * radiusSquared;
+        return areas;
+      }, emptyBiomeRecord()),
       ...climateStats,
       ...sedimentBudget,
     },

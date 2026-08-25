@@ -13,11 +13,23 @@ The first deterministic whole-world slice is now implemented independently of th
 - `lib/spherical/` and `lib/evaluation/` contain exact spherical raster areas, canonical-mask comparison, and multiscale ribbon, neck, gulf, lake, elongation, solidity, perimeter-retention, peninsula/bay, and coastline-richness metrics.
 - `npm run evaluate:tectonics` performs deterministic multi-seed hard-gate evaluation and ranks accepted candidates only.
 - `npm run render:tectonic-atlas` and `npm run render:tectonic-candidates` render exact scientific or presentation-smoothed atlases without running or deploying the web app.
-- `lib/tectonics/surfaceProcess.ts` promotes a tectonic snapshot to a nested spherical surface mesh with geology-conditioned relief, same-medium distance-to-coast, continentality and seasonal-temperature range, spherical annual moisture circulation, orographic precipitation, conservative runoff, Priority-Flood drainage, resolved rivers, lithology-aware incision, and conservative sediment transfer.
-- The resolution-independent surface sampler exposes one canonical world through synchronized natural, heightmap, climate, precipitation, temperature, continentality, drainage, wind, and lithology modes. Presentation resolution and style do not reclassify the coast.
+- `lib/tectonics/surfaceProcess.ts` promotes a tectonic snapshot to a nested spherical surface mesh with geology-conditioned relief, same-medium distance-to-coast, continentality and seasonal-temperature range, spherical annual moisture circulation, orographic precipitation, PET-relative aridity, conservative runoff, Priority-Flood drainage, deep-basin lake cover, resolved rivers, biome classification, lithology-aware incision, and conservative sediment transfer.
+- The resolution-independent surface sampler exposes one canonical world through synchronized natural, heightmap, climate, biomes, precipitation, aridity, temperature, continentality, drainage, wind, and lithology modes. Presentation resolution and style do not reclassify the coast.
 - The external capability references supplied on 2026-08-24 are catalogued in `docs/references/reddit-world-simulator/README.md`. They are design targets, not generated fixtures and not licensed product assets.
 
 This slice now generates complete flooded planets and is suitable for testing macro organization, causal geology, first-order surface processes, and annual climate. `fixed-geodesic-control-volume-v1` remains the reference history and `lagrangian-parcel-snapshot-v1` remains the exact remap conformance path. `coupled-conservative-cell-history-v1` performs explicit adjacent-edge finite-volume transport every timestep, carries fractional continental and plate mixtures plus deformation memory, and lets moved state change later boundary forcing. Ridge underfill and convergent overfill are explicit paired creation/subduction budgets; continental material is shortened rather than preferentially subducted. Area-preserving VOF compression limits first-order interface diffusion. Current coupled runs are evaluated at both their simulation subdivision and target raster tier because coarse winners are not assumed to remain valid at high detail. Placement gates cover effective continent count, dominant land share, polar land share, zonal/circumpolar occupancy, elongation, necks, gulfs, and scale-space coastline richness. This remains a reduced prototype rather than a final mantle/lithosphere or climate solver: persistent parcel identities through creation/destruction, overlap-area remapping, plate splits/mergers, seasonal circulation, ocean heat transport, hillslope diffusion, explicit lake evolution, and dynamic deltas remain incomplete.
+
+### Milestone: annual physical atlas
+
+The annual physical-atlas milestone is reached when a single accepted tectonic snapshot deterministically produces all of the following without renderer-specific geography:
+
+- continuous terrain, bathymetry, geology, coast distance, temperature, precipitation, aridity, drainage area, and discharge;
+- derived deep-basin lake cover and sixteen marine/terrestrial biome classes with exact spherical area closure;
+- conservative runoff and sediment budgets, canonical coast anchors, and deterministic surface sampling;
+- adaptive coast antialiasing and smoothed hierarchical river presentation at raster time;
+- synchronized natural and scientific atlas modes suitable for fixed-seed visual comparison.
+
+This milestone does not claim seasonal general circulation, explicit lake time evolution, ocean-current heat transport, ecological succession, or settlement simulation. Those remain downstream of annual-field calibration.
 
 ## Decision
 
@@ -553,7 +565,7 @@ Exit gate: round-trip remapping meets conservation and diffusion bounds; tile se
 
 ### Phase 6: climate, hydrology, erosion, and sediment
 
-**Status: first annualized slice implemented.** Reduced spherical prevailing winds, moisture advection, orographic loss, land distance-to-ocean, continentality, seasonal-temperature range, runoff closure, Priority-Flood routing, river hierarchy, stream-power incision, lithology resistance, and sediment budgets exist. Seasonal pressure/circulation, denser channel extraction, hillslope diffusion, explicit lakes, deltas, and biome calibration remain open.
+**Status: annual physical-atlas milestone implemented.** Reduced spherical prevailing winds, moisture advection, orographic loss, land distance-to-ocean, continentality, seasonal-temperature range, PET-relative aridity, runoff closure, Priority-Flood routing, deep-basin lake cover, river hierarchy, smoothed river presentation, stream-power incision, lithology resistance, biome classification, and closed sediment/area budgets exist. Seasonal pressure/circulation, process-grid channel refinement, hillslope diffusion, explicit lake evolution, deltas, and empirical biome calibration remain open.
 
 Implement atmospheric circulation at an appropriate reduced fidelity, moisture/orography, runoff, Priority-Flood, rivers, stream-power incision, hillslope diffusion, sediment, lakes, deltas, and high-resolution geomorphic amplification on the established process grid.
 
@@ -561,7 +573,7 @@ Exit gate: water and sediment conserve; drainage tests pass; rivers have plausib
 
 ### Phase 7: browser renderer and aesthetic calibration
 
-**Status: diagnostic rendering underway.** Natural, heightmap, climate, precipitation, temperature, continentality, drainage, wind, and lithology modes share one canonical world in offline renders. Adaptive coast-only supersampling reduces raster stair steps without globally multiplying render cost. The new simulator is not deployed or wired into the legacy studio; retained-model browser switching and progressive tiled rendering remain open.
+**Status: annual atlas diagnostics implemented.** Natural, heightmap, climate, biomes, precipitation, aridity, temperature, continentality, drainage, wind, and lithology modes share one canonical world in offline renders. Adaptive coast-only supersampling reduces raster stair steps without globally multiplying render cost. The new simulator is not deployed or wired into the legacy studio; retained-model browser switching and progressive tiled rendering remain open.
 
 Implement progressive 1K–10K rendering, model/tile caches, style separation, and export encoding. Run the public and hidden suites, human pairwise tests, Earth epochs, and private fantasy-reference analysis. Tune initial-condition priors and snapshot selection without violating physical gates.
 
@@ -573,7 +585,7 @@ The near-term product spine is deliberately narrower than the complete reference
 
 1. Improve canonical surface elevation, bathymetry, shelves, coast antialiasing, and drainage density without changing macro-land authority.
 2. Calibrate the implemented land distance-to-ocean and continentality fields; improve pressure-informed winds and orographic precipitation while retaining an explicitly reduced climate fidelity label.
-3. Derive inspectable aridity and biome classes from continuous annual fields, with classification tests that cannot mutate climate or coast state.
+3. Calibrate the implemented aridity and biome classes against Earth-derived ranges and diverse accepted seeds without allowing classification to mutate climate or coast state.
 4. Retain one simulated surface in a worker and switch diagnostic modes, atlas/globe projection, and style without regeneration.
 5. Calibrate whole-world composition and resolved detail against Earth epochs, synthetic fixtures, the Malazan-inspired private aesthetic targets, and the catalogued external simulator references.
 
