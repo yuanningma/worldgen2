@@ -48,6 +48,39 @@ test("terrane geology produces distinct rock provinces with closed area accounti
     <= Math.max(1e-9, surface.stats.erodedVolumeKm3 * 1e-12));
 });
 
+test("spherical circulation creates longitudinal rainfall structure and orographic enhancement", () => {
+  const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
+  const land = surface.cells.filter((cell) => cell.isLand);
+  assert.ok(land.every((cell) => Number.isFinite(cell.atmosphericMoisture)
+    && cell.atmosphericMoisture >= 0
+    && cell.atmosphericMoisture <= 1));
+  assert.ok(land.every((cell) => Number.isFinite(cell.orographicLiftKm) && cell.orographicLiftKm >= 0));
+  assert.ok(surface.stats.meanLandPrecipitationMPerYear > 0.2);
+  assert.ok(surface.stats.meanLandPrecipitationMPerYear < 2.5);
+  assert.ok(surface.stats.aridLandFraction > 0 && surface.stats.aridLandFraction < 0.9);
+  assert.ok(surface.stats.humidLandFraction > 0 && surface.stats.humidLandFraction < 0.8);
+  assert.ok(surface.stats.maximumOrographicLiftKm > 0.1);
+
+  const latitudeBins = new Map();
+  for (const cell of land) {
+    const z = surface.sphere.faces[cell.faceId].center[2];
+    const bin = Math.floor((z + 1) * 8);
+    const values = latitudeBins.get(bin) ?? [];
+    values.push(cell.precipitationMPerYear);
+    latitudeBins.set(bin, values);
+  }
+  const maximumWithinBeltSpread = Math.max(...[...latitudeBins.values()]
+    .filter((values) => values.length >= 20)
+    .map((values) => Math.max(...values) - Math.min(...values)));
+  assert.ok(maximumWithinBeltSpread > 0.45);
+
+  const lifted = land.filter((cell) => cell.orographicLiftKm > 0.12);
+  const unlifted = land.filter((cell) => cell.orographicLiftKm < 0.015);
+  assert.ok(lifted.length > 0 && unlifted.length > 0);
+  const mean = (cells) => cells.reduce((sum, cell) => sum + cell.precipitationMPerYear, 0) / cells.length;
+  assert.ok(mean(lifted) > mean(unlifted));
+});
+
 test("Priority-Flood drainage is local, acyclic, and reaches the ocean", () => {
   const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
   const neighbors = surface.sphere.faces.map(() => new Set());

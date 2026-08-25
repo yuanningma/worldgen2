@@ -48,6 +48,10 @@ export interface SurfaceProcessCell {
   readonly fillDepthKm: number;
   readonly temperatureC: number;
   readonly precipitationMPerYear: number;
+  /** Advected atmospheric moisture after local precipitation loss, in [0, 1]. */
+  readonly atmosphericMoisture: number;
+  /** Positive upwind terrain rise used by the reduced orographic model. */
+  readonly orographicLiftKm: number;
   readonly lithology: SurfaceLithology;
   /** Dimensionless resistance to fluvial and diffusive erosion, in [0, 1]. */
   readonly erosionResistance: number;
@@ -75,6 +79,8 @@ export interface SurfacePresentationSample {
   readonly coastDistanceKm: number;
   readonly temperatureC: number;
   readonly precipitationMPerYear: number;
+  readonly atmosphericMoisture: number;
+  readonly orographicLiftKm: number;
   readonly lithology: SurfaceLithology;
   readonly erosionResistance: number;
   /** Stable world-space detail used for albedo modulation, in [-1, 1]. */
@@ -105,6 +111,11 @@ export interface SurfaceProcessStats {
   readonly meanLandErosionResistance: number;
   readonly lithologyAreaKm2: Readonly<Record<SurfaceLithology, number>>;
   readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
+  readonly meanLandTemperatureC: number;
+  readonly meanLandPrecipitationMPerYear: number;
+  readonly aridLandFraction: number;
+  readonly humidLandFraction: number;
+  readonly maximumOrographicLiftKm: number;
 }
 
 export interface SurfaceProcessWorld {
@@ -129,7 +140,20 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   dischargeKm3PerYear: number;
   erodedThicknessKm: number;
   depositedThicknessKm: number;
+  temperatureC: number;
+  precipitationMPerYear: number;
+  atmosphericMoisture: number;
+  orographicLiftKm: number;
+  localRunoffKm3PerYear: number;
   floodOrder: number;
+}
+
+interface SurfaceClimateStats {
+  readonly meanLandTemperatureC: number;
+  readonly meanLandPrecipitationMPerYear: number;
+  readonly aridLandFraction: number;
+  readonly humidLandFraction: number;
+  readonly maximumOrographicLiftKm: number;
 }
 
 interface DrainageResult {
@@ -504,21 +528,190 @@ function exactFaceAtPoint(
   return nearest;
 }
 
-function climateAt(point: Vec3, elevationAboveSeaKm: number, seed: number): {
-  temperatureC: number;
-  precipitationMPerYear: number;
-} {
+function prevailingWindAt(point: Vec3): Vec3 {
   const latitude = Math.asin(clamp(point[2], -1, 1));
   const absoluteLatitude = Math.abs(latitude);
-  const temperatureC = 29 - absoluteLatitude / (Math.PI / 2) * 51 - Math.max(0, elevationAboveSeaKm) * 6.1;
-  const equatorial = Math.exp(-((absoluteLatitude / 0.29) ** 2));
-  const subtropical = Math.exp(-(((absoluteLatitude - 0.48) / 0.17) ** 2));
-  const stormTrack = Math.exp(-(((absoluteLatitude - 0.93) / 0.25) ** 2));
-  const texture = clamp(0.82 + sphericalNoise(point, seed + 911) * 0.28, 0.45, 1.35);
-  const orographic = 1 + clamp(elevationAboveSeaKm / 5, 0, 1) * 0.32;
+  const horizontal = Math.hypot(point[0], point[1]);
+  const east: Vec3 = horizontal > 1e-8
+    ? [-point[1] / horizontal, point[0] / horizontal, 0]
+    : [0, 1, 0];
+  const north: Vec3 = horizontal > 1e-8
+    ? normalize3([
+      -point[0] * point[2],
+      -point[1] * point[2],
+      horizontal * horizontal,
+    ])
+    : [1, 0, 0];
+  const trades = Math.exp(-((absoluteLatitude / 0.43) ** 4));
+  const westerlies = Math.exp(-(((absoluteLatitude - 0.82) / 0.28) ** 2));
+  const polarEasterlies = Math.exp(-(((absoluteLatitude - 1.37) / 0.22) ** 2));
+  const hemisphere = latitude >= 0 ? 1 : -1;
+  const zonal = -trades + westerlies * 1.12 - polarEasterlies * 0.72;
+  const meridional = hemisphere * (-trades * 0.3 + westerlies * 0.16 - polarEasterlies * 0.1);
+  return normalize3([
+    east[0] * zonal + north[0] * meridional,
+    east[1] * zonal + north[1] * meridional,
+    east[2] * zonal + north[2] * meridional,
+  ]);
+}
+
+function createUpwindTransport(
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+): readonly (readonly { readonly faceId: number; readonly weight: number }[])[] {
+  return sphere.faces.map((face) => {
+    const wind = prevailingWindAt(face.center);
+    const candidates = adjacency[face.id].map((neighborId) => {
+      const neighbor = sphere.faces[neighborId].center;
+      const cosine = clamp(dot3(face.center, neighbor), -1, 1);
+      const incoming: Vec3 = normalize3([
+        face.center[0] * cosine - neighbor[0],
+        face.center[1] * cosine - neighbor[1],
+        face.center[2] * cosine - neighbor[2],
+      ]);
+      const alignment = Math.max(0, dot3(incoming, wind));
+      return { faceId: neighborId, weight: alignment ** 3.5 };
+    });
+    let total = candidates.reduce((sum, candidate) => sum + candidate.weight, 0);
+    if (total < 1e-9) {
+      total = candidates.length;
+      return candidates.map((candidate) => ({ faceId: candidate.faceId, weight: 1 / total }));
+    }
+    const retained = candidates.filter((candidate) => candidate.weight > total * 0.015);
+    const retainedTotal = retained.reduce((sum, candidate) => sum + candidate.weight, 0);
+    return retained.map((candidate) => ({
+      faceId: candidate.faceId,
+      weight: candidate.weight / retainedTotal,
+    }));
+  });
+}
+
+function simulateSurfaceClimate(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  seaLevelKm: number,
+  radiusKm: number,
+  seed: number,
+): SurfaceClimateStats {
+  const upwind = createUpwindTransport(sphere, adjacency);
+  const elevationAboveSea = Float64Array.from(cells.map((cell) => (
+    cell.isLand ? Math.max(0, cell.elevationKm - seaLevelKm) : 0
+  )));
+  const humidity = new Float64Array(cells.length);
+  const saturation = new Float64Array(cells.length);
+  const equatorialConvection = new Float64Array(cells.length);
+  const stormTrack = new Float64Array(cells.length);
+  const subtropicalSubsidence = new Float64Array(cells.length);
+  const orographicLift = new Float64Array(cells.length);
+  for (const cell of cells) {
+    const latitude = Math.asin(clamp(sphere.faces[cell.faceId].center[2], -1, 1));
+    const absoluteLatitude = Math.abs(latitude);
+    const temperatureNoise = sphericalNoise(sphere.faces[cell.faceId].center, seed + 12_421) * 1.45;
+    cell.temperatureC = 29.5
+      - Math.abs(latitude) / (Math.PI / 2) * 51.5
+      - elevationAboveSea[cell.faceId] * 6.05
+      + temperatureNoise;
+    saturation[cell.faceId] = clamp(0.62 + cell.temperatureC * 0.011, 0.34, 0.96);
+    humidity[cell.faceId] = cell.isLand ? saturation[cell.faceId] * 0.18 : saturation[cell.faceId];
+    equatorialConvection[cell.faceId] = Math.exp(-((absoluteLatitude / 0.3) ** 2));
+    stormTrack[cell.faceId] = Math.exp(-(((absoluteLatitude - 0.92) / 0.24) ** 2));
+    subtropicalSubsidence[cell.faceId] = Math.exp(-(((absoluteLatitude - 0.5) / 0.16) ** 2));
+  }
+  for (const cell of cells) {
+    let incomingElevation = 0;
+    for (const input of upwind[cell.faceId]) {
+      incomingElevation += elevationAboveSea[input.faceId] * input.weight;
+    }
+    orographicLift[cell.faceId] = cell.isLand
+      ? Math.max(0, elevationAboveSea[cell.faceId] - incomingElevation)
+      : 0;
+  }
+
+  const transportPasses = 36;
+  for (let pass = 0; pass < transportPasses; pass += 1) {
+    const next = new Float64Array(cells.length);
+    for (const cell of cells) {
+      const inputs = upwind[cell.faceId];
+      let incomingMoisture = 0;
+      for (const input of inputs) {
+        incomingMoisture += humidity[input.faceId] * input.weight;
+      }
+      const lift = orographicLift[cell.faceId];
+      const precipitationLoss = clamp(
+        0.01
+          + equatorialConvection[cell.faceId] * 0.055
+          + stormTrack[cell.faceId] * 0.04
+          + lift * 0.12,
+        0.008,
+        0.46,
+      );
+      if (!cell.isLand) {
+        next[cell.faceId] = incomingMoisture * 0.22 + saturation[cell.faceId] * 0.78;
+      } else {
+        const warmRecycle = clamp((cell.temperatureC + 8) / 38, 0, 1) * 0.022;
+        next[cell.faceId] = clamp(incomingMoisture * (1 - precipitationLoss) + warmRecycle, 0.008, 0.98);
+      }
+    }
+    humidity.set(next);
+  }
+
+  let landArea = 0;
+  let temperatureAreaSum = 0;
+  let precipitationAreaSum = 0;
+  let aridArea = 0;
+  let humidArea = 0;
+  let maximumOrographicLiftKm = 0;
+  const radiusSquared = radiusKm ** 2;
+  for (const cell of cells) {
+    const inputs = upwind[cell.faceId];
+    let incomingMoisture = 0;
+    for (const input of inputs) {
+      incomingMoisture += humidity[input.faceId] * input.weight;
+    }
+    const point = sphere.faces[cell.faceId].center;
+    const lift = orographicLift[cell.faceId];
+    const texture = clamp(0.9 + sphericalNoise(point, seed + 911) * 0.12, 0.72, 1.18);
+    const precipitation = clamp(
+      (0.1 + incomingMoisture * (
+        0.92
+        + equatorialConvection[cell.faceId] * 1.8
+        + stormTrack[cell.faceId]
+        + lift * 2
+        - subtropicalSubsidence[cell.faceId] * 0.22
+      )) * texture,
+      0.045,
+      4.8,
+    );
+    cell.atmosphericMoisture = humidity[cell.faceId];
+    cell.orographicLiftKm = lift;
+    cell.precipitationMPerYear = precipitation;
+    maximumOrographicLiftKm = Math.max(maximumOrographicLiftKm, lift);
+    const areaKm2 = sphere.faces[cell.faceId].areaSteradians * radiusSquared;
+    const frozenFraction = clamp((-cell.temperatureC + 2) / 22, 0, 0.72);
+    const mountainEnvelope = clamp((elevationAboveSea[cell.faceId] - 0.25) / 4.5);
+    const runoffCoefficient = clamp(
+      0.34 + precipitation * 0.14 + mountainEnvelope * 0.18 - frozenFraction * 0.12,
+      0.2,
+      0.84,
+    );
+    cell.localRunoffKm3PerYear = cell.isLand
+      ? precipitation * areaKm2 / 1000 * runoffCoefficient
+      : 0;
+    if (!cell.isLand) continue;
+    const area = sphere.faces[cell.faceId].areaSteradians;
+    landArea += area;
+    temperatureAreaSum += cell.temperatureC * area;
+    precipitationAreaSum += precipitation * area;
+    if (precipitation < 0.42) aridArea += area;
+    if (precipitation > 1.55) humidArea += area;
+  }
   return {
-    temperatureC,
-    precipitationMPerYear: clamp((0.42 + equatorial * 1.85 + stormTrack * 0.9 - subtropical * 0.48) * texture * orographic, 0.08, 4.2),
+    meanLandTemperatureC: temperatureAreaSum / Math.max(landArea, Number.EPSILON),
+    meanLandPrecipitationMPerYear: precipitationAreaSum / Math.max(landArea, Number.EPSILON),
+    aridLandFraction: aridArea / Math.max(landArea, Number.EPSILON),
+    humidLandFraction: humidArea / Math.max(landArea, Number.EPSILON),
+    maximumOrographicLiftKm,
   };
 }
 
@@ -732,13 +925,7 @@ export function createSurfaceProcessWorld(
     const elevationKm = refined.isLand
       ? Math.max(tectonicWorld.seaLevelKm + 0.002, refined.elevationKm + detail)
       : Math.min(tectonicWorld.seaLevelKm - 0.002, refined.elevationKm + detail);
-    const climate = climateAt(face.center, elevationKm - tectonicWorld.seaLevelKm, hashedSeed);
     const areaKm2 = face.areaSteradians * radiusSquared;
-    const frozenFraction = clamp((-climate.temperatureC + 2) / 22, 0, 0.72);
-    const runoffCoefficient = clamp(0.36 + climate.precipitationMPerYear * 0.13 + mountainEnvelope * 0.18 - frozenFraction * 0.12, 0.22, 0.82);
-    const localRunoffKm3PerYear = refined.isLand
-      ? climate.precipitationMPerYear * areaKm2 / 1000 * runoffCoefficient
-      : 0;
     return {
       faceId: face.id,
       canonicalFaceId,
@@ -747,19 +934,30 @@ export function createSurfaceProcessWorld(
       coastDistanceKm: refined.isLand ? 0 : Infinity,
       filledElevationKm: elevationKm,
       fillDepthKm: 0,
-      temperatureC: climate.temperatureC,
-      precipitationMPerYear: climate.precipitationMPerYear,
+      temperatureC: 0,
+      precipitationMPerYear: 0,
+      atmosphericMoisture: 0,
+      orographicLiftKm: 0,
       lithology: geology.lithology,
       erosionResistance: geology.erosionResistance,
-      localRunoffKm3PerYear,
+      localRunoffKm3PerYear: 0,
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
       receiverFaceId: null,
       drainageAreaKm2: refined.isLand ? areaKm2 : 0,
-      dischargeKm3PerYear: localRunoffKm3PerYear,
+      dischargeKm3PerYear: 0,
       floodOrder: -1,
     };
   });
+
+  const climateStats = simulateSurfaceClimate(
+    cells,
+    sphere,
+    adjacency,
+    tectonicWorld.seaLevelKm,
+    tectonicWorld.recipe.radiusKm,
+    hashedSeed,
+  );
 
   const initialDrainage = routeSurfaceHydrology(
     cells,
@@ -836,6 +1034,8 @@ export function createSurfaceProcessWorld(
     fillDepthKm: cell.fillDepthKm,
     temperatureC: cell.temperatureC,
     precipitationMPerYear: cell.precipitationMPerYear,
+    atmosphericMoisture: cell.atmosphericMoisture,
+    orographicLiftKm: cell.orographicLiftKm,
     lithology: cell.lithology,
     erosionResistance: cell.erosionResistance,
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
@@ -866,6 +1066,8 @@ export function createSurfaceProcessWorld(
     let coastDistanceKm = 0;
     let temperatureC = 0;
     let precipitationMPerYear = 0;
+    let atmosphericMoisture = 0;
+    let orographicLiftKm = 0;
     let erosionResistance = 0;
     for (const faceId of candidates) {
       const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
@@ -875,12 +1077,16 @@ export function createSurfaceProcessWorld(
       coastDistanceKm += (Number.isFinite(cell.coastDistanceKm) ? cell.coastDistanceKm : 0) * weight;
       temperatureC += cell.temperatureC * weight;
       precipitationMPerYear += cell.precipitationMPerYear * weight;
+      atmosphericMoisture += cell.atmosphericMoisture * weight;
+      orographicLiftKm += cell.orographicLiftKm * weight;
       erosionResistance += cell.erosionResistance * weight;
     }
     elevationKm /= totalWeight;
     coastDistanceKm /= totalWeight;
     temperatureC /= totalWeight;
     precipitationMPerYear /= totalWeight;
+    atmosphericMoisture /= totalWeight;
+    orographicLiftKm /= totalWeight;
     erosionResistance /= totalWeight;
     const gradient: [number, number, number] = [0, 0, 0];
     for (const faceId of candidates) {
@@ -927,6 +1133,8 @@ export function createSurfaceProcessWorld(
       coastDistanceKm: refined.isLand ? 0 : coastDistanceKm,
       temperatureC,
       precipitationMPerYear,
+      atmosphericMoisture,
+      orographicLiftKm,
       lithology: immutableCells[nearestMatchingId].lithology,
       erosionResistance,
       surfaceTexture,
@@ -962,6 +1170,7 @@ export function createSurfaceProcessWorld(
         areas[cell.lithology] += sphere.faces[cell.faceId].areaSteradians * radiusSquared;
         return areas;
       }, emptyLithologyRecord()),
+      ...climateStats,
       ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],
