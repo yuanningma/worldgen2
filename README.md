@@ -49,6 +49,7 @@ The replacement geology core is being developed separately from the current visu
 - a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
 - synchronized natural, heightmap, climate, biomes, precipitation, aridity, temperature, continentality, drainage, wind, and lithology diagnostics that all read the same canonical world instead of regenerating geography;
 - five bounded coastline wavelength bands plus deterministic world-space fine relief and albedo detail that reveal smaller features at larger output sizes without introducing raster-dependent geography.
+- two renderer-only natural presentation styles: a flat illustrated atlas for judging world composition and a restrained physical relief view for inspecting terrain and bathymetry without changing geography.
 
 Generate and evaluate worlds without starting or deploying the web app:
 
@@ -65,6 +66,8 @@ npm run render:tectonic-surface -- --seed=ATLAS-A --subdivisions=5
 npm run render:surface-process -- --model=coupled --seed=ATLAS-A --subdivisions=5 --surface-subdivisions=6
 npm run render:surface-process -- --quality=high --model=coupled --seed=ATLAS-A
 npm run render:surface-process -- --quality=ultra --model=coupled --seed=ATLAS-A
+npm run render:surface-process -- --style=atlas --quality=high --seed=ATLAS-A
+npm run render:surface-process -- --style=relief --quality=high --seed=ATLAS-A
 npm run render:surface-process -- --quality=ultra --coast-octaves=5 --presentation-samples=12 --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=heightmap --quality=preview --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=climate --quality=preview --seed=ATLAS-A
@@ -77,6 +80,8 @@ npm run review:surface-atlas -- --input=outputs/tectonics/surface-process-world.
 ```
 
 The review command preserves native pixels in four regional crops and also writes a compact 2×2 contact sheet. Use it with a 4096×2048 or 8192×4096 atlas before judging coastline hierarchy, river widths, or relief detail from a downscaled whole-world image.
+
+`--style=atlas` is the current aesthetic-development default. It uses a flat pale ocean, a thin ink coastline, categorical climate/elevation colors, and restrained rivers so silhouette and regional composition remain legible. `--style=relief` uses continuous hypsometry, local terrain shading, and a narrow dark shelf ramp. The style choice is presentation-only: it never changes the canonical land mask, elevation, climate, lakes, or drainage network.
 
 The implementation roadmap is in [the comprehensive simulator plan](./docs/COMPREHENSIVE_WORLD_SIMULATOR_PLAN.md). The fixed history remains the stable reference, and `simulateMovingCrustSnapshot` remains the exact parcel-remap conformance path. `simulateCoupledTectonicWorld` is the first feedback model: an explicit finite-volume step transports material only across adjacent spherical faces, retains fractional continental and plate mixtures, feeds moved state into later rifting/collision, reports ridge-creation and subduction budgets, and applies area-preserving VOF interface compression to limit long-horizon diffusion. Initial continental lobes now remain distinct provenance terranes instead of being flattened into one homogeneous region; their direct elevation influence is deliberately bounded so terrane sutures cannot merge macro-landmasses merely for visual complexity. The evaluator rejects nonlocal parcel transport, fine-only coast noise, insufficient continent hierarchy, oversized dominant landmasses, polar land concentration, and near-circumpolar zonal belts. `createSurfaceProcessWorld` promotes an accepted tectonic state to a nested spherical process mesh and derives a closed drainage graph without changing canonical topology. Its continuous sampler decouples output resolution from process-cell density; `preview`, `high`, and `ultra` currently mean 2048×1024, 4096×2048, and 8192×4096. High-resolution rendering adds resolved visual detail but intentionally does not invent new continents or alter drainage topology. Surface geology distinguishes crystalline, metamorphic, volcanic, carbonate, sedimentary, and oceanic-basalt units; resistance modulates relief and incision, and both area and eroded volume close by lithology. Reduced atmospheric circulation now advects ocean moisture through spherical trade-wind, westerly, and polar belts, with explicit uplift loss and downwind rain shadows. It is an annualized moisture model, not a seasonal general-circulation model. The geomorphic pass still does not model time-varying climate, hillslope diffusion, flexural/isostatic feedback, explicit lake stratigraphy, or dynamic deltas. The coupled model also still lacks persistent parcel identities through creation/destruction, overlap-area remapping, and plate splits/mergers.
 

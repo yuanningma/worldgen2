@@ -8,6 +8,10 @@ import {
   type SurfaceLithology,
 } from "../lib/tectonics/surfaceProcess.ts";
 import {
+  naturalSurfaceColor,
+  type SurfacePresentationStyle,
+} from "../lib/tectonics/surfaceStyle.ts";
+import {
   simulateCoupledTectonicWorld,
   simulateTectonicWorld,
 } from "../lib/tectonics/worldSimulation.ts";
@@ -130,6 +134,7 @@ function climateBucketColor(
 
 function color(
   mapMode: SurfaceMapMode,
+  presentationStyle: SurfacePresentationStyle,
   isLand: boolean,
   isLake: boolean,
   elevationAboveSeaKm: number,
@@ -204,34 +209,18 @@ function color(
     const thematicShade = isLand ? clamp(shade, 0.82, 1.12) : 0.72;
     return base.map((channel) => Math.round(clamp(channel * thematicShade, 0, 255))) as unknown as readonly [number, number, number];
   }
-  let base: readonly [number, number, number];
-  if (isLake) {
-    base = mix([91, 163, 194], [36, 102, 151], clamp(elevationAboveSeaKm / 4));
-  } else if (!isLand) {
-    const shelf = clamp(coastDistanceKm / 520);
-    base = shelf < 0.42
-      ? mix([128, 185, 207], [42, 108, 151], shelf / 0.42)
-      : mix([42, 108, 151], [8, 32, 66], (shelf - 0.42) / 0.58);
-  } else if (elevationAboveSeaKm > 4.8 || temperatureC < -13) {
-    base = [238, 236, 220];
-  } else if (elevationAboveSeaKm > 2.2) {
-    base = mix([177, 139, 91], [216, 200, 169], (elevationAboveSeaKm - 2.2) / 2.6);
-  } else if (precipitationMPerYear < 0.42 && temperatureC > 4) {
-    base = [210, 181, 111];
-  } else if (precipitationMPerYear > 1.55 && temperatureC > 2) {
-    base = [74, 128, 76];
-  } else if (temperatureC < 1) {
-    base = [164, 177, 145];
-  } else {
-    base = [137, 166, 105];
-  }
-  if (isLand && !isLake) {
-    const snowOrIce = elevationAboveSeaKm > 4.8 || temperatureC < -13;
-    base = mix(base, LITHOLOGY_TINTS[lithology], snowOrIce ? 0.045 : 0.14);
-  }
-  const textureShade = 1 + surfaceTexture
-    * (isLand && !isLake ? 0.021 + erosionResistance * 0.014 : 0.008);
-  return base.map((channel) => Math.round(clamp(channel * shade * textureShade, 0, 255))) as unknown as readonly [number, number, number];
+  return naturalSurfaceColor(presentationStyle, {
+    isLand,
+    isLake,
+    elevationAboveSeaKm,
+    coastDistanceKm,
+    temperatureC,
+    precipitationMPerYear,
+    lithology,
+    erosionResistance,
+    shade,
+    surfaceTexture,
+  });
 }
 
 function escapeXml(value: string): string {
@@ -316,6 +305,7 @@ function drawRiverCurve(
   to: readonly [number, number],
   next: readonly [number, number] | null,
   strength: number,
+  ink: readonly [number, number, number],
 ): void {
   const p1: readonly [number, number] = from;
   const p2: readonly [number, number] = [unwrapX(to[0], p1[0], width), to[1]];
@@ -348,7 +338,7 @@ function drawRiverCurve(
       h00 * p1[0] + h10 * m1[0] + h01 * p2[0] + h11 * m2[0],
       h00 * p1[1] + h10 * m1[1] + h01 * p2[1] + h11 * m2[1],
     ];
-    drawAntiAliasedSegment(pixels, width, height, last, point, strength);
+    drawAntiAliasedSegment(pixels, width, height, last, point, strength, ink);
     last = point;
   }
 }
@@ -362,6 +352,11 @@ if (!MAP_MODES.includes(mapModeOption as SurfaceMapMode)) {
   throw new RangeError(`--map-mode must be ${MAP_MODES.join(", ")}`);
 }
 const mapMode = mapModeOption as SurfaceMapMode;
+const presentationStyleOption = option("style") ?? "atlas";
+if (presentationStyleOption !== "atlas" && presentationStyleOption !== "relief") {
+  throw new RangeError("--style must be atlas or relief");
+}
+const presentationStyle = presentationStyleOption as SurfacePresentationStyle;
 const qualityWidth = QUALITY_WIDTHS[quality as keyof typeof QUALITY_WIDTHS];
 const width = Math.max(512, Math.round(numberOption("width", qualityWidth)));
 const height = Math.max(256, Math.round(numberOption("height", width / 2)));
@@ -401,6 +396,7 @@ const coastSamples = Math.round(clamp(
 function renderColorAt(longitude: number, latitude: number): {
   readonly rgb: readonly [number, number, number];
   readonly coastDistanceKm: number;
+  readonly isLand: boolean;
 } {
   const radial = Math.cos(latitude);
   const point: readonly [number, number, number] = [
@@ -418,9 +414,11 @@ function renderColorAt(longitude: number, latitude: number): {
   const lightSlope = cell.terrainGradient[0] * (east[0] * -0.58 + north[0] * 0.82)
     + cell.terrainGradient[1] * (east[1] * -0.58 + north[1] * 0.82)
     + cell.terrainGradient[2] * (east[2] * -0.58 + north[2] * 0.82);
-  const terrainShade = cell.isLand
-    ? clamp(0.98 - lightSlope * 13, 0.7, 1.2)
-    : clamp(0.99 - lightSlope * 2.2, 0.92, 1.05);
+  const terrainShade = presentationStyle === "atlas"
+    ? 1
+    : cell.isLand
+      ? clamp(0.99 - lightSlope * 10, 0.79, 1.15)
+      : clamp(1 - lightSlope * 1.2, 0.96, 1.025);
   const windEast = cell.prevailingWind[0] * east[0]
     + cell.prevailingWind[1] * east[1]
     + cell.prevailingWind[2] * east[2];
@@ -430,6 +428,7 @@ function renderColorAt(longitude: number, latitude: number): {
   return {
     rgb: color(
       mapMode,
+      presentationStyle,
       cell.isLand,
       cell.isLake,
       cell.elevationKm - world.seaLevelKm,
@@ -449,10 +448,12 @@ function renderColorAt(longitude: number, latitude: number): {
       cell.surfaceTexture,
     ),
     coastDistanceKm: cell.coastDistanceKm,
+    isLand: cell.isLand,
   };
 }
 
 const pixels = Buffer.allocUnsafe(width * height * 4);
+const landMask = new Uint8Array(width * height);
 for (let y = 0; y < height; y += 1) {
   const latitude = Math.PI / 2 - (y + 0.5) / height * Math.PI;
   for (let x = 0; x < width; x += 1) {
@@ -492,8 +493,28 @@ for (let y = 0; y < height; y += 1) {
     pixels[index + 1] = rgb[1];
     pixels[index + 2] = rgb[2];
     pixels[index + 3] = 255;
+    landMask[y * width + x] = center.isLand ? 1 : 0;
   }
   if (y > 0 && y % 128 === 0) process.stdout.write(`sampled ${y}/${height} rows\n`);
+}
+
+if (mapMode === "natural") {
+  const coastInk: readonly [number, number, number] = presentationStyle === "atlas"
+    ? [79, 91, 84]
+    : [22, 43, 54];
+  const coastStrength = presentationStyle === "atlas" ? 0.7 : 0.46;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      if (landMask[y * width + x] === 0) continue;
+      const west = landMask[y * width + ((x - 1 + width) % width)] === 0;
+      const east = landMask[y * width + ((x + 1) % width)] === 0;
+      const north = y > 0 && landMask[(y - 1) * width + x] === 0;
+      const south = y + 1 < height && landMask[(y + 1) * width + x] === 0;
+      if (west || east || north || south) {
+        blendPixel(pixels, width, height, x, y, coastStrength, coastInk);
+      }
+    }
+  }
 }
 
 if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage") {
@@ -518,10 +539,15 @@ if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || ma
       ? longitudeLatitude(surface.sphere.faces[nextRiver.toFaceId].center, width, height)
       : null;
     const strength = clamp(
-      0.34 + Math.log2(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2)) * 0.085,
-      0.34,
-      0.82,
+      (presentationStyle === "atlas" ? 0.26 : 0.31)
+        + Math.log2(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2))
+        * (presentationStyle === "atlas" ? 0.065 : 0.078),
+      presentationStyle === "atlas" ? 0.26 : 0.31,
+      presentationStyle === "atlas" ? 0.68 : 0.78,
     );
+    const riverInk: readonly [number, number, number] = presentationStyle === "atlas"
+      ? [75, 121, 171]
+      : [31, 92, 139];
     drawRiverCurve(
       pixels,
       width,
@@ -531,6 +557,7 @@ if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || ma
       longitudeLatitude(to, width, height),
       next,
       strength,
+      riverInk,
     );
   }
 }
@@ -585,7 +612,7 @@ const header = Buffer.from([
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${headerHeight}">`,
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">${mapMode.toUpperCase()} MODE · ${escapeXml(seed)}</text>`,
-  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
+  `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${presentationStyle.toUpperCase()} STYLE · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
   `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));

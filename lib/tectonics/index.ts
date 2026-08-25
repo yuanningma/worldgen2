@@ -103,3 +103,9 @@ export {
   type SurfaceProcessWorld,
   type SurfaceRiverSegment,
 } from "./surfaceProcess.ts";
+
+export {
+  naturalSurfaceColor,
+  type NaturalSurfaceColorInput,
+  type SurfacePresentationStyle,
+} from "./surfaceStyle.ts";
