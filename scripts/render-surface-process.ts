@@ -31,6 +31,18 @@ const QUALITY_WIDTHS = {
   ultra: 8192,
 } as const;
 
+const MAP_MODES = [
+  "natural",
+  "heightmap",
+  "climate",
+  "precipitation",
+  "temperature",
+  "wind",
+  "lithology",
+] as const;
+
+type SurfaceMapMode = typeof MAP_MODES[number];
+
 const LITHOLOGY_TINTS: Readonly<Record<SurfaceLithology, readonly [number, number, number]>> = {
   "oceanic-basalt": [78, 103, 111],
   crystalline: [124, 142, 112],
@@ -61,7 +73,40 @@ function mix(a: readonly number[], b: readonly number[], amount: number): readon
   return a.map((value, index) => Math.round(value + (b[index] - value) * clamp(amount))) as unknown as readonly [number, number, number];
 }
 
+function hsvToRgb(hue: number, saturation: number, value: number): readonly [number, number, number] {
+  const h = ((hue % 1) + 1) % 1 * 6;
+  const sector = Math.floor(h);
+  const fraction = h - sector;
+  const chroma = value * saturation;
+  const x = chroma * (1 - Math.abs((h % 2) - 1));
+  const offset = value - chroma;
+  const rgb = sector === 0 ? [chroma, x, 0]
+    : sector === 1 ? [x, chroma, 0]
+      : sector === 2 ? [0, chroma, x]
+        : sector === 3 ? [0, x, chroma]
+          : sector === 4 ? [x, 0, chroma]
+            : [chroma, 0, x];
+  return rgb.map((channel) => Math.round((channel + offset) * 255)) as unknown as readonly [number, number, number];
+}
+
+function climateBucketColor(
+  isLand: boolean,
+  temperatureC: number,
+  precipitationMPerYear: number,
+): readonly [number, number, number] {
+  if (!isLand) return [42, 93, 126];
+  if (temperatureC < -12) return [235, 239, 232];
+  if (temperatureC < 1) return precipitationMPerYear < 0.42 ? [189, 190, 166] : [140, 164, 143];
+  if (precipitationMPerYear < 0.3) return [222, 190, 115];
+  if (precipitationMPerYear < 0.58) return temperatureC > 18 ? [196, 166, 91] : [174, 168, 104];
+  if (temperatureC > 20 && precipitationMPerYear > 1.5) return [44, 112, 65];
+  if (temperatureC > 14 && precipitationMPerYear > 0.95) return [75, 135, 78];
+  if (temperatureC < 7) return [111, 143, 115];
+  return [126, 158, 88];
+}
+
 function color(
+  mapMode: SurfaceMapMode,
   isLand: boolean,
   elevationAboveSeaKm: number,
   coastDistanceKm: number,
@@ -69,9 +114,43 @@ function color(
   precipitationMPerYear: number,
   lithology: SurfaceLithology,
   erosionResistance: number,
+  atmosphericMoisture: number,
+  windEast: number,
+  windNorth: number,
   shade: number,
   surfaceTexture: number,
 ): readonly [number, number, number] {
+  if (mapMode === "heightmap") {
+    const value = elevationAboveSeaKm < 0
+      ? clamp(0.5 + elevationAboveSeaKm / 16, 0, 0.5)
+      : clamp(0.5 + elevationAboveSeaKm / 12, 0.5, 1);
+    const channel = Math.round(value * 255);
+    return [channel, channel, channel];
+  }
+  if (mapMode === "temperature") {
+    const normalized = clamp((temperatureC + 30) / 65);
+    return normalized < 0.5
+      ? mix([35, 75, 145], [229, 235, 218], normalized * 2)
+      : mix([229, 235, 218], [183, 55, 39], (normalized - 0.5) * 2);
+  }
+  if (mapMode === "precipitation") {
+    const normalized = clamp(Math.log1p(precipitationMPerYear * 2.2) / Math.log1p(4.8 * 2.2));
+    return normalized < 0.45
+      ? mix([191, 154, 91], [102, 165, 153], normalized / 0.45)
+      : mix([102, 165, 153], [25, 62, 128], (normalized - 0.45) / 0.55);
+  }
+  if (mapMode === "wind") {
+    const angle = Math.atan2(windNorth, windEast);
+    return hsvToRgb(angle / (Math.PI * 2) + 0.5, 0.68, 0.52 + atmosphericMoisture * 0.34);
+  }
+  if (mapMode === "climate") {
+    return climateBucketColor(isLand, temperatureC, precipitationMPerYear);
+  }
+  if (mapMode === "lithology") {
+    const base = LITHOLOGY_TINTS[lithology];
+    const thematicShade = isLand ? clamp(shade, 0.82, 1.12) : 0.72;
+    return base.map((channel) => Math.round(clamp(channel * thematicShade, 0, 255))) as unknown as readonly [number, number, number];
+  }
   let base: readonly [number, number, number];
   if (!isLand) {
     const shelf = clamp(coastDistanceKm / 520);
@@ -116,23 +195,31 @@ function longitudeLatitude(point: readonly [number, number, number], width: numb
   return [(longitude + Math.PI) / (Math.PI * 2) * width, (Math.PI / 2 - latitude) / Math.PI * height];
 }
 
-function blendPixel(pixels: Buffer, width: number, height: number, x: number, y: number, alpha: number): void {
+function blendPixel(
+  pixels: Buffer,
+  width: number,
+  height: number,
+  x: number,
+  y: number,
+  alpha: number,
+  ink: readonly [number, number, number] = [32, 103, 151],
+): void {
   const wrappedX = ((x % width) + width) % width;
   if (y < 0 || y >= height || alpha <= 0) return;
   const index = (y * width + wrappedX) * 4;
-  const river = [32, 103, 151];
   for (let channel = 0; channel < 3; channel += 1) {
-    pixels[index + channel] = Math.round(pixels[index + channel] * (1 - alpha) + river[channel] * alpha);
+    pixels[index + channel] = Math.round(pixels[index + channel] * (1 - alpha) + ink[channel] * alpha);
   }
 }
 
-function drawRiver(
+function drawAntiAliasedSegment(
   pixels: Buffer,
   width: number,
   height: number,
   from: readonly [number, number],
   to: readonly [number, number],
   strength: number,
+  ink?: readonly [number, number, number],
 ): void {
   let x0 = from[0];
   const y0 = from[1];
@@ -151,10 +238,10 @@ function drawRiver(
     const iy = Math.floor(y);
     const fx = x - ix;
     const fy = y - iy;
-    blendPixel(pixels, width, height, ix, iy, (1 - fx) * (1 - fy) * strength);
-    blendPixel(pixels, width, height, ix + 1, iy, fx * (1 - fy) * strength);
-    blendPixel(pixels, width, height, ix, iy + 1, (1 - fx) * fy * strength);
-    blendPixel(pixels, width, height, ix + 1, iy + 1, fx * fy * strength);
+    blendPixel(pixels, width, height, ix, iy, (1 - fx) * (1 - fy) * strength, ink);
+    blendPixel(pixels, width, height, ix + 1, iy, fx * (1 - fy) * strength, ink);
+    blendPixel(pixels, width, height, ix, iy + 1, (1 - fx) * fy * strength, ink);
+    blendPixel(pixels, width, height, ix + 1, iy + 1, fx * fy * strength, ink);
   }
 }
 
@@ -162,6 +249,11 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const output = resolve(projectRoot, option("output") ?? "outputs/tectonics/surface-process-world.png");
 const quality = option("quality") ?? "high";
 if (!(quality in QUALITY_WIDTHS)) throw new RangeError("--quality must be preview, high, or ultra");
+const mapModeOption = option("map-mode") ?? "natural";
+if (!MAP_MODES.includes(mapModeOption as SurfaceMapMode)) {
+  throw new RangeError(`--map-mode must be ${MAP_MODES.join(", ")}`);
+}
+const mapMode = mapModeOption as SurfaceMapMode;
 const qualityWidth = QUALITY_WIDTHS[quality as keyof typeof QUALITY_WIDTHS];
 const width = Math.max(512, Math.round(numberOption("width", qualityWidth)));
 const height = Math.max(256, Math.round(numberOption("height", width / 2)));
@@ -216,7 +308,14 @@ for (let y = 0; y < height; y += 1) {
     const terrainShade = cell.isLand
       ? clamp(0.98 - lightSlope * 13, 0.7, 1.2)
       : clamp(0.99 - lightSlope * 2.2, 0.92, 1.05);
+    const windEast = cell.prevailingWind[0] * east[0]
+      + cell.prevailingWind[1] * east[1]
+      + cell.prevailingWind[2] * east[2];
+    const windNorth = cell.prevailingWind[0] * north[0]
+      + cell.prevailingWind[1] * north[1]
+      + cell.prevailingWind[2] * north[2];
     const rgb = color(
+      mapMode,
       cell.isLand,
       cell.elevationKm - world.seaLevelKm,
       cell.coastDistanceKm,
@@ -224,6 +323,9 @@ for (let y = 0; y < height; y += 1) {
       cell.precipitationMPerYear,
       cell.lithology,
       cell.erosionResistance,
+      cell.atmosphericMoisture,
+      windEast,
+      windNorth,
       terrainShade,
       cell.surfaceTexture,
     );
@@ -236,11 +338,57 @@ for (let y = 0; y < height; y += 1) {
   if (y > 0 && y % 128 === 0) process.stdout.write(`sampled ${y}/${height} rows\n`);
 }
 
-for (const river of surface.rivers) {
-  const from = surface.sphere.faces[river.fromFaceId].center;
-  const to = surface.sphere.faces[river.toFaceId].center;
-  const strength = clamp(0.42 + Math.log2(Math.max(1, river.drainageAreaKm2 / 650_000)) * 0.1, 0.42, 0.88);
-  drawRiver(pixels, width, height, longitudeLatitude(from, width, height), longitudeLatitude(to, width, height), strength);
+if (mapMode === "natural" || mapMode === "climate" || mapMode === "lithology") {
+  for (const river of surface.rivers) {
+    const from = surface.sphere.faces[river.fromFaceId].center;
+    const to = surface.sphere.faces[river.toFaceId].center;
+    const strength = clamp(0.42 + Math.log2(Math.max(1, river.drainageAreaKm2 / 650_000)) * 0.1, 0.42, 0.88);
+    drawAntiAliasedSegment(pixels, width, height, longitudeLatitude(from, width, height), longitudeLatitude(to, width, height), strength);
+  }
+}
+
+if (mapMode === "wind") {
+  const spacing = Math.max(36, Math.round(width / 18));
+  const arrowInk: readonly [number, number, number] = [245, 244, 228];
+  for (let y = Math.round(spacing * 0.75); y < height - spacing * 0.5; y += spacing) {
+    const latitude = Math.PI / 2 - (y + 0.5) / height * Math.PI;
+    const radial = Math.cos(latitude);
+    if (radial < 0.18) continue;
+    for (let x = Math.round(spacing * 0.5); x < width; x += spacing) {
+      const longitude = (x + 0.5) / width * Math.PI * 2 - Math.PI;
+      const point: readonly [number, number, number] = [
+        radial * Math.cos(longitude),
+        radial * Math.sin(longitude),
+        Math.sin(latitude),
+      ];
+      const sample = surface.sampleContinuous(point);
+      const east: readonly [number, number, number] = [-Math.sin(longitude), Math.cos(longitude), 0];
+      const north: readonly [number, number, number] = [
+        -Math.sin(latitude) * Math.cos(longitude),
+        -Math.sin(latitude) * Math.sin(longitude),
+        Math.cos(latitude),
+      ];
+      const windEast = sample.prevailingWind[0] * east[0]
+        + sample.prevailingWind[1] * east[1]
+        + sample.prevailingWind[2] * east[2];
+      const windNorth = sample.prevailingWind[0] * north[0]
+        + sample.prevailingWind[1] * north[1]
+        + sample.prevailingWind[2] * north[2];
+      const magnitude = Math.max(1e-12, Math.hypot(windEast, windNorth));
+      const dx = windEast / magnitude;
+      const dy = -windNorth / magnitude;
+      const length = spacing * (0.42 + sample.atmosphericMoisture * 0.14);
+      const start: readonly [number, number] = [x - dx * length * 0.48, y - dy * length * 0.48];
+      const end: readonly [number, number] = [x + dx * length * 0.48, y + dy * length * 0.48];
+      drawAntiAliasedSegment(pixels, width, height, start, end, 0.78, arrowInk);
+      const headLength = length * 0.25;
+      const headWidth = headLength * 0.58;
+      const headBaseX = end[0] - dx * headLength;
+      const headBaseY = end[1] - dy * headLength;
+      drawAntiAliasedSegment(pixels, width, height, end, [headBaseX - dy * headWidth, headBaseY + dx * headWidth], 0.78, arrowInk);
+      drawAntiAliasedSegment(pixels, width, height, end, [headBaseX + dy * headWidth, headBaseY - dx * headWidth], 0.78, arrowInk);
+    }
+  }
 }
 
 const headerHeight = 94;
@@ -248,7 +396,7 @@ const map = await image(pixels, { raw: { width, height, channels: 4 } }).png().t
 const header = Buffer.from([
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${headerHeight}">`,
   `<rect width="100%" height="100%" fill="#071721"/>`,
-  `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">SPHERICAL SURFACE PROCESSES · ${escapeXml(seed)}</text>`,
+  `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">${mapMode.toUpperCase()} MODE · ${escapeXml(seed)}</text>`,
   `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
   `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE TRANSPORT + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,

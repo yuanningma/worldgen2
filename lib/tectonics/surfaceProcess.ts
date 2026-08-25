@@ -81,6 +81,8 @@ export interface SurfacePresentationSample {
   readonly precipitationMPerYear: number;
   readonly atmosphericMoisture: number;
   readonly orographicLiftKm: number;
+  /** Unit tangent vector of the reduced annual prevailing wind field. */
+  readonly prevailingWind: Vec3;
   readonly lithology: SurfaceLithology;
   readonly erosionResistance: number;
   /** Stable world-space detail used for albedo modulation, in [-1, 1]. */
@@ -1135,6 +1137,7 @@ export function createSurfaceProcessWorld(
       precipitationMPerYear,
       atmosphericMoisture,
       orographicLiftKm,
+      prevailingWind: prevailingWindAt(point),
       lithology: immutableCells[nearestMatchingId].lithology,
       erosionResistance,
       surfaceTexture,
