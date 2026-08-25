@@ -86,6 +86,8 @@ export interface SurfacePresentationSample {
   readonly seasonalTemperatureRangeC: number;
   readonly continentality: number;
   readonly precipitationMPerYear: number;
+  readonly drainageAreaKm2: number;
+  readonly dischargeKm3PerYear: number;
   readonly atmosphericMoisture: number;
   readonly orographicLiftKm: number;
   /** Unit tangent vector of the reduced annual prevailing wind field. */
@@ -1118,6 +1120,8 @@ export function createSurfaceProcessWorld(
     let seasonalTemperatureRangeC = 0;
     let continentality = 0;
     let precipitationMPerYear = 0;
+    let drainageAreaKm2 = 0;
+    let dischargeKm3PerYear = 0;
     let atmosphericMoisture = 0;
     let orographicLiftKm = 0;
     let erosionResistance = 0;
@@ -1131,6 +1135,8 @@ export function createSurfaceProcessWorld(
       seasonalTemperatureRangeC += cell.seasonalTemperatureRangeC * weight;
       continentality += cell.continentality * weight;
       precipitationMPerYear += cell.precipitationMPerYear * weight;
+      drainageAreaKm2 += cell.drainageAreaKm2 * weight;
+      dischargeKm3PerYear += cell.dischargeKm3PerYear * weight;
       atmosphericMoisture += cell.atmosphericMoisture * weight;
       orographicLiftKm += cell.orographicLiftKm * weight;
       erosionResistance += cell.erosionResistance * weight;
@@ -1141,6 +1147,8 @@ export function createSurfaceProcessWorld(
     seasonalTemperatureRangeC /= totalWeight;
     continentality /= totalWeight;
     precipitationMPerYear /= totalWeight;
+    drainageAreaKm2 /= totalWeight;
+    dischargeKm3PerYear /= totalWeight;
     atmosphericMoisture /= totalWeight;
     orographicLiftKm /= totalWeight;
     erosionResistance /= totalWeight;
@@ -1191,6 +1199,8 @@ export function createSurfaceProcessWorld(
       seasonalTemperatureRangeC,
       continentality,
       precipitationMPerYear,
+      drainageAreaKm2,
+      dischargeKm3PerYear,
       atmosphericMoisture,
       orographicLiftKm,
       prevailingWind: prevailingWindAt(point),

@@ -202,6 +202,8 @@ test("continuous presentation sampling preserves anchors and removes cell-edge j
   assert.ok(Math.abs(Math.hypot(...first.prevailingWind) - 1) < 1e-10);
   assert.ok(Number.isFinite(first.seasonalTemperatureRangeC));
   assert.ok(first.continentality >= 0 && first.continentality <= 1);
+  assert.ok(Number.isFinite(first.drainageAreaKm2) && first.drainageAreaKm2 > 0);
+  assert.ok(Number.isFinite(first.dischargeKm3PerYear) && first.dischargeKm3PerYear >= 0);
   assert.ok(Number.isFinite(first.surfaceTexture));
   assert.ok(Math.abs(first.surfaceTexture) <= 1.0000001);
   assert.ok(Math.abs(first.surfaceTexture - second.surfaceTexture) > 1e-10);

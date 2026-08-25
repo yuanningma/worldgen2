@@ -38,6 +38,7 @@ const MAP_MODES = [
   "precipitation",
   "temperature",
   "continentality",
+  "drainage",
   "wind",
   "lithology",
 ] as const;
@@ -113,6 +114,7 @@ function color(
   temperatureC: number,
   seasonalTemperatureRangeC: number,
   precipitationMPerYear: number,
+  drainageAreaKm2: number,
   lithology: SurfaceLithology,
   erosionResistance: number,
   atmosphericMoisture: number,
@@ -145,6 +147,13 @@ function color(
     return normalized < 0.45
       ? mix([191, 154, 91], [102, 165, 153], normalized / 0.45)
       : mix([102, 165, 153], [25, 62, 128], (normalized - 0.45) / 0.55);
+  }
+  if (mapMode === "drainage") {
+    if (!isLand) return [246, 248, 246];
+    const normalized = clamp((Math.log10(Math.max(100, drainageAreaKm2)) - 2) / 5.4);
+    return normalized < 0.48
+      ? mix([241, 247, 248], [151, 210, 232], normalized / 0.48)
+      : mix([151, 210, 232], [18, 72, 138], (normalized - 0.48) / 0.52);
   }
   if (mapMode === "wind") {
     const angle = Math.atan2(windNorth, windEast);
@@ -278,11 +287,12 @@ const recipe = {
   oceanFraction: numberOption("ocean-fraction", 0.68),
 };
 const world = coupled ? simulateCoupledTectonicWorld(recipe) : simulateTectonicWorld(recipe);
+const minimumRiverAreaKm2 = numberOption("minimum-river-area-km2", 220_000);
 const surface = createSurfaceProcessWorld(world, {
   subdivisions: surfaceSubdivisions,
   reliefAmplitudeKm: numberOption("relief-amplitude-km", 0.34),
   coastOctaves: numberOption("coast-octaves", 5),
-  minimumRiverAreaKm2: numberOption("minimum-river-area-km2", 650_000),
+  minimumRiverAreaKm2,
   erosionStrengthKm: numberOption("erosion-strength-km", 0.2),
   minimumErosionAreaKm2: numberOption("minimum-erosion-area-km2", 200_000),
   presentationSampleCount: numberOption("presentation-samples", 12),
@@ -290,38 +300,43 @@ const surface = createSurfaceProcessWorld(world, {
 const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
   .filter(([lithology, area]) => lithology !== "oceanic-basalt" && area > 0)
   .length;
+const coastSamples = Math.round(clamp(
+  numberOption("coast-samples", width <= QUALITY_WIDTHS.high ? 2 : 1),
+  1,
+  4,
+));
 
-const pixels = Buffer.allocUnsafe(width * height * 4);
-for (let y = 0; y < height; y += 1) {
-  const latitude = Math.PI / 2 - (y + 0.5) / height * Math.PI;
+function renderColorAt(longitude: number, latitude: number): {
+  readonly rgb: readonly [number, number, number];
+  readonly coastDistanceKm: number;
+} {
   const radial = Math.cos(latitude);
-  for (let x = 0; x < width; x += 1) {
-    const longitude = (x + 0.5) / width * Math.PI * 2 - Math.PI;
-    const point: readonly [number, number, number] = [
-      radial * Math.cos(longitude),
-      radial * Math.sin(longitude),
-      Math.sin(latitude),
-    ];
-    const cell = surface.sampleContinuous(point);
-    const east: readonly [number, number, number] = [-Math.sin(longitude), Math.cos(longitude), 0];
-    const north: readonly [number, number, number] = [
-      -Math.sin(latitude) * Math.cos(longitude),
-      -Math.sin(latitude) * Math.sin(longitude),
-      Math.cos(latitude),
-    ];
-    const lightSlope = cell.terrainGradient[0] * (east[0] * -0.58 + north[0] * 0.82)
-      + cell.terrainGradient[1] * (east[1] * -0.58 + north[1] * 0.82)
-      + cell.terrainGradient[2] * (east[2] * -0.58 + north[2] * 0.82);
-    const terrainShade = cell.isLand
-      ? clamp(0.98 - lightSlope * 13, 0.7, 1.2)
-      : clamp(0.99 - lightSlope * 2.2, 0.92, 1.05);
-    const windEast = cell.prevailingWind[0] * east[0]
-      + cell.prevailingWind[1] * east[1]
-      + cell.prevailingWind[2] * east[2];
-    const windNorth = cell.prevailingWind[0] * north[0]
-      + cell.prevailingWind[1] * north[1]
-      + cell.prevailingWind[2] * north[2];
-    const rgb = color(
+  const point: readonly [number, number, number] = [
+    radial * Math.cos(longitude),
+    radial * Math.sin(longitude),
+    Math.sin(latitude),
+  ];
+  const cell = surface.sampleContinuous(point);
+  const east: readonly [number, number, number] = [-Math.sin(longitude), Math.cos(longitude), 0];
+  const north: readonly [number, number, number] = [
+    -Math.sin(latitude) * Math.cos(longitude),
+    -Math.sin(latitude) * Math.sin(longitude),
+    Math.cos(latitude),
+  ];
+  const lightSlope = cell.terrainGradient[0] * (east[0] * -0.58 + north[0] * 0.82)
+    + cell.terrainGradient[1] * (east[1] * -0.58 + north[1] * 0.82)
+    + cell.terrainGradient[2] * (east[2] * -0.58 + north[2] * 0.82);
+  const terrainShade = cell.isLand
+    ? clamp(0.98 - lightSlope * 13, 0.7, 1.2)
+    : clamp(0.99 - lightSlope * 2.2, 0.92, 1.05);
+  const windEast = cell.prevailingWind[0] * east[0]
+    + cell.prevailingWind[1] * east[1]
+    + cell.prevailingWind[2] * east[2];
+  const windNorth = cell.prevailingWind[0] * north[0]
+    + cell.prevailingWind[1] * north[1]
+    + cell.prevailingWind[2] * north[2];
+  return {
+    rgb: color(
       mapMode,
       cell.isLand,
       cell.elevationKm - world.seaLevelKm,
@@ -329,6 +344,7 @@ for (let y = 0; y < height; y += 1) {
       cell.temperatureC,
       cell.seasonalTemperatureRangeC,
       cell.precipitationMPerYear,
+      cell.drainageAreaKm2,
       cell.lithology,
       cell.erosionResistance,
       cell.atmosphericMoisture,
@@ -336,7 +352,46 @@ for (let y = 0; y < height; y += 1) {
       windNorth,
       terrainShade,
       cell.surfaceTexture,
+    ),
+    coastDistanceKm: cell.coastDistanceKm,
+  };
+}
+
+const pixels = Buffer.allocUnsafe(width * height * 4);
+for (let y = 0; y < height; y += 1) {
+  const latitude = Math.PI / 2 - (y + 0.5) / height * Math.PI;
+  for (let x = 0; x < width; x += 1) {
+    const longitude = (x + 0.5) / width * Math.PI * 2 - Math.PI;
+    const center = renderColorAt(longitude, latitude);
+    let rgb = center.rgb;
+    const latitudeStep = Math.PI / height;
+    const longitudeStep = Math.PI * 2 / width;
+    const pixelRadiusKm = world.recipe.radiusKm * 0.5 * Math.hypot(
+      latitudeStep,
+      longitudeStep * Math.cos(latitude),
     );
+    if (coastSamples > 1 && center.coastDistanceKm <= pixelRadiusKm * 1.45) {
+      const sum = [0, 0, 0];
+      for (let sampleY = 0; sampleY < coastSamples; sampleY += 1) {
+        for (let sampleX = 0; sampleX < coastSamples; sampleX += 1) {
+          const offsetX = (sampleX + 0.5) / coastSamples - 0.5;
+          const offsetY = (sampleY + 0.5) / coastSamples - 0.5;
+          const sample = renderColorAt(
+            longitude + offsetX * longitudeStep,
+            latitude - offsetY * latitudeStep,
+          ).rgb;
+          sum[0] += sample[0];
+          sum[1] += sample[1];
+          sum[2] += sample[2];
+        }
+      }
+      const sampleCount = coastSamples ** 2;
+      rgb = [
+        Math.round(sum[0] / sampleCount),
+        Math.round(sum[1] / sampleCount),
+        Math.round(sum[2] / sampleCount),
+      ];
+    }
     const index = (y * width + x) * 4;
     pixels[index] = rgb[0];
     pixels[index + 1] = rgb[1];
@@ -346,11 +401,15 @@ for (let y = 0; y < height; y += 1) {
   if (y > 0 && y % 128 === 0) process.stdout.write(`sampled ${y}/${height} rows\n`);
 }
 
-if (mapMode === "natural" || mapMode === "climate" || mapMode === "lithology") {
+if (mapMode === "natural" || mapMode === "climate" || mapMode === "lithology" || mapMode === "drainage") {
   for (const river of surface.rivers) {
     const from = surface.sphere.faces[river.fromFaceId].center;
     const to = surface.sphere.faces[river.toFaceId].center;
-    const strength = clamp(0.42 + Math.log2(Math.max(1, river.drainageAreaKm2 / 650_000)) * 0.1, 0.42, 0.88);
+    const strength = clamp(
+      0.34 + Math.log2(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2)) * 0.085,
+      0.34,
+      0.82,
+    );
     drawAntiAliasedSegment(pixels, width, height, longitudeLatitude(from, width, height), longitudeLatitude(to, width, height), strength);
   }
 }
