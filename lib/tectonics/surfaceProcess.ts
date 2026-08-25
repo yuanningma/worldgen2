@@ -1,4 +1,9 @@
 import { createGeodesicSphere, type GeodesicSphere } from "./geodesic.ts";
+import {
+  createCanonicalOrogeny,
+  type CanonicalOrogenyCell,
+  type OrogenRegime,
+} from "./orogeny.ts";
 import { createSurfaceRefinement } from "./surfaceRefinement.ts";
 import { cross3, dot3, normalize3, type Vec3 } from "./vector.ts";
 import type { TectonicWorldModel } from "./worldSimulation.ts";
@@ -103,6 +108,10 @@ export interface SurfaceProcessCell {
   readonly lithology: SurfaceLithology;
   /** Dimensionless resistance to fluvial and diffusive erosion, in [0, 1]. */
   readonly erosionResistance: number;
+  /** Dominant tectonic origin of resolved mountain relief. */
+  readonly orogeny: OrogenRegime;
+  /** Combined narrow-core and broad-foothill support in [0, 1]. */
+  readonly orogenStrength: number;
   readonly localRunoffKm3PerYear: number;
   readonly erodedThicknessKm: number;
   readonly depositedThicknessKm: number;
@@ -141,6 +150,8 @@ export interface SurfacePresentationSample {
   readonly prevailingWind: Vec3;
   readonly lithology: SurfaceLithology;
   readonly erosionResistance: number;
+  readonly orogeny: OrogenRegime;
+  readonly orogenStrength: number;
   /** Stable world-space detail used for albedo modulation, in [-1, 1]. */
   readonly surfaceTexture: number;
   /** Tangential rise/run vector used for continuous hill shading. */
@@ -426,6 +437,7 @@ function diffuseCanonicalField(
 function canonicalGeologyContext(world: TectonicWorldModel): {
   readonly sutureStrength: Float64Array;
   readonly activeMarginStrength: Float64Array;
+  readonly orogeny: readonly CanonicalOrogenyCell[];
 } {
   const adjacency = buildAdjacency(world.sphere);
   const continental = (faceId: number): boolean => {
@@ -463,7 +475,53 @@ function canonicalGeologyContext(world: TectonicWorldModel): {
     0.64,
     () => true,
   );
-  return { sutureStrength, activeMarginStrength };
+  return { sutureStrength, activeMarginStrength, orogeny: createCanonicalOrogeny(world) };
+}
+
+function shapedOrogenicHeight(
+  elevationAboveSeaKm: number,
+  orogeny: CanonicalOrogenyCell,
+  point: Vec3,
+  seed: number,
+): number {
+  if (elevationAboveSeaKm <= 0) return elevationAboveSeaKm;
+  const modulation = 0.88 + (sphericalNoise(point, seed + 8_903) * 0.5 + 0.5) * 0.18;
+  const core = Math.max(
+    orogeny.collisionCore,
+    orogeny.subductionCore,
+    orogeny.islandArcCore,
+    orogeny.sutureCore * 0.72,
+  );
+  const support = clamp(core * 0.88 + orogeny.foothillStrength * 0.58);
+  const broadExcess = Math.max(0, elevationAboveSeaKm - 1.15);
+  let shaped = elevationAboveSeaKm - broadExcess * (1 - support) * 0.62;
+  const collisionTarget = (0.72
+    + orogeny.collisionCore ** 0.82 * 4.65
+    + orogeny.foothillStrength * 0.9) * modulation;
+  const subductionTarget = (0.68
+    + orogeny.subductionCore ** 0.86 * 3.8
+    + orogeny.foothillStrength * 0.76) * modulation;
+  const islandArcTarget = (0.5
+    + orogeny.islandArcCore ** 0.9 * 3.15
+    + orogeny.foothillStrength * 0.42) * modulation;
+  const sutureTarget = (0.62
+    + orogeny.sutureCore ** 0.92 * 2.35
+    + orogeny.foothillStrength * 0.62) * modulation;
+  shaped = Math.max(
+    shaped,
+    collisionTarget * orogeny.collisionCore,
+    subductionTarget * orogeny.subductionCore,
+    islandArcTarget * orogeny.islandArcCore,
+    sutureTarget * orogeny.sutureCore,
+  );
+  const supportedMaximum = 1.72
+    + core * 4.35
+    + orogeny.foothillStrength * 1.05
+    + orogeny.sutureCore * 0.72;
+  if (shaped > supportedMaximum) {
+    shaped = supportedMaximum + (shaped - supportedMaximum) * 0.14;
+  }
+  return Math.max(0.002, shaped);
 }
 
 function surfaceGeology(
@@ -1052,7 +1110,12 @@ export function createSurfaceProcessWorld(
     const refined = refinement.sample(face.center);
     const canonicalFaceId = Math.floor(face.id / 4 ** detailLevels);
     const canonical = tectonicWorld.cells[canonicalFaceId];
-    const aboveSea = refined.elevationKm - tectonicWorld.seaLevelKm;
+    const rawAboveSea = refined.elevationKm - tectonicWorld.seaLevelKm;
+    const orogeny = geologyContext.orogeny[canonicalFaceId];
+    const aboveSea = refined.isLand
+      ? shapedOrogenicHeight(rawAboveSea, orogeny, face.center, hashedSeed)
+      : rawAboveSea;
+    const structuralElevationKm = tectonicWorld.seaLevelKm + aboveSea;
     const mountainEnvelope = clamp((aboveSea - 0.25) / 4.5);
     const continentalEnvelope = clamp(canonical.continentalFraction
       ?? (canonical.crustType === "continental" ? 1 : 0));
@@ -1075,8 +1138,8 @@ export function createSurfaceProcessWorld(
         * (0.72 + geology.erosionResistance * 0.42)
       : noise * reliefAmplitudeKm * 0.16;
     const elevationKm = refined.isLand
-      ? Math.max(tectonicWorld.seaLevelKm + 0.002, refined.elevationKm + detail)
-      : Math.min(tectonicWorld.seaLevelKm - 0.002, refined.elevationKm + detail);
+      ? Math.max(tectonicWorld.seaLevelKm + 0.002, structuralElevationKm + detail)
+      : Math.min(tectonicWorld.seaLevelKm - 0.002, structuralElevationKm + detail);
     const areaKm2 = face.areaSteradians * radiusSquared;
     return {
       faceId: face.id,
@@ -1098,6 +1161,8 @@ export function createSurfaceProcessWorld(
       orographicLiftKm: 0,
       lithology: geology.lithology,
       erosionResistance: geology.erosionResistance,
+      orogeny: orogeny.regime,
+      orogenStrength: orogeny.strength,
       localRunoffKm3PerYear: 0,
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
@@ -1197,6 +1262,8 @@ export function createSurfaceProcessWorld(
     orographicLiftKm: cell.orographicLiftKm,
     lithology: cell.lithology,
     erosionResistance: cell.erosionResistance,
+    orogeny: cell.orogeny,
+    orogenStrength: cell.orogenStrength,
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
     erodedThicknessKm: cell.erodedThicknessKm,
     depositedThicknessKm: cell.depositedThicknessKm,
@@ -1234,6 +1301,7 @@ export function createSurfaceProcessWorld(
     let atmosphericMoisture = 0;
     let orographicLiftKm = 0;
     let erosionResistance = 0;
+    let orogenStrength = 0;
     for (const faceId of candidates) {
       const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
       const cell = immutableCells[faceId];
@@ -1251,6 +1319,7 @@ export function createSurfaceProcessWorld(
       atmosphericMoisture += cell.atmosphericMoisture * weight;
       orographicLiftKm += cell.orographicLiftKm * weight;
       erosionResistance += cell.erosionResistance * weight;
+      orogenStrength += cell.orogenStrength * weight;
     }
     elevationKm /= totalWeight;
     coastDistanceKm /= totalWeight;
@@ -1265,6 +1334,7 @@ export function createSurfaceProcessWorld(
     atmosphericMoisture /= totalWeight;
     orographicLiftKm /= totalWeight;
     erosionResistance /= totalWeight;
+    orogenStrength /= totalWeight;
     const gradient: [number, number, number] = [0, 0, 0];
     for (const faceId of candidates) {
       const center = centers[faceId];
@@ -1324,6 +1394,8 @@ export function createSurfaceProcessWorld(
       prevailingWind: prevailingWindAt(point),
       lithology: nearestMatchingCell.lithology,
       erosionResistance,
+      orogeny: nearestMatchingCell.orogeny,
+      orogenStrength,
       surfaceTexture,
       terrainGradient: gradient,
       presentationOnly: true,

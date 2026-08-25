@@ -40,6 +40,7 @@ The replacement geology core is being developed separately from the current visu
 - plate-aware irregular continental graph growth without a user-facing continent-count control;
 - persistent subordinate accreted terranes with unequal area hierarchy, provenance, shelf tapering, and finite-width interior sutures;
 - terrane-, suture-, age-, and margin-conditioned surface lithology with rock-dependent relief retention, fluvial incision, and closed sediment budgets by material class;
+- boundary-specific orogenic profiles that distinguish continental collision cores, landward subduction ranges, oceanic island arcs, inherited sutures, and their lower-amplitude foothills;
 - reduced spherical atmospheric circulation with latitude-dependent wind belts, ocean moisture recharge, iterative downwind transport, orographic precipitation, and rain shadows;
 - PET-relative aridity, marine and terrestrial biome classes, same-medium coast distance, continentality, seasonal-temperature range, and derived deep-basin lake cover with closed global area accounting;
 - spherical hard gates for ribbons, isthmuses, gulfs, lakes, elongation, canonical border stability, and multiscale coastline richness;
@@ -47,7 +48,7 @@ The replacement geology core is being developed separately from the current visu
 - exact scientific and smoothed presentation atlas renderers;
 - a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, spherical moisture circulation, conservative runoff, Priority-Flood drainage, resolved river networks, bounded stream-power incision, and conservative downstream sediment transfer.
 - a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
-- synchronized natural, heightmap, climate, biomes, precipitation, aridity, temperature, continentality, drainage, wind, and lithology diagnostics that all read the same canonical world instead of regenerating geography;
+- synchronized natural, heightmap, climate, biomes, precipitation, aridity, temperature, continentality, drainage, wind, lithology, and orogeny diagnostics that all read the same canonical world instead of regenerating geography;
 - five bounded coastline wavelength bands plus deterministic world-space fine relief and albedo detail that reveal smaller features at larger output sizes without introducing raster-dependent geography.
 - two renderer-only natural presentation styles: a flat illustrated atlas for judging world composition and a restrained physical relief view for inspecting terrain and bathymetry without changing geography.
 
@@ -76,6 +77,7 @@ npm run render:surface-process -- --map-mode=aridity --quality=preview --seed=AT
 npm run render:surface-process -- --map-mode=continentality --quality=preview --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=drainage --quality=preview --seed=ATLAS-A
 npm run render:surface-process -- --map-mode=wind --quality=preview --seed=ATLAS-A
+npm run render:surface-process -- --map-mode=orogeny --quality=preview --seed=ATLAS-A
 npm run review:surface-atlas -- --input=outputs/tectonics/surface-process-world.png
 ```
 

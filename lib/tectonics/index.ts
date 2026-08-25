@@ -109,3 +109,9 @@ export {
   type NaturalSurfaceColorInput,
   type SurfacePresentationStyle,
 } from "./surfaceStyle.ts";
+
+export {
+  createCanonicalOrogeny,
+  type CanonicalOrogenyCell,
+  type OrogenRegime,
+} from "./orogeny.ts";

@@ -7,6 +7,7 @@ import {
   type SurfaceBiome,
   type SurfaceLithology,
 } from "../lib/tectonics/surfaceProcess.ts";
+import type { OrogenRegime } from "../lib/tectonics/orogeny.ts";
 import {
   naturalSurfaceColor,
   type SurfacePresentationStyle,
@@ -48,6 +49,7 @@ const MAP_MODES = [
   "drainage",
   "wind",
   "lithology",
+  "orogeny",
 ] as const;
 
 type SurfaceMapMode = typeof MAP_MODES[number];
@@ -147,6 +149,8 @@ function color(
   biome: SurfaceBiome,
   lithology: SurfaceLithology,
   erosionResistance: number,
+  orogeny: OrogenRegime,
+  orogenStrength: number,
   atmosphericMoisture: number,
   windEast: number,
   windNorth: number,
@@ -208,6 +212,17 @@ function color(
     const base = LITHOLOGY_TINTS[lithology];
     const thematicShade = isLand ? clamp(shade, 0.82, 1.12) : 0.72;
     return base.map((channel) => Math.round(clamp(channel * thematicShade, 0, 255))) as unknown as readonly [number, number, number];
+  }
+  if (mapMode === "orogeny") {
+    if (!isLand) return [28, 53, 71];
+    const regimeColors: Readonly<Record<OrogenRegime, readonly [number, number, number]>> = {
+      none: [202, 210, 189],
+      collision: [168, 52, 42],
+      subduction: [221, 121, 47],
+      "island-arc": [123, 85, 166],
+      suture: [135, 103, 70],
+    };
+    return mix([202, 210, 189], regimeColors[orogeny], clamp(orogenStrength * 1.1));
   }
   return naturalSurfaceColor(presentationStyle, {
     isLand,
@@ -441,6 +456,8 @@ function renderColorAt(longitude: number, latitude: number): {
       cell.biome,
       cell.lithology,
       cell.erosionResistance,
+      cell.orogeny,
+      cell.orogenStrength,
       cell.atmosphericMoisture,
       windEast,
       windNorth,
