@@ -714,7 +714,12 @@ function prevailingWindAt(point: Vec3): Vec3 {
 function createUpwindTransport(
   sphere: GeodesicSphere,
   adjacency: readonly number[][],
-): readonly (readonly { readonly faceId: number; readonly weight: number }[])[] {
+  radiusKm: number,
+): readonly (readonly {
+  readonly faceId: number;
+  readonly weight: number;
+  readonly distanceKm: number;
+}[])[] {
   return sphere.faces.map((face) => {
     const wind = prevailingWindAt(face.center);
     const candidates = adjacency[face.id].map((neighborId) => {
@@ -726,17 +731,21 @@ function createUpwindTransport(
         face.center[2] * cosine - neighbor[2],
       ]);
       const alignment = Math.max(0, dot3(incoming, wind));
-      return { faceId: neighborId, weight: alignment ** 3.5 };
+      return {
+        faceId: neighborId,
+        weight: alignment ** 3.5,
+        distanceKm: Math.acos(cosine) * radiusKm,
+      };
     });
     let total = candidates.reduce((sum, candidate) => sum + candidate.weight, 0);
     if (total < 1e-9) {
       total = candidates.length;
-      return candidates.map((candidate) => ({ faceId: candidate.faceId, weight: 1 / total }));
+      return candidates.map((candidate) => ({ ...candidate, weight: 1 / total }));
     }
     const retained = candidates.filter((candidate) => candidate.weight > total * 0.015);
     const retainedTotal = retained.reduce((sum, candidate) => sum + candidate.weight, 0);
     return retained.map((candidate) => ({
-      faceId: candidate.faceId,
+      ...candidate,
       weight: candidate.weight / retainedTotal,
     }));
   });
@@ -780,7 +789,18 @@ function simulateSurfaceClimate(
   radiusKm: number,
   seed: number,
 ): SurfaceClimateStats {
-  const upwind = createUpwindTransport(sphere, adjacency);
+  const upwind = createUpwindTransport(sphere, adjacency, radiusKm);
+  // One atmospheric iteration advances moisture by approximately one mesh
+  // edge. Express loss, recharge, and iteration count in physical distance so
+  // refining the icosphere does not shorten the effective fetch or dry out
+  // continental interiors. Subdivision 6 on an Earth-radius sphere is close to
+  // the 120 km reference step used to calibrate the reduced annual model.
+  const referenceTransportStepKm = 120;
+  const characteristicStepKm = sphere.edges.reduce(
+    (sum, edge) => sum + edge.arcLengthRadians * radiusKm,
+    0,
+  ) / Math.max(1, sphere.edges.length);
+  const distanceScale = characteristicStepKm / referenceTransportStepKm;
   const elevationAboveSea = Float64Array.from(cells.map((cell) => (
     cell.isLand ? Math.max(0, cell.elevationKm - seaLevelKm) : 0
   )));
@@ -821,15 +841,21 @@ function simulateSurfaceClimate(
   }
   for (const cell of cells) {
     let incomingElevation = 0;
+    let incomingDistanceKm = 0;
     for (const input of upwind[cell.faceId]) {
       incomingElevation += elevationAboveSea[input.faceId] * input.weight;
+      incomingDistanceKm += input.distanceKm * input.weight;
     }
+    const rawLift = Math.max(0, elevationAboveSea[cell.faceId] - incomingElevation);
     orographicLift[cell.faceId] = cell.isLand
-      ? Math.max(0, elevationAboveSea[cell.faceId] - incomingElevation)
+      ? Math.min(
+        elevationAboveSea[cell.faceId],
+        rawLift * referenceTransportStepKm / Math.max(1, incomingDistanceKm),
+      )
       : 0;
   }
 
-  const transportPasses = 36;
+  const transportPasses = Math.max(12, Math.round(36 / Math.max(0.1, distanceScale)));
   for (let pass = 0; pass < transportPasses; pass += 1) {
     const next = new Float64Array(cells.length);
     for (const cell of cells) {
@@ -839,7 +865,7 @@ function simulateSurfaceClimate(
         incomingMoisture += humidity[input.faceId] * input.weight;
       }
       const lift = orographicLift[cell.faceId];
-      const precipitationLoss = clamp(
+      const referencePrecipitationLoss = clamp(
         0.01
           + equatorialConvection[cell.faceId] * 0.055
           + stormTrack[cell.faceId] * 0.04
@@ -847,10 +873,13 @@ function simulateSurfaceClimate(
         0.008,
         0.46,
       );
+      const precipitationLoss = 1 - (1 - referencePrecipitationLoss) ** distanceScale;
       if (!cell.isLand) {
-        next[cell.faceId] = incomingMoisture * 0.22 + saturation[cell.faceId] * 0.78;
+        const rechargeFraction = 1 - (1 - 0.78) ** distanceScale;
+        next[cell.faceId] = incomingMoisture * (1 - rechargeFraction)
+          + saturation[cell.faceId] * rechargeFraction;
       } else {
-        const warmRecycle = clamp((cell.temperatureC + 8) / 38, 0, 1) * 0.022;
+        const warmRecycle = clamp((cell.temperatureC + 8) / 38, 0, 1) * 0.022 * distanceScale;
         next[cell.faceId] = clamp(incomingMoisture * (1 - precipitationLoss) + warmRecycle, 0.008, 0.98);
       }
     }
@@ -980,6 +1009,77 @@ function routeSurfaceHydrology(
     }
   }
   return { downstreamOrder, outletRunoffKm3PerYear };
+}
+
+function classifyResolvedLakes(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  seaLevelKm: number,
+  radiusKm: number,
+  minimumCatchmentKm2: number,
+): void {
+  const visited = new Uint8Array(cells.length);
+  const connectedDepressionDepthKm = 0.005;
+  const resolvedLakeDepthKm = 0.13;
+  const radiusSquared = radiusKm ** 2;
+  const planetAreaKm2 = sphere.totalAreaSteradians * radiusSquared;
+  for (const start of cells) {
+    if (!start.isLand
+      || start.fillDepthKm < connectedDepressionDepthKm
+      || visited[start.faceId] !== 0) continue;
+    const members: number[] = [];
+    const queue = [start.faceId];
+    visited[start.faceId] = 1;
+    let maximumDepthKm = 0;
+    let maximumCatchmentKm2 = 0;
+    let maximumSurfaceElevationKm = -Infinity;
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const faceId = queue[cursor];
+      const cell = cells[faceId];
+      members.push(faceId);
+      maximumDepthKm = Math.max(maximumDepthKm, cell.fillDepthKm);
+      maximumCatchmentKm2 = Math.max(maximumCatchmentKm2, cell.drainageAreaKm2);
+      maximumSurfaceElevationKm = Math.max(maximumSurfaceElevationKm, cell.filledElevationKm);
+      for (const neighborId of adjacency[faceId]) {
+        const neighbor = cells[neighborId];
+        if (visited[neighborId] !== 0
+          || !neighbor.isLand
+          || neighbor.fillDepthKm < connectedDepressionDepthKm) continue;
+        visited[neighborId] = 1;
+        queue.push(neighborId);
+      }
+    }
+    const resolved = maximumDepthKm >= resolvedLakeDepthKm
+      && maximumCatchmentKm2 >= minimumCatchmentKm2
+      && maximumSurfaceElevationKm >= seaLevelKm + 0.01;
+    if (!resolved) continue;
+    // Priority-Flood supplies the maximum spill capacity of a depression, not
+    // an unlimited lake-water inventory. Bound the occupied deep contour by
+    // catchment scale and basin depth until an explicit evaporation/outflow
+    // balance replaces this reduced annual approximation.
+    const depthSupport = clamp(
+      (maximumDepthKm - resolvedLakeDepthKm) / 0.45,
+      0.08,
+      1,
+    );
+    const maximumResolvedAreaKm2 = Math.min(
+      planetAreaKm2 / 900,
+      Math.max(planetAreaKm2 / 10_000, maximumCatchmentKm2 * 0.16),
+    ) * depthSupport;
+    const deepMembers = members
+      .filter((faceId) => cells[faceId].fillDepthKm >= resolvedLakeDepthKm)
+      .sort((a, b) => cells[b].fillDepthKm - cells[a].fillDepthKm || a - b);
+    let resolvedAreaKm2 = 0;
+    for (const faceId of deepMembers) {
+      const cell = cells[faceId];
+      const areaKm2 = sphere.faces[faceId].areaSteradians * radiusSquared;
+      if (resolvedAreaKm2 > 0 && resolvedAreaKm2 + areaKm2 > maximumResolvedAreaKm2) continue;
+      cell.isLake = true;
+      cell.lakeDepthKm = cell.fillDepthKm;
+      resolvedAreaKm2 += areaKm2;
+    }
+  }
 }
 
 function erodeAndRouteSediment(
@@ -1217,12 +1317,17 @@ export function createSurfaceProcessWorld(
   const minimumLakeCatchmentKm2 = Math.max(500_000, totalSurfaceAreaKm2 / 1_200);
   for (const cell of cells) {
     cell.lakeDepthKm = cell.isLand ? Math.max(0, cell.fillDepthKm) : 0;
-    cell.isLake = cell.isLand
-      && cell.lakeDepthKm >= 0.13
-      && cell.drainageAreaKm2 >= minimumLakeCatchmentKm2
-      && cell.filledElevationKm >= tectonicWorld.seaLevelKm + 0.01;
-    cell.biome = classifySurfaceBiome(cell, tectonicWorld.seaLevelKm);
+    cell.isLake = false;
   }
+  classifyResolvedLakes(
+    cells,
+    sphere,
+    adjacency,
+    tectonicWorld.seaLevelKm,
+    tectonicWorld.recipe.radiusKm,
+    minimumLakeCatchmentKm2,
+  );
+  for (const cell of cells) cell.biome = classifySurfaceBiome(cell, tectonicWorld.seaLevelKm);
 
   const minimumRiverAreaKm2 = options.minimumRiverAreaKm2
     ?? Math.max(90_000, totalSurfaceAreaKm2 / 3_500);

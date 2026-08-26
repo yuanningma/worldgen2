@@ -31,6 +31,21 @@ test("surface resolution comparison is deterministic and reports bounded metrics
   assert.ok(Object.values(first).filter((value) => typeof value === "number").every(Number.isFinite));
 });
 
+test("physical-distance climate transport converges as the process mesh is refined", () => {
+  for (const seed of ["SURFACE-RESOLUTION-3", "ATLAS-TECTONIC-11", "EPOCH-29"]) {
+    const world = simulateTectonicWorld({ seed, subdivisions: 3, historyMyr: 120 });
+    const coarse = createSurfaceProcessWorld(world, { subdivisions: 4 });
+    const fine = createSurfaceProcessWorld(world, { subdivisions: 5 });
+    const comparison = compareSurfaceResolutions(coarse, fine);
+    assert.ok(comparison.meanPrecipitationRelativeDrift < 0.06, seed);
+    assert.ok(comparison.runoffRelativeDrift < 0.06, seed);
+    assert.ok(comparison.aridFractionDrift < 0.06, seed);
+    assert.ok(comparison.humidFractionDrift < 0.03, seed);
+    assert.ok(comparison.lakeAreaRelativeDrift < 0.15, seed);
+    assert.ok(comparison.biomeAreaTotalVariation < 0.05, seed);
+  }
+});
+
 test("surface resolution comparison rejects unrelated canonical seeds", () => {
   const other = simulateTectonicWorld({ seed: "OTHER-SURFACE", subdivisions: 2, historyMyr: 90 });
   const candidate = createSurfaceProcessWorld(other, { subdivisions: 3 });
