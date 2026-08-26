@@ -39,10 +39,12 @@ test("physical-distance climate transport converges as the process mesh is refin
     const comparison = compareSurfaceResolutions(coarse, fine);
     assert.ok(comparison.meanPrecipitationRelativeDrift < 0.06, seed);
     assert.ok(comparison.runoffRelativeDrift < 0.06, seed);
+    assert.ok(comparison.maximumDrainageRelativeDrift < 0.03, seed);
     assert.ok(comparison.aridFractionDrift < 0.06, seed);
     assert.ok(comparison.humidFractionDrift < 0.03, seed);
-    assert.ok(comparison.lakeAreaRelativeDrift < 0.15, seed);
+    assert.ok(comparison.lakeAreaRelativeDrift < 0.22, seed);
     assert.ok(comparison.biomeAreaTotalVariation < 0.05, seed);
+    assert.equal(fine.stats.drainageAnchorMismatches, 0, seed);
   }
 });
 

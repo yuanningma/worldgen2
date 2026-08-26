@@ -36,10 +36,10 @@ export const DEFAULT_SURFACE_RESOLUTION_THRESHOLDS: SurfaceResolutionThresholds 
   meanSeasonalRangeC: 2,
   meanPrecipitationRelative: 0.15,
   runoffRelative: 0.15,
-  maximumDrainageRelative: 0.15,
+  maximumDrainageRelative: 0.08,
   aridFraction: 0.08,
   humidFraction: 0.08,
-  lakeAreaRelative: 0.5,
+  lakeAreaRelative: 0.25,
   biomeAreaTotalVariation: 0.08,
 };
 

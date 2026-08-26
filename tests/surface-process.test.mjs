@@ -144,6 +144,33 @@ test("Priority-Flood drainage is local, acyclic, and reaches the ocean", () => {
   }
 });
 
+test("fine drainage inherits coarse continental divides while refining local channels", () => {
+  const coarse = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
+  const fine = createSurfaceProcessWorld(tectonic, { subdivisions: 5 });
+  const descendantsPerAnchor = 4;
+  const oceanChildByAnchor = new Uint8Array(coarse.cells.length);
+  for (const cell of fine.cells) {
+    if (!cell.isLand) oceanChildByAnchor[Math.floor(cell.faceId / descendantsPerAnchor)] = 1;
+  }
+  let inheritedCrossings = 0;
+  for (const cell of fine.cells) {
+    if (!cell.isLand || cell.receiverFaceId === null) continue;
+    const sourceAnchorId = Math.floor(cell.faceId / descendantsPerAnchor);
+    const receiverAnchorId = Math.floor(cell.receiverFaceId / descendantsPerAnchor);
+    if (sourceAnchorId === receiverAnchorId
+      || !coarse.cells[sourceAnchorId].isLand
+      || oceanChildByAnchor[sourceAnchorId] !== 0) continue;
+    assert.equal(receiverAnchorId, coarse.cells[sourceAnchorId].receiverFaceId);
+    inheritedCrossings += 1;
+  }
+  assert.ok(inheritedCrossings > 0);
+  assert.equal(fine.stats.drainageAnchorSubdivisions, coarse.sphere.subdivisions);
+  assert.equal(fine.stats.drainageAnchorMismatches, 0);
+  assert.ok(Math.abs(
+    fine.stats.maximumDrainageAreaKm2 - coarse.stats.maximumDrainageAreaKm2,
+  ) <= coarse.stats.maximumDrainageAreaKm2 * 0.06);
+});
+
 test("surface runoff closes at ocean outlets and produces resolved rivers", () => {
   const surface = createSurfaceProcessWorld(tectonic, {
     subdivisions: 4,

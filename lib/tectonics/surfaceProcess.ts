@@ -173,6 +173,10 @@ export interface SurfaceProcessStats {
   readonly runoffResidualKm3PerYear: number;
   readonly maximumFillDepthKm: number;
   readonly canonicalAnchorMismatches: number;
+  /** Stable process-grid level that owns continental drainage divides. */
+  readonly drainageAnchorSubdivisions: number;
+  /** Fine cross-parent receivers that disagree with the anchor basin graph. */
+  readonly drainageAnchorMismatches: number;
   readonly erodedVolumeKm3: number;
   readonly depositedVolumeKm3: number;
   readonly exportedSedimentVolumeKm3: number;
@@ -239,6 +243,7 @@ interface SurfaceClimateStats {
 interface DrainageResult {
   readonly downstreamOrder: readonly MutableSurfaceCell[];
   readonly outletRunoffKm3PerYear: number;
+  readonly anchorMismatches: number;
 }
 
 interface SedimentBudget {
@@ -959,6 +964,7 @@ function routeSurfaceHydrology(
   sphere: GeodesicSphere,
   adjacency: readonly number[][],
   radiusKm: number,
+  hierarchyAnchor?: SurfaceProcessWorld,
 ): DrainageResult {
   const radiusSquared = radiusKm ** 2;
   const heap = new ElevationHeap();
@@ -979,17 +985,132 @@ function routeSurfaceHydrology(
   }
   if (floodOrder === 0) throw new Error("surface hydrology requires at least one ocean outlet");
   const epsilonKm = 1e-7;
-  for (let entry = heap.pop(); entry; entry = heap.pop()) {
-    for (const neighborId of adjacency[entry.faceId]) {
-      if (visited[neighborId] !== 0) continue;
-      const neighbor = cells[neighborId];
-      visited[neighborId] = 1;
-      neighbor.floodOrder = floodOrder;
-      floodOrder += 1;
-      neighbor.receiverFaceId = entry.faceId;
-      neighbor.filledElevationKm = Math.max(neighbor.elevationKm, entry.priority + epsilonKm);
-      neighbor.fillDepthKm = Math.max(0, neighbor.filledElevationKm - neighbor.elevationKm);
-      heap.push({ faceId: neighborId, priority: neighbor.filledElevationKm });
+  let anchorMismatches = 0;
+  const visitFrom = (neighborId: number, receiverId: number, receiverPriority: number): void => {
+    const neighbor = cells[neighborId];
+    visited[neighborId] = 1;
+    neighbor.floodOrder = floodOrder;
+    floodOrder += 1;
+    neighbor.receiverFaceId = receiverId;
+    neighbor.filledElevationKm = Math.max(neighbor.elevationKm, receiverPriority + epsilonKm);
+    neighbor.fillDepthKm = Math.max(0, neighbor.filledElevationKm - neighbor.elevationKm);
+  };
+
+  if (!hierarchyAnchor || hierarchyAnchor.sphere.subdivisions >= sphere.subdivisions) {
+    for (let entry = heap.pop(); entry; entry = heap.pop()) {
+      for (const neighborId of adjacency[entry.faceId]) {
+        if (visited[neighborId] !== 0) continue;
+        visitFrom(neighborId, entry.faceId, entry.priority);
+        heap.push({ faceId: neighborId, priority: cells[neighborId].filledElevationKm });
+      }
+    }
+  } else {
+    const detailLevels = sphere.subdivisions - hierarchyAnchor.sphere.subdivisions;
+    const descendantsPerAnchor = 4 ** detailLevels;
+    if (hierarchyAnchor.cells.length * descendantsPerAnchor !== cells.length) {
+      throw new Error("hierarchical drainage requires exact nested icosphere ancestry");
+    }
+    const anchorIdOf = (faceId: number): number => Math.floor(faceId / descendantsPerAnchor);
+    const membersByAnchor = hierarchyAnchor.cells.map(() => [] as number[]);
+    const freeAnchor = new Uint8Array(hierarchyAnchor.cells.length);
+    for (const cell of cells) {
+      const anchorId = anchorIdOf(cell.faceId);
+      membersByAnchor[anchorId].push(cell.faceId);
+      if (!cell.isLand) freeAnchor[anchorId] = 1;
+    }
+    for (const anchorCell of hierarchyAnchor.cells) {
+      if (!anchorCell.isLand) freeAnchor[anchorCell.faceId] = 1;
+    }
+
+    // Coastal and ocean-parent detail is allowed to find the nearest resolved
+    // ocean freely. Inland parent faces are handled below against the stable
+    // anchor receiver graph.
+    for (let entry = heap.pop(); entry; entry = heap.pop()) {
+      for (const neighborId of adjacency[entry.faceId]) {
+        if (visited[neighborId] !== 0 || freeAnchor[anchorIdOf(neighborId)] === 0) continue;
+        visitFrom(neighborId, entry.faceId, entry.priority);
+        heap.push({ faceId: neighborId, priority: cells[neighborId].filledElevationKm });
+      }
+    }
+
+    const anchorDepth = new Int32Array(hierarchyAnchor.cells.length);
+    anchorDepth.fill(-1);
+    for (const anchorCell of hierarchyAnchor.cells) {
+      if (!anchorCell.isLand) anchorDepth[anchorCell.faceId] = 0;
+    }
+    for (const start of hierarchyAnchor.cells) {
+      if (!start.isLand || anchorDepth[start.faceId] >= 0) continue;
+      const path: number[] = [];
+      let cursor = start.faceId;
+      while (anchorDepth[cursor] < 0) {
+        path.push(cursor);
+        if (path.length > hierarchyAnchor.cells.length) {
+          throw new Error("hierarchical drainage anchor contains a receiver cycle");
+        }
+        const receiverId = hierarchyAnchor.cells[cursor].receiverFaceId;
+        if (receiverId === null) {
+          throw new Error(`anchor land face ${cursor} has no hydrologic receiver`);
+        }
+        cursor = receiverId;
+      }
+      let depth = anchorDepth[cursor];
+      for (let index = path.length - 1; index >= 0; index -= 1) {
+        depth += 1;
+        anchorDepth[path[index]] = depth;
+      }
+    }
+
+    const inlandAnchors = hierarchyAnchor.cells
+      .filter((anchorCell) => anchorCell.isLand && freeAnchor[anchorCell.faceId] === 0)
+      .sort((a, b) => anchorDepth[a.faceId] - anchorDepth[b.faceId] || a.faceId - b.faceId);
+    for (const anchorCell of inlandAnchors) {
+      const receiverAnchorId = anchorCell.receiverFaceId;
+      if (receiverAnchorId === null) {
+        throw new Error(`inland anchor face ${anchorCell.faceId} has no hydrologic receiver`);
+      }
+      let exitFaceId = -1;
+      let exitReceiverId = -1;
+      let exitPriority = Infinity;
+      for (const faceId of membersByAnchor[anchorCell.faceId]) {
+        const source = cells[faceId];
+        for (const neighborId of adjacency[faceId]) {
+          if (anchorIdOf(neighborId) !== receiverAnchorId || visited[neighborId] === 0) continue;
+          const priority = Math.max(source.elevationKm, cells[neighborId].filledElevationKm + epsilonKm);
+          if (priority < exitPriority
+            || (priority === exitPriority && (faceId < exitFaceId
+              || (faceId === exitFaceId && neighborId < exitReceiverId)))) {
+            exitFaceId = faceId;
+            exitReceiverId = neighborId;
+            exitPriority = priority;
+          }
+        }
+      }
+      if (exitFaceId < 0 || exitReceiverId < 0) {
+        throw new Error(`anchor receiver edge ${anchorCell.faceId} -> ${receiverAnchorId} has no fine descendant`);
+      }
+      visitFrom(exitFaceId, exitReceiverId, cells[exitReceiverId].filledElevationKm);
+      const localHeap = new ElevationHeap();
+      localHeap.push({ faceId: exitFaceId, priority: cells[exitFaceId].filledElevationKm });
+      for (let entry = localHeap.pop(); entry; entry = localHeap.pop()) {
+        for (const neighborId of adjacency[entry.faceId]) {
+          if (visited[neighborId] !== 0 || anchorIdOf(neighborId) !== anchorCell.faceId) continue;
+          visitFrom(neighborId, entry.faceId, entry.priority);
+          localHeap.push({ faceId: neighborId, priority: cells[neighborId].filledElevationKm });
+        }
+      }
+    }
+
+    for (const cell of cells) {
+      if (visited[cell.faceId] === 0) {
+        throw new Error(`hierarchical drainage did not visit fine face ${cell.faceId}`);
+      }
+      if (!cell.isLand || cell.receiverFaceId === null) continue;
+      const sourceAnchorId = anchorIdOf(cell.faceId);
+      const receiverAnchorId = anchorIdOf(cell.receiverFaceId);
+      if (sourceAnchorId === receiverAnchorId || freeAnchor[sourceAnchorId] !== 0) continue;
+      if (hierarchyAnchor.cells[sourceAnchorId].receiverFaceId !== receiverAnchorId) {
+        anchorMismatches += 1;
+      }
     }
   }
   if (floodOrder !== cells.length) throw new Error("surface hydrology did not cover the closed sphere");
@@ -1008,7 +1129,7 @@ function routeSurfaceHydrology(
       outletRunoffKm3PerYear += cell.dischargeKm3PerYear;
     }
   }
-  return { downstreamOrder, outletRunoffKm3PerYear };
+  return { downstreamOrder, outletRunoffKm3PerYear, anchorMismatches };
 }
 
 function classifyResolvedLakes(
@@ -1188,6 +1309,16 @@ export function createSurfaceProcessWorld(
     || subdivisions > 7) {
     throw new RangeError("surface subdivisions must be an integer from the tectonic level through 7");
   }
+  const drainageAnchorSubdivisions = Math.min(
+    subdivisions,
+    tectonicWorld.sphere.subdivisions + 1,
+  );
+  const hierarchyAnchor = subdivisions > drainageAnchorSubdivisions
+    ? createSurfaceProcessWorld(tectonicWorld, {
+      ...options,
+      subdivisions: drainageAnchorSubdivisions,
+    })
+    : undefined;
   const detailLevels = subdivisions - tectonicWorld.sphere.subdivisions;
   const sphere = createGeodesicSphere(subdivisions);
   const adjacency = buildAdjacency(sphere);
@@ -1293,6 +1424,7 @@ export function createSurfaceProcessWorld(
     sphere,
     adjacency,
     tectonicWorld.recipe.radiusKm,
+    hierarchyAnchor,
   );
   const totalSurfaceAreaKm2 = sphere.totalAreaSteradians * radiusSquared;
   const erosionStrengthKm = clamp(options.erosionStrengthKm ?? 0.2, 0, 0.6);
@@ -1312,6 +1444,7 @@ export function createSurfaceProcessWorld(
     sphere,
     adjacency,
     tectonicWorld.recipe.radiusKm,
+    hierarchyAnchor,
   );
 
   const minimumLakeCatchmentKm2 = Math.max(500_000, totalSurfaceAreaKm2 / 1_200);
@@ -1529,6 +1662,8 @@ export function createSurfaceProcessWorld(
       runoffResidualKm3PerYear: totalRunoff - finalDrainage.outletRunoffKm3PerYear,
       maximumFillDepthKm: cells.reduce((maximum, cell) => Math.max(maximum, cell.fillDepthKm), 0),
       canonicalAnchorMismatches: refinementAudit.canonicalAnchorMismatches,
+      drainageAnchorSubdivisions,
+      drainageAnchorMismatches: finalDrainage.anchorMismatches,
       meanLandErosionResistance: cells.reduce(
         (sum, cell) => sum + (cell.isLand
           ? cell.erosionResistance * sphere.faces[cell.faceId].areaSteradians
