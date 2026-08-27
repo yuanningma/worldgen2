@@ -24,6 +24,8 @@ export interface SurfaceProcessOptions {
   readonly minimumErosionAreaKm2?: number;
   /** Nearby same-class cells blended by the resolution-independent sampler. */
   readonly presentationSampleCount?: number;
+  /** Multiplier on the reduced open-water potential-evaporation estimate. */
+  readonly openWaterEvaporationScale?: number;
 }
 
 export type SurfaceLithology =
@@ -101,6 +103,8 @@ export interface SurfaceProcessCell {
   /** A derived inland-water cover; canonical crust remains land. */
   readonly isLake: boolean;
   readonly lakeDepthKm: number;
+  /** Solved annual-equilibrium depression depth at the lake shoreline. */
+  readonly lakeSurfaceDepthThresholdKm: number;
   /** Advected atmospheric moisture after local precipitation loss, in [0, 1]. */
   readonly atmosphericMoisture: number;
   /** Positive upwind terrain rise used by the reduced orographic model. */
@@ -127,6 +131,15 @@ export interface SurfaceRiverSegment {
   readonly fromPoint: Vec3;
   /** Renderer-only shared node inside the receiver process cell. */
   readonly toPoint: Vec3;
+  readonly drainageAreaKm2: number;
+  readonly dischargeKm3PerYear: number;
+}
+
+export interface SurfaceRiverMouth {
+  readonly fromFaceId: number;
+  readonly toFaceId: number;
+  readonly point: Vec3;
+  readonly receivingWater: "ocean" | "lake";
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
 }
@@ -171,7 +184,14 @@ export interface SurfaceProcessStats {
   readonly oceanCellCount: number;
   readonly lakeCellCount: number;
   readonly lakeAreaKm2: number;
+  readonly lakeBodyCount: number;
+  readonly closedLakeBodyCount: number;
+  readonly overflowingLakeBodyCount: number;
+  readonly lakeEvaporationKm3PerYear: number;
   readonly riverSegmentCount: number;
+  readonly riverMouthCount: number;
+  readonly oceanRiverMouthCount: number;
+  readonly lakeInflowCount: number;
   readonly maximumDrainageAreaKm2: number;
   readonly maximumDischargeKm3PerYear: number;
   readonly totalLocalRunoffKm3PerYear: number;
@@ -207,6 +227,7 @@ export interface SurfaceProcessWorld {
   readonly sphere: GeodesicSphere;
   readonly cells: readonly SurfaceProcessCell[];
   readonly rivers: readonly SurfaceRiverSegment[];
+  readonly riverMouths: readonly SurfaceRiverMouth[];
   readonly stats: SurfaceProcessStats;
   readonly sample: (direction: Vec3) => SurfaceProcessCell;
   /** Continuous render sample whose output does not depend on raster size. */
@@ -231,6 +252,7 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   biome: SurfaceBiome;
   isLake: boolean;
   lakeDepthKm: number;
+  lakeSurfaceDepthThresholdKm: number;
   atmosphericMoisture: number;
   orographicLiftKm: number;
   localRunoffKm3PerYear: number;
@@ -260,6 +282,20 @@ interface SedimentBudget {
   readonly incisedCellCount: number;
   readonly depositionalCellCount: number;
   readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
+}
+
+interface LakeBalanceResult {
+  readonly presentationDepthThresholdKm: Float64Array;
+  readonly evaporationSinkKm3PerYear: Float64Array;
+  readonly lakeBodyCount: number;
+  readonly closedLakeBodyCount: number;
+  readonly overflowingLakeBodyCount: number;
+  readonly overflowOutletFaceIds: ReadonlySet<number>;
+}
+
+interface BalancedRunoffResult {
+  readonly outletRunoffKm3PerYear: number;
+  readonly lakeEvaporationKm3PerYear: number;
 }
 
 interface HeapEntry {
@@ -1145,13 +1181,18 @@ function classifyResolvedLakes(
   seaLevelKm: number,
   radiusKm: number,
   minimumCatchmentKm2: number,
-): Float64Array {
+  openWaterEvaporationScale: number,
+): LakeBalanceResult {
   const visited = new Uint8Array(cells.length);
   const presentationDepthThresholdKm = new Float64Array(cells.length);
+  const evaporationSinkKm3PerYear = new Float64Array(cells.length);
   const connectedDepressionDepthKm = 0.005;
   const resolvedLakeDepthKm = 0.13;
   const radiusSquared = radiusKm ** 2;
-  const planetAreaKm2 = sphere.totalAreaSteradians * radiusSquared;
+  let lakeBodyCount = 0;
+  let closedLakeBodyCount = 0;
+  let overflowingLakeBodyCount = 0;
+  const overflowOutletFaceIds = new Set<number>();
   for (const start of cells) {
     if (!start.isLand
       || start.fillDepthKm < connectedDepressionDepthKm
@@ -1161,6 +1202,8 @@ function classifyResolvedLakes(
     visited[start.faceId] = 1;
     let maximumDepthKm = 0;
     let maximumCatchmentKm2 = 0;
+    let maximumDischargeKm3PerYear = 0;
+    let outletFaceId = start.faceId;
     let maximumSurfaceElevationKm = -Infinity;
     for (let cursor = 0; cursor < queue.length; cursor += 1) {
       const faceId = queue[cursor];
@@ -1168,6 +1211,11 @@ function classifyResolvedLakes(
       members.push(faceId);
       maximumDepthKm = Math.max(maximumDepthKm, cell.fillDepthKm);
       maximumCatchmentKm2 = Math.max(maximumCatchmentKm2, cell.drainageAreaKm2);
+      if (cell.dischargeKm3PerYear > maximumDischargeKm3PerYear
+        || (cell.dischargeKm3PerYear === maximumDischargeKm3PerYear && faceId < outletFaceId)) {
+        maximumDischargeKm3PerYear = cell.dischargeKm3PerYear;
+        outletFaceId = faceId;
+      }
       maximumSurfaceElevationKm = Math.max(maximumSurfaceElevationKm, cell.filledElevationKm);
       for (const neighborId of adjacency[faceId]) {
         const neighbor = cells[neighborId];
@@ -1182,19 +1230,10 @@ function classifyResolvedLakes(
       && maximumCatchmentKm2 >= minimumCatchmentKm2
       && maximumSurfaceElevationKm >= seaLevelKm + 0.01;
     if (!resolved) continue;
-    // Priority-Flood supplies the maximum spill capacity of a depression, not
-    // an unlimited lake-water inventory. Bound the occupied deep contour by
-    // catchment scale and basin depth until an explicit evaporation/outflow
-    // balance replaces this reduced annual approximation.
-    const depthSupport = clamp(
-      (maximumDepthKm - resolvedLakeDepthKm) / 0.45,
-      0.08,
-      1,
-    );
-    const maximumResolvedAreaKm2 = Math.min(
-      planetAreaKm2 / 900,
-      Math.max(planetAreaKm2 / 10_000, maximumCatchmentKm2 * 0.16),
-    ) * depthSupport;
+    // At annual equilibrium a closed lake expands down its depression contour
+    // until potential open-water evaporation can consume the routed inflow.
+    // If the entire spill basin cannot evaporate that inflow, the remaining
+    // water overflows through the Priority-Flood outlet.
     const deepMembers = members
       .filter((faceId) => cells[faceId].fillDepthKm >= resolvedLakeDepthKm)
       .sort((a, b) => cells[b].fillDepthKm - cells[a].fillDepthKm || a - b);
@@ -1205,16 +1244,21 @@ function classifyResolvedLakes(
     const lakeHeap = new ElevationHeap();
     lakeHeap.push({ faceId: deepMembers[0], priority: -cells[deepMembers[0]].fillDepthKm });
     queued.add(deepMembers[0]);
-    let resolvedAreaKm2 = 0;
+    let evaporationCapacityKm3PerYear = 0;
     for (let entry = lakeHeap.pop(); entry; entry = lakeHeap.pop()) {
       const faceId = entry.faceId;
       const cell = cells[faceId];
       const areaKm2 = sphere.faces[faceId].areaSteradians * radiusSquared;
-      if (resolvedAreaKm2 > 0 && resolvedAreaKm2 + areaKm2 > maximumResolvedAreaKm2) break;
       cell.isLake = true;
       cell.lakeDepthKm = cell.fillDepthKm;
       selected.push(faceId);
-      resolvedAreaKm2 += areaKm2;
+      const potentialEvaporationMPerYear = clamp(
+        (0.22 + Math.max(0, cell.temperatureC + 5) * 0.04) * openWaterEvaporationScale,
+        0.12,
+        2.2,
+      );
+      evaporationCapacityKm3PerYear += potentialEvaporationMPerYear * areaKm2 / 1000;
+      if (evaporationCapacityKm3PerYear >= maximumDischargeKm3PerYear) break;
       for (const neighborId of adjacency[faceId]) {
         if (!eligible.has(neighborId) || queued.has(neighborId)) continue;
         queued.add(neighborId);
@@ -1222,14 +1266,161 @@ function classifyResolvedLakes(
       }
     }
     if (selected.length > 0) {
+      lakeBodyCount += 1;
+      const actualEvaporationKm3PerYear = Math.min(
+        maximumDischargeKm3PerYear,
+        evaporationCapacityKm3PerYear,
+      );
+      evaporationSinkKm3PerYear[outletFaceId] += actualEvaporationKm3PerYear;
+      if (evaporationCapacityKm3PerYear + 1e-12 >= maximumDischargeKm3PerYear) {
+        closedLakeBodyCount += 1;
+      } else {
+        overflowingLakeBodyCount += 1;
+        overflowOutletFaceIds.add(outletFaceId);
+      }
       const shorelineDepthKm = selected.reduce(
         (minimum, faceId) => Math.min(minimum, cells[faceId].fillDepthKm),
         Infinity,
       );
-      for (const faceId of members) presentationDepthThresholdKm[faceId] = shorelineDepthKm;
+      for (const faceId of members) {
+        presentationDepthThresholdKm[faceId] = shorelineDepthKm;
+        cells[faceId].lakeSurfaceDepthThresholdKm = shorelineDepthKm;
+      }
     }
   }
-  return presentationDepthThresholdKm;
+  return {
+    presentationDepthThresholdKm,
+    evaporationSinkKm3PerYear,
+    lakeBodyCount,
+    closedLakeBodyCount,
+    overflowingLakeBodyCount,
+    overflowOutletFaceIds,
+  };
+}
+
+function balanceRunoffAcrossLakes(
+  cells: MutableSurfaceCell[],
+  downstreamOrder: readonly MutableSurfaceCell[],
+  evaporationSinkKm3PerYear: Float64Array,
+): BalancedRunoffResult {
+  for (const cell of cells) cell.dischargeKm3PerYear = cell.localRunoffKm3PerYear;
+  let outletRunoffKm3PerYear = 0;
+  let lakeEvaporationKm3PerYear = 0;
+  for (const cell of downstreamOrder) {
+    const evaporation = Math.min(
+      cell.dischargeKm3PerYear,
+      evaporationSinkKm3PerYear[cell.faceId],
+    );
+    cell.dischargeKm3PerYear -= evaporation;
+    lakeEvaporationKm3PerYear += evaporation;
+    if (cell.receiverFaceId === null) throw new Error(`land face ${cell.faceId} has no hydrologic receiver`);
+    const receiver = cells[cell.receiverFaceId];
+    if (receiver.isLand) receiver.dischargeKm3PerYear += cell.dischargeKm3PerYear;
+    else outletRunoffKm3PerYear += cell.dischargeKm3PerYear;
+  }
+  return { outletRunoffKm3PerYear, lakeEvaporationKm3PerYear };
+}
+
+function inheritResolvedLakeBalance(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  radiusKm: number,
+  hierarchyAnchor: SurfaceProcessWorld,
+  openWaterEvaporationScale: number,
+): LakeBalanceResult {
+  const detailLevels = sphere.subdivisions - hierarchyAnchor.sphere.subdivisions;
+  const descendantsPerAnchor = 4 ** detailLevels;
+  const presentationDepthThresholdKm = new Float64Array(cells.length);
+  const evaporationSinkKm3PerYear = new Float64Array(cells.length);
+  const visited = new Uint8Array(cells.length);
+  const radiusSquared = radiusKm ** 2;
+  let lakeBodyCount = 0;
+  let closedLakeBodyCount = 0;
+  let overflowingLakeBodyCount = 0;
+  const overflowOutletFaceIds = new Set<number>();
+  for (const cell of cells) {
+    const anchorId = Math.floor(cell.faceId / descendantsPerAnchor);
+    const anchorCell = hierarchyAnchor.cells[anchorId];
+    cell.isLake = cell.isLand && anchorCell.isLake;
+    cell.lakeDepthKm = cell.isLake ? Math.max(0.001, cell.fillDepthKm) : 0;
+    cell.lakeSurfaceDepthThresholdKm = anchorCell.lakeSurfaceDepthThresholdKm;
+    presentationDepthThresholdKm[cell.faceId] = anchorCell.lakeSurfaceDepthThresholdKm;
+  }
+  for (const start of cells) {
+    if (!start.isLake || visited[start.faceId] !== 0) continue;
+    const members: number[] = [];
+    const queue = [start.faceId];
+    visited[start.faceId] = 1;
+    let outletFaceId = start.faceId;
+    let inflowKm3PerYear = start.dischargeKm3PerYear;
+    let evaporationCapacityKm3PerYear = 0;
+    let shorelineDepthKm = Infinity;
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const faceId = queue[cursor];
+      const cell = cells[faceId];
+      members.push(faceId);
+      if (cell.dischargeKm3PerYear > inflowKm3PerYear
+        || (cell.dischargeKm3PerYear === inflowKm3PerYear && faceId < outletFaceId)) {
+        outletFaceId = faceId;
+        inflowKm3PerYear = cell.dischargeKm3PerYear;
+      }
+      shorelineDepthKm = Math.min(shorelineDepthKm, cell.fillDepthKm);
+      const areaKm2 = sphere.faces[faceId].areaSteradians * radiusSquared;
+      const potentialEvaporationMPerYear = clamp(
+        (0.22 + Math.max(0, cell.temperatureC + 5) * 0.04) * openWaterEvaporationScale,
+        0.12,
+        2.2,
+      );
+      evaporationCapacityKm3PerYear += potentialEvaporationMPerYear * areaKm2 / 1000;
+      for (const neighborId of adjacency[faceId]) {
+        if (visited[neighborId] !== 0 || !cells[neighborId].isLake) continue;
+        visited[neighborId] = 1;
+        queue.push(neighborId);
+      }
+    }
+    const memberSet = new Set(members);
+    const exitFace = members
+      .filter((faceId) => {
+        const receiverFaceId = cells[faceId].receiverFaceId;
+        return receiverFaceId !== null && !memberSet.has(receiverFaceId);
+      })
+      .sort((a, b) => cells[b].dischargeKm3PerYear - cells[a].dischargeKm3PerYear || a - b)[0];
+    if (exitFace !== undefined) {
+      outletFaceId = exitFace;
+      inflowKm3PerYear = cells[exitFace].dischargeKm3PerYear;
+    }
+    lakeBodyCount += 1;
+    const actualEvaporationKm3PerYear = Math.min(
+      inflowKm3PerYear,
+      evaporationCapacityKm3PerYear,
+    );
+    evaporationSinkKm3PerYear[outletFaceId] += actualEvaporationKm3PerYear;
+    if (evaporationCapacityKm3PerYear + 1e-12 >= inflowKm3PerYear) closedLakeBodyCount += 1;
+    else {
+      overflowingLakeBodyCount += 1;
+      overflowOutletFaceIds.add(outletFaceId);
+    }
+    const stableThresholdKm = members.reduce((thresholdKm, faceId) => Math.max(
+      thresholdKm,
+      cells[faceId].lakeSurfaceDepthThresholdKm,
+    ), 0);
+    if (stableThresholdKm <= 0 && Number.isFinite(shorelineDepthKm)) {
+      for (const faceId of members) {
+        const fallbackThresholdKm = Math.max(0.001, shorelineDepthKm);
+        presentationDepthThresholdKm[faceId] = fallbackThresholdKm;
+        cells[faceId].lakeSurfaceDepthThresholdKm = fallbackThresholdKm;
+      }
+    }
+  }
+  return {
+    presentationDepthThresholdKm,
+    evaporationSinkKm3PerYear,
+    lakeBodyCount,
+    closedLakeBodyCount,
+    overflowingLakeBodyCount,
+    overflowOutletFaceIds,
+  };
 }
 
 function erodeAndRouteSediment(
@@ -1515,6 +1706,7 @@ export function createSurfaceProcessWorld(
       biome: refined.isLand ? "temperate-grassland" : "open-ocean",
       isLake: false,
       lakeDepthKm: 0,
+      lakeSurfaceDepthThresholdKm: 0,
       atmosphericMoisture: 0,
       orographicLiftKm: 0,
       lithology: geology.lithology,
@@ -1579,14 +1771,31 @@ export function createSurfaceProcessWorld(
     cell.lakeDepthKm = cell.isLand ? Math.max(0, cell.fillDepthKm) : 0;
     cell.isLake = false;
   }
-  const presentationLakeDepthThresholdKm = classifyResolvedLakes(
+  const openWaterEvaporationScale = clamp(options.openWaterEvaporationScale ?? 1.05, 0.4, 2.5);
+  const lakeBalance = hierarchyAnchor
+    ? inheritResolvedLakeBalance(
+      cells,
+      sphere,
+      adjacency,
+      tectonicWorld.recipe.radiusKm,
+      hierarchyAnchor,
+      openWaterEvaporationScale,
+    )
+    : classifyResolvedLakes(
+      cells,
+      sphere,
+      adjacency,
+      tectonicWorld.seaLevelKm,
+      tectonicWorld.recipe.radiusKm,
+      minimumLakeCatchmentKm2,
+      openWaterEvaporationScale,
+    );
+  const balancedRunoff = balanceRunoffAcrossLakes(
     cells,
-    sphere,
-    adjacency,
-    tectonicWorld.seaLevelKm,
-    tectonicWorld.recipe.radiusKm,
-    minimumLakeCatchmentKm2,
+    finalDrainage.downstreamOrder,
+    lakeBalance.evaporationSinkKm3PerYear,
   );
+  const presentationLakeDepthThresholdKm = lakeBalance.presentationDepthThresholdKm;
   for (const cell of cells) {
     if (!cell.isLake) cell.lakeDepthKm = 0;
     cell.biome = classifySurfaceBiome(cell, tectonicWorld.seaLevelKm);
@@ -1596,7 +1805,9 @@ export function createSurfaceProcessWorld(
     ?? Math.max(90_000, totalSurfaceAreaKm2 / 3_500);
   const riverCells = cells.filter((cell) => cell.isLand
     && cell.receiverFaceId !== null
-    && cell.drainageAreaKm2 >= minimumRiverAreaKm2);
+    && cell.drainageAreaKm2 >= minimumRiverAreaKm2
+    && cell.dischargeKm3PerYear > 1e-12
+    && (!cell.isLake || lakeBalance.overflowOutletFaceIds.has(cell.faceId)));
   const riverFaceIds = new Set(riverCells.map((cell) => cell.faceId));
   const riverPresentationPoints = createRiverPresentationPoints(
     cells,
@@ -1615,6 +1826,23 @@ export function createSurfaceProcessWorld(
       drainageAreaKm2: cell.drainageAreaKm2,
       dischargeKm3PerYear: cell.dischargeKm3PerYear,
     };
+  });
+  const riverMouths: SurfaceRiverMouth[] = rivers.flatMap((river) => {
+    const source = cells[river.fromFaceId];
+    const receiver = cells[river.toFaceId];
+    const receivingWater = !receiver.isLand
+      ? "ocean"
+      : receiver.isLake && !source.isLake
+        ? "lake"
+        : null;
+    return receivingWater === null ? [] : [{
+      fromFaceId: river.fromFaceId,
+      toFaceId: river.toFaceId,
+      point: river.toPoint,
+      receivingWater,
+      drainageAreaKm2: river.drainageAreaKm2,
+      dischargeKm3PerYear: river.dischargeKm3PerYear,
+    }];
   });
 
   const totalRunoff = cells.reduce((sum, cell) => sum + cell.localRunoffKm3PerYear, 0);
@@ -1638,6 +1866,7 @@ export function createSurfaceProcessWorld(
     biome: cell.biome,
     isLake: cell.isLake,
     lakeDepthKm: cell.lakeDepthKm,
+    lakeSurfaceDepthThresholdKm: cell.lakeSurfaceDepthThresholdKm,
     atmosphericMoisture: cell.atmosphericMoisture,
     orographicLiftKm: cell.orographicLiftKm,
     lithology: cell.lithology,
@@ -1826,6 +2055,7 @@ export function createSurfaceProcessWorld(
     sphere,
     cells: immutableCells,
     rivers,
+    riverMouths,
     stats: {
       landFraction: landArea / sphere.totalAreaSteradians,
       landCellCount: cells.filter((cell) => cell.isLand).length,
@@ -1835,12 +2065,21 @@ export function createSurfaceProcessWorld(
         (sum, cell) => sum + (cell.isLake ? sphere.faces[cell.faceId].areaSteradians * radiusSquared : 0),
         0,
       ),
+      lakeBodyCount: lakeBalance.lakeBodyCount,
+      closedLakeBodyCount: lakeBalance.closedLakeBodyCount,
+      overflowingLakeBodyCount: lakeBalance.overflowingLakeBodyCount,
+      lakeEvaporationKm3PerYear: balancedRunoff.lakeEvaporationKm3PerYear,
       riverSegmentCount: rivers.length,
+      riverMouthCount: riverMouths.length,
+      oceanRiverMouthCount: riverMouths.filter((mouth) => mouth.receivingWater === "ocean").length,
+      lakeInflowCount: riverMouths.filter((mouth) => mouth.receivingWater === "lake").length,
       maximumDrainageAreaKm2: cells.reduce((maximum, cell) => Math.max(maximum, cell.drainageAreaKm2), 0),
       maximumDischargeKm3PerYear: cells.reduce((maximum, cell) => Math.max(maximum, cell.dischargeKm3PerYear), 0),
       totalLocalRunoffKm3PerYear: totalRunoff,
-      totalOutletRunoffKm3PerYear: finalDrainage.outletRunoffKm3PerYear,
-      runoffResidualKm3PerYear: totalRunoff - finalDrainage.outletRunoffKm3PerYear,
+      totalOutletRunoffKm3PerYear: balancedRunoff.outletRunoffKm3PerYear,
+      runoffResidualKm3PerYear: totalRunoff
+        - balancedRunoff.outletRunoffKm3PerYear
+        - balancedRunoff.lakeEvaporationKm3PerYear,
       maximumFillDepthKm: cells.reduce((maximum, cell) => Math.max(maximum, cell.fillDepthKm), 0),
       canonicalAnchorMismatches: refinementAudit.canonicalAnchorMismatches,
       drainageAnchorSubdivisions,

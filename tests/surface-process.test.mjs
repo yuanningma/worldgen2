@@ -62,7 +62,7 @@ test("annual physical atlas derives closed biome areas and inland lakes", () => 
   assert.equal(lakes.length, surface.stats.lakeCellCount);
   assert.ok(lakes.every((cell) => cell.isLand
     && cell.biome === "freshwater-lake"
-    && cell.lakeDepthKm >= 0.13));
+    && cell.lakeDepthKm > 0));
   assert.ok(surface.cells.filter((cell) => !cell.isLake)
     .every((cell) => cell.biome !== "freshwater-lake"));
   const expectedLakeAreaKm2 = lakes.reduce(
@@ -72,6 +72,27 @@ test("annual physical atlas derives closed biome areas and inland lakes", () => 
   assert.ok(Math.abs(expectedLakeAreaKm2 - surface.stats.lakeAreaKm2)
     <= Math.max(1e-9, expectedLakeAreaKm2 * 1e-12));
   assert.equal(surface.stats.biomeAreaKm2["freshwater-lake"], surface.stats.lakeAreaKm2);
+  assert.equal(
+    surface.stats.closedLakeBodyCount + surface.stats.overflowingLakeBodyCount,
+    surface.stats.lakeBodyCount,
+  );
+  assert.ok(surface.stats.lakeBodyCount > 0);
+  assert.ok(surface.stats.lakeEvaporationKm3PerYear > 0);
+});
+
+test("annual lake equilibrium responds causally to open-water evaporation", () => {
+  const lowEvaporation = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    openWaterEvaporationScale: 0.6,
+  });
+  const highEvaporation = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    openWaterEvaporationScale: 1.8,
+  });
+  assert.ok(highEvaporation.stats.lakeAreaKm2 <= lowEvaporation.stats.lakeAreaKm2);
+  assert.ok(highEvaporation.stats.lakeCellCount <= lowEvaporation.stats.lakeCellCount);
+  assert.ok(lowEvaporation.stats.lakeBodyCount > 0);
+  assert.ok(highEvaporation.stats.lakeBodyCount > 0);
 });
 
 test("spherical circulation creates longitudinal rainfall structure and orographic enhancement", () => {
@@ -154,6 +175,12 @@ test("fine drainage inherits coarse continental divides while refining local cha
   }
   let inheritedCrossings = 0;
   for (const cell of fine.cells) {
+    const lakeAnchor = coarse.cells[Math.floor(cell.faceId / descendantsPerAnchor)];
+    assert.equal(cell.isLake, cell.isLand && lakeAnchor.isLake);
+    assert.equal(
+      cell.lakeSurfaceDepthThresholdKm,
+      lakeAnchor.lakeSurfaceDepthThresholdKm,
+    );
     if (!cell.isLand || cell.receiverFaceId === null) continue;
     const sourceAnchorId = Math.floor(cell.faceId / descendantsPerAnchor);
     const receiverAnchorId = Math.floor(cell.receiverFaceId / descendantsPerAnchor);
@@ -178,12 +205,38 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
   });
   const tolerance = Math.max(1e-9, surface.stats.totalLocalRunoffKm3PerYear * 1e-12);
   assert.ok(Math.abs(surface.stats.runoffResidualKm3PerYear) <= tolerance);
+  assert.ok(Math.abs(
+    surface.stats.totalLocalRunoffKm3PerYear
+      - surface.stats.totalOutletRunoffKm3PerYear
+      - surface.stats.lakeEvaporationKm3PerYear,
+  ) <= tolerance);
   assert.ok(surface.stats.totalOutletRunoffKm3PerYear > 0);
   assert.ok(surface.stats.riverSegmentCount > 0);
+  assert.equal(surface.riverMouths.length, surface.stats.riverMouthCount);
+  assert.equal(
+    surface.stats.oceanRiverMouthCount + surface.stats.lakeInflowCount,
+    surface.stats.riverMouthCount,
+  );
+  assert.ok(surface.stats.oceanRiverMouthCount > 0);
   assert.ok(surface.stats.maximumDrainageAreaKm2 > 20_000);
   for (const river of surface.rivers) {
     assert.ok(river.drainageAreaKm2 >= 20_000);
     assert.equal(surface.cells[river.fromFaceId].isLand, true);
+    assert.equal(
+      surface.cells[river.fromFaceId].isLake && surface.cells[river.toFaceId].isLake,
+      false,
+    );
+  }
+  for (const mouth of surface.riverMouths) {
+    const source = surface.cells[mouth.fromFaceId];
+    const receiver = surface.cells[mouth.toFaceId];
+    assert.equal(source.isLand, true);
+    if (mouth.receivingWater === "ocean") {
+      assert.equal(receiver.isLand, false);
+    } else {
+      assert.equal(source.isLake, false);
+      assert.equal(receiver.isLake, true);
+    }
   }
 });
 
