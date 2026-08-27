@@ -123,6 +123,10 @@ export interface SurfaceProcessCell {
 export interface SurfaceRiverSegment {
   readonly fromFaceId: number;
   readonly toFaceId: number;
+  /** Renderer-only shared node inside the source process cell. */
+  readonly fromPoint: Vec3;
+  /** Renderer-only shared node inside the receiver process cell. */
+  readonly toPoint: Vec3;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
 }
@@ -141,6 +145,8 @@ export interface SurfacePresentationSample {
   readonly aridityIndex: number;
   readonly biome: SurfaceBiome;
   readonly isLake: boolean;
+  /** Smooth presentation coverage derived from canonical lake cells. */
+  readonly lakeCoverage: number;
   readonly lakeDepthKm: number;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
@@ -1139,8 +1145,9 @@ function classifyResolvedLakes(
   seaLevelKm: number,
   radiusKm: number,
   minimumCatchmentKm2: number,
-): void {
+): Float64Array {
   const visited = new Uint8Array(cells.length);
+  const presentationDepthThresholdKm = new Float64Array(cells.length);
   const connectedDepressionDepthKm = 0.005;
   const resolvedLakeDepthKm = 0.13;
   const radiusSquared = radiusKm ** 2;
@@ -1191,16 +1198,38 @@ function classifyResolvedLakes(
     const deepMembers = members
       .filter((faceId) => cells[faceId].fillDepthKm >= resolvedLakeDepthKm)
       .sort((a, b) => cells[b].fillDepthKm - cells[a].fillDepthKm || a - b);
+    if (deepMembers.length === 0) continue;
+    const eligible = new Set(deepMembers);
+    const queued = new Set<number>();
+    const selected: number[] = [];
+    const lakeHeap = new ElevationHeap();
+    lakeHeap.push({ faceId: deepMembers[0], priority: -cells[deepMembers[0]].fillDepthKm });
+    queued.add(deepMembers[0]);
     let resolvedAreaKm2 = 0;
-    for (const faceId of deepMembers) {
+    for (let entry = lakeHeap.pop(); entry; entry = lakeHeap.pop()) {
+      const faceId = entry.faceId;
       const cell = cells[faceId];
       const areaKm2 = sphere.faces[faceId].areaSteradians * radiusSquared;
-      if (resolvedAreaKm2 > 0 && resolvedAreaKm2 + areaKm2 > maximumResolvedAreaKm2) continue;
+      if (resolvedAreaKm2 > 0 && resolvedAreaKm2 + areaKm2 > maximumResolvedAreaKm2) break;
       cell.isLake = true;
       cell.lakeDepthKm = cell.fillDepthKm;
+      selected.push(faceId);
       resolvedAreaKm2 += areaKm2;
+      for (const neighborId of adjacency[faceId]) {
+        if (!eligible.has(neighborId) || queued.has(neighborId)) continue;
+        queued.add(neighborId);
+        lakeHeap.push({ faceId: neighborId, priority: -cells[neighborId].fillDepthKm });
+      }
+    }
+    if (selected.length > 0) {
+      const shorelineDepthKm = selected.reduce(
+        (minimum, faceId) => Math.min(minimum, cells[faceId].fillDepthKm),
+        Infinity,
+      );
+      for (const faceId of members) presentationDepthThresholdKm[faceId] = shorelineDepthKm;
     }
   }
+  return presentationDepthThresholdKm;
 }
 
 function erodeAndRouteSediment(
@@ -1290,6 +1319,104 @@ function erodeAndRouteSediment(
     depositionalCellCount,
     erodedVolumeByLithologyKm3,
   };
+}
+
+function createRiverPresentationPoints(
+  cells: readonly MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  riverFaceIds: ReadonlySet<number>,
+  seed: number,
+): ReadonlyMap<number, Vec3> {
+  const nodeIds = new Set<number>();
+  const dominantIncoming = new Map<number, number>();
+  for (const faceId of riverFaceIds) {
+    const cell = cells[faceId];
+    if (cell.receiverFaceId === null) continue;
+    nodeIds.add(faceId);
+    nodeIds.add(cell.receiverFaceId);
+    const incumbentId = dominantIncoming.get(cell.receiverFaceId);
+    if (incumbentId === undefined
+      || cells[faceId].drainageAreaKm2 > cells[incumbentId].drainageAreaKm2
+      || (cells[faceId].drainageAreaKm2 === cells[incumbentId].drainageAreaKm2
+        && faceId < incumbentId)) {
+      dominantIncoming.set(cell.receiverFaceId, faceId);
+    }
+  }
+  let points = new Map<number, Vec3>();
+  for (const faceId of nodeIds) points.set(faceId, sphere.faces[faceId].center);
+  for (let pass = 0; pass < 2; pass += 1) {
+    const next = new Map<number, Vec3>();
+    for (const faceId of nodeIds) {
+      const center = sphere.faces[faceId].center;
+      const upstreamId = dominantIncoming.get(faceId);
+      const downstreamId = cells[faceId].isLand ? cells[faceId].receiverFaceId : null;
+      const upstream = upstreamId === undefined ? null : points.get(upstreamId) ?? sphere.faces[upstreamId].center;
+      const downstream = downstreamId === null ? null : points.get(downstreamId) ?? sphere.faces[downstreamId].center;
+      let centerWeight = 0.58;
+      let neighborWeight = 0.21;
+      if (!upstream || !downstream) {
+        centerWeight = 0.72;
+        neighborWeight = 0.28;
+      }
+      const candidate: [number, number, number] = [
+        center[0] * centerWeight,
+        center[1] * centerWeight,
+        center[2] * centerWeight,
+      ];
+      if (upstream) {
+        candidate[0] += upstream[0] * neighborWeight;
+        candidate[1] += upstream[1] * neighborWeight;
+        candidate[2] += upstream[2] * neighborWeight;
+      }
+      if (downstream) {
+        candidate[0] += downstream[0] * neighborWeight;
+        candidate[1] += downstream[1] * neighborWeight;
+        candidate[2] += downstream[2] * neighborWeight;
+      }
+      let smoothed = normalize3(candidate);
+      if (upstream && downstream) {
+        const flow: Vec3 = [
+          downstream[0] - upstream[0],
+          downstream[1] - upstream[1],
+          downstream[2] - upstream[2],
+        ];
+        const lateral = cross3(center, flow);
+        const lateralLength = Math.sqrt(dot3(lateral, lateral));
+        if (lateralLength > 1e-12) {
+          const localStep = adjacency[faceId].reduce((minimum, neighborId) => Math.min(
+            minimum,
+            Math.acos(clamp(dot3(center, sphere.faces[neighborId].center), -1, 1)),
+          ), Infinity);
+          const meander = sphericalNoise(center, seed + 18_821)
+            * localStep * 0.11
+            * (1 - cells[faceId].orogenStrength * 0.45);
+          smoothed = normalize3([
+            smoothed[0] + lateral[0] / lateralLength * meander,
+            smoothed[1] + lateral[1] / lateralLength * meander,
+            smoothed[2] + lateral[2] / lateralLength * meander,
+          ]);
+        }
+      }
+      const localStep = adjacency[faceId].reduce((minimum, neighborId) => Math.min(
+        minimum,
+        Math.acos(clamp(dot3(center, sphere.faces[neighborId].center), -1, 1)),
+      ), Infinity);
+      const displacement = Math.acos(clamp(dot3(center, smoothed), -1, 1));
+      const limit = localStep * 0.38;
+      if (displacement > limit) {
+        const amount = limit / displacement;
+        smoothed = normalize3([
+          center[0] * (1 - amount) + smoothed[0] * amount,
+          center[1] * (1 - amount) + smoothed[1] * amount,
+          center[2] * (1 - amount) + smoothed[2] * amount,
+        ]);
+      }
+      next.set(faceId, smoothed);
+    }
+    points = next;
+  }
+  return points;
 }
 
 /**
@@ -1452,7 +1579,7 @@ export function createSurfaceProcessWorld(
     cell.lakeDepthKm = cell.isLand ? Math.max(0, cell.fillDepthKm) : 0;
     cell.isLake = false;
   }
-  classifyResolvedLakes(
+  const presentationLakeDepthThresholdKm = classifyResolvedLakes(
     cells,
     sphere,
     adjacency,
@@ -1460,20 +1587,35 @@ export function createSurfaceProcessWorld(
     tectonicWorld.recipe.radiusKm,
     minimumLakeCatchmentKm2,
   );
-  for (const cell of cells) cell.biome = classifySurfaceBiome(cell, tectonicWorld.seaLevelKm);
+  for (const cell of cells) {
+    if (!cell.isLake) cell.lakeDepthKm = 0;
+    cell.biome = classifySurfaceBiome(cell, tectonicWorld.seaLevelKm);
+  }
 
   const minimumRiverAreaKm2 = options.minimumRiverAreaKm2
     ?? Math.max(90_000, totalSurfaceAreaKm2 / 3_500);
-  const rivers: SurfaceRiverSegment[] = [];
-  for (const cell of cells) {
-    if (!cell.isLand || cell.receiverFaceId === null || cell.drainageAreaKm2 < minimumRiverAreaKm2) continue;
-    rivers.push({
+  const riverCells = cells.filter((cell) => cell.isLand
+    && cell.receiverFaceId !== null
+    && cell.drainageAreaKm2 >= minimumRiverAreaKm2);
+  const riverFaceIds = new Set(riverCells.map((cell) => cell.faceId));
+  const riverPresentationPoints = createRiverPresentationPoints(
+    cells,
+    sphere,
+    adjacency,
+    riverFaceIds,
+    hashedSeed,
+  );
+  const rivers: SurfaceRiverSegment[] = riverCells.map((cell) => {
+    const receiverFaceId = cell.receiverFaceId as number;
+    return {
       fromFaceId: cell.faceId,
-      toFaceId: cell.receiverFaceId,
+      toFaceId: receiverFaceId,
+      fromPoint: riverPresentationPoints.get(cell.faceId) ?? sphere.faces[cell.faceId].center,
+      toPoint: riverPresentationPoints.get(receiverFaceId) ?? sphere.faces[receiverFaceId].center,
       drainageAreaKm2: cell.drainageAreaKm2,
       dischargeKm3PerYear: cell.dischargeKm3PerYear,
-    });
-  }
+    };
+  });
 
   const totalRunoff = cells.reduce((sum, cell) => sum + cell.localRunoffKm3PerYear, 0);
   const landArea = cells.reduce(
@@ -1516,6 +1658,10 @@ export function createSurfaceProcessWorld(
   const presentationCandidateCount = presentationSampleCount * 4;
   const characteristicRadians = Math.sqrt(sphere.totalAreaSteradians / sphere.faces.length);
   const kernelSharpness = 1.7 / characteristicRadians ** 2;
+  // Reconstruct each resolved lake from a smooth Priority-Flood depression
+  // contour. Canonical lake cells still own area and water accounting; the
+  // scalar contour only replaces their triangular process-cell silhouettes.
+  const lakeKernelSharpness = 1.35 / characteristicRadians ** 2;
   const sampleContinuous = (direction: Vec3): SurfacePresentationSample => {
     const point = normalize3(direction);
     const refined = refinement.sample(point);
@@ -1533,6 +1679,7 @@ export function createSurfaceProcessWorld(
     let continentality = 0;
     let precipitationMPerYear = 0;
     let aridityIndex = 0;
+    let lakeCoverage = 0;
     let lakeDepthKm = 0;
     let drainageAreaKm2 = 0;
     let dischargeKm3PerYear = 0;
@@ -1573,6 +1720,33 @@ export function createSurfaceProcessWorld(
     orographicLiftKm /= totalWeight;
     erosionResistance /= totalWeight;
     orogenStrength /= totalWeight;
+    if (refined.isLand) {
+      let lakePotential = 0;
+      let basinWeight = 0;
+      let basinFillDepthKm = 0;
+      const relevantThresholdKm = candidateIds
+        .map((faceId) => presentationLakeDepthThresholdKm[faceId])
+        .find((thresholdKm) => thresholdKm > 0) ?? 0;
+      for (const faceId of candidateIds) {
+        const cell = immutableCells[faceId];
+        if (!cell.isLand) continue;
+        const weight = Math.exp((dot3(centers[faceId], point) - 1) * lakeKernelSharpness);
+        if (cell.isLake) lakePotential += weight;
+        if (relevantThresholdKm > 0
+          && Math.abs(presentationLakeDepthThresholdKm[faceId] - relevantThresholdKm) < 1e-9) {
+          basinWeight += weight;
+          basinFillDepthKm += cell.fillDepthKm * weight;
+        }
+      }
+      if (basinWeight > 0 && relevantThresholdKm > 0) {
+        const smoothedFillDepthKm = basinFillDepthKm / basinWeight;
+        const depthT = clamp((smoothedFillDepthKm - relevantThresholdKm + 0.025) / 0.05, 0, 1);
+        const depthCoverage = depthT * depthT * (3 - 2 * depthT);
+        const supportT = clamp((lakePotential - 0.035) / 0.1, 0, 1);
+        const supportCoverage = supportT * supportT * (3 - 2 * supportT);
+        lakeCoverage = depthCoverage * supportCoverage;
+      }
+    }
     const gradient: [number, number, number] = [0, 0, 0];
     for (const faceId of candidates) {
       const center = centers[faceId];
@@ -1611,6 +1785,10 @@ export function createSurfaceProcessWorld(
       : Math.min(tectonicWorld.seaLevelKm - 0.001, elevationKm + fineRelief);
     const nearestMatchingId = candidates[0];
     const nearestMatchingCell = immutableCells[nearestMatchingId];
+    const presentationIsLake = refined.isLand && lakeCoverage >= 0.5;
+    const nearestDryCell = nearestMatchingCell.isLake
+      ? candidates.map((faceId) => immutableCells[faceId]).find((cell) => !cell.isLake)
+      : nearestMatchingCell;
     return {
       faceId: nearestMatchingId,
       canonicalFaceId: immutableCells[nearestMatchingId].canonicalFaceId,
@@ -1622,8 +1800,11 @@ export function createSurfaceProcessWorld(
       continentality,
       precipitationMPerYear,
       aridityIndex,
-      biome: nearestMatchingCell.biome,
-      isLake: nearestMatchingCell.isLake,
+      biome: presentationIsLake
+        ? "freshwater-lake"
+        : nearestDryCell?.biome ?? "temperate-grassland",
+      isLake: presentationIsLake,
+      lakeCoverage,
       lakeDepthKm,
       drainageAreaKm2,
       dischargeKm3PerYear,

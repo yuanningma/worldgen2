@@ -187,6 +187,70 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
   }
 });
 
+test("river presentation nodes are shared, spherical, and remain inside their process cells", () => {
+  const surface = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    minimumRiverAreaKm2: 20_000,
+  });
+  const pointByFace = new Map();
+  const neighbors = surface.sphere.faces.map(() => new Set());
+  for (const edge of surface.sphere.edges) {
+    neighbors[edge.faces[0]].add(edge.faces[1]);
+    neighbors[edge.faces[1]].add(edge.faces[0]);
+  }
+  for (const river of surface.rivers) {
+    for (const [faceId, point] of [
+      [river.fromFaceId, river.fromPoint],
+      [river.toFaceId, river.toPoint],
+    ]) {
+      const incumbent = pointByFace.get(faceId);
+      if (incumbent) assert.deepEqual(point, incumbent);
+      else pointByFace.set(faceId, point);
+      assert.ok(Math.abs(Math.hypot(...point) - 1) < 1e-12);
+      const center = surface.sphere.faces[faceId].center;
+      const displacement = Math.acos(Math.max(-1, Math.min(1,
+        center[0] * point[0] + center[1] * point[1] + center[2] * point[2],
+      )));
+      const localStep = Math.min(...[...neighbors[faceId]].map((neighborId) => {
+        const neighbor = surface.sphere.faces[neighborId].center;
+        return Math.acos(Math.max(-1, Math.min(1,
+          center[0] * neighbor[0] + center[1] * neighbor[1] + center[2] * neighbor[2],
+        )));
+      }));
+      assert.ok(displacement <= localStep * 0.381);
+    }
+  }
+});
+
+test("continuous lake coverage interpolates canonical lake shores", () => {
+  const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
+  let shorelineSample = null;
+  for (const edge of surface.sphere.edges) {
+    const first = surface.cells[edge.faces[0]];
+    const second = surface.cells[edge.faces[1]];
+    if (first.isLand && second.isLand && first.isLake !== second.isLake) {
+      const lakeFaceId = first.isLake ? edge.faces[0] : edge.faces[1];
+      const dryFaceId = first.isLake ? edge.faces[1] : edge.faces[0];
+      const lake = surface.sphere.faces[lakeFaceId].center;
+      const dry = surface.sphere.faces[dryFaceId].center;
+      for (let distance = 0.25; distance <= 3; distance += 0.125) {
+        const sample = surface.sampleContinuous([
+          lake[0] + (dry[0] - lake[0]) * distance,
+          lake[1] + (dry[1] - lake[1]) * distance,
+          lake[2] + (dry[2] - lake[2]) * distance,
+        ]);
+        if (sample.isLand && sample.lakeCoverage > 0.05 && sample.lakeCoverage < 0.95) {
+          shorelineSample = sample;
+          break;
+        }
+      }
+      if (shorelineSample) break;
+    }
+  }
+  assert.ok(shorelineSample);
+  assert.ok(shorelineSample.lakeDepthKm >= 0);
+});
+
 test("surface processes are deterministic for a world recipe", () => {
   const first = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
   const second = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });

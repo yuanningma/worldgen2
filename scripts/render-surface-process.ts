@@ -412,6 +412,7 @@ function renderColorAt(longitude: number, latitude: number): {
   readonly rgb: readonly [number, number, number];
   readonly coastDistanceKm: number;
   readonly isLand: boolean;
+  readonly lakeCoverage: number;
 } {
   const radial = Math.cos(latitude);
   const point: readonly [number, number, number] = [
@@ -466,6 +467,7 @@ function renderColorAt(longitude: number, latitude: number): {
     ),
     coastDistanceKm: cell.coastDistanceKm,
     isLand: cell.isLand,
+    lakeCoverage: cell.lakeCoverage,
   };
 }
 
@@ -483,7 +485,9 @@ for (let y = 0; y < height; y += 1) {
       latitudeStep,
       longitudeStep * Math.cos(latitude),
     );
-    if (coastSamples > 1 && center.coastDistanceKm <= pixelRadiusKm * 1.45) {
+    const nearLakeShore = center.lakeCoverage > 0.08 && center.lakeCoverage < 0.92;
+    if (coastSamples > 1
+      && (center.coastDistanceKm <= pixelRadiusKm * 1.45 || nearLakeShore)) {
       const sum = [0, 0, 0];
       for (let sampleY = 0; sampleY < coastSamples; sampleY += 1) {
         for (let sampleX = 0; sampleX < coastSamples; sampleX += 1) {
@@ -545,15 +549,15 @@ if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || ma
     }
   }
   for (const river of surface.rivers) {
-    const from = surface.sphere.faces[river.fromFaceId].center;
-    const to = surface.sphere.faces[river.toFaceId].center;
+    const from = river.fromPoint;
+    const to = river.toPoint;
     const previousRiver = dominantIncoming.get(river.fromFaceId);
     const nextRiver = outgoing.get(river.toFaceId);
     const previous = previousRiver
-      ? longitudeLatitude(surface.sphere.faces[previousRiver.fromFaceId].center, width, height)
+      ? longitudeLatitude(previousRiver.fromPoint, width, height)
       : null;
     const next = nextRiver
-      ? longitudeLatitude(surface.sphere.faces[nextRiver.toFaceId].center, width, height)
+      ? longitudeLatitude(nextRiver.toPoint, width, height)
       : null;
     const strength = clamp(
       (presentationStyle === "atlas" ? 0.26 : 0.31)
