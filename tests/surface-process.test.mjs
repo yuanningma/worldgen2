@@ -95,6 +95,45 @@ test("annual lake equilibrium responds causally to open-water evaporation", () =
   assert.ok(highEvaporation.stats.lakeBodyCount > 0);
 });
 
+test("hybrid depression evolution breaches weak wet basins and retains supported lakes", () => {
+  const hybrid = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    depressionEvolution: "hybrid",
+  });
+  const fillOnly = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    depressionEvolution: "fill-only",
+  });
+  assert.deepEqual(
+    hybrid.cells.map((cell) => cell.isLand),
+    fillOnly.cells.map((cell) => cell.isLand),
+  );
+  assert.ok(hybrid.stats.breachedBasinCount > 0);
+  assert.ok(hybrid.stats.preservedBasinCount > 0);
+  assert.equal(fillOnly.stats.breachedBasinCount, 0);
+  assert.equal(
+    hybrid.stats.breachedBasinCount + hybrid.stats.preservedBasinCount,
+    fillOnly.stats.preservedBasinCount,
+  );
+  assert.ok(hybrid.stats.lakeAreaKm2 < fillOnly.stats.lakeAreaKm2);
+  assert.ok(hybrid.stats.lakeBodyCount < fillOnly.stats.lakeBodyCount);
+  assert.ok(hybrid.stats.spillwayCellCount > 0);
+  assert.ok(hybrid.stats.spillwayExcavatedVolumeKm3 > 0);
+  assert.ok(hybrid.stats.maximumSpillwayIncisionKm > 0);
+  assert.equal(fillOnly.stats.spillwayCellCount, 0);
+  assert.equal(fillOnly.stats.spillwayExcavatedVolumeKm3, 0);
+  const spillways = hybrid.cells.filter((cell) => cell.spillwayIncisionKm > 0);
+  assert.equal(spillways.length, hybrid.stats.spillwayCellCount);
+  assert.ok(spillways.every((cell) => cell.isLand && cell.spillwayIncisionKm < 1));
+  const excavatedVolumeKm3 = spillways.reduce(
+    (sum, cell) => sum + cell.spillwayIncisionKm
+      * hybrid.sphere.faces[cell.faceId].areaSteradians * tectonic.recipe.radiusKm ** 2,
+    0,
+  );
+  assert.ok(Math.abs(excavatedVolumeKm3 - hybrid.stats.spillwayExcavatedVolumeKm3)
+    <= hybrid.stats.spillwayExcavatedVolumeKm3 * 1e-12);
+});
+
 test("spherical circulation creates longitudinal rainfall structure and orographic enhancement", () => {
   const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
   const land = surface.cells.filter((cell) => cell.isLand);
@@ -193,6 +232,11 @@ test("fine drainage inherits coarse continental divides while refining local cha
   assert.ok(inheritedCrossings > 0);
   assert.equal(fine.stats.drainageAnchorSubdivisions, coarse.sphere.subdivisions);
   assert.equal(fine.stats.drainageAnchorMismatches, 0);
+  assert.equal(fine.stats.breachedBasinCount, coarse.stats.breachedBasinCount);
+  assert.equal(fine.stats.preservedBasinCount, coarse.stats.preservedBasinCount);
+  assert.ok(Math.abs(
+    fine.stats.spillwayExcavatedVolumeKm3 - coarse.stats.spillwayExcavatedVolumeKm3,
+  ) <= coarse.stats.spillwayExcavatedVolumeKm3 * 0.05);
   assert.ok(Math.abs(
     fine.stats.maximumDrainageAreaKm2 - coarse.stats.maximumDrainageAreaKm2,
   ) <= coarse.stats.maximumDrainageAreaKm2 * 0.06);
@@ -374,6 +418,8 @@ test("continuous presentation sampling preserves anchors and removes cell-edge j
   assert.ok(first.continentality >= 0 && first.continentality <= 1);
   assert.ok(Number.isFinite(first.drainageAreaKm2) && first.drainageAreaKm2 > 0);
   assert.ok(Number.isFinite(first.dischargeKm3PerYear) && first.dischargeKm3PerYear >= 0);
+  assert.ok(Number.isFinite(first.fillDepthKm) && first.fillDepthKm >= 0);
+  assert.ok(Number.isFinite(first.spillwayIncisionKm) && first.spillwayIncisionKm >= 0);
   assert.ok(Number.isFinite(first.surfaceTexture));
   assert.ok(Math.abs(first.surfaceTexture) <= 1.0000001);
   assert.ok(Math.abs(first.surfaceTexture - second.surfaceTexture) > 1e-10);

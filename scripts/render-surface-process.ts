@@ -47,6 +47,7 @@ const MAP_MODES = [
   "temperature",
   "continentality",
   "drainage",
+  "depressions",
   "wind",
   "lithology",
   "orogeny",
@@ -146,6 +147,8 @@ function color(
   precipitationMPerYear: number,
   aridityIndex: number,
   drainageAreaKm2: number,
+  fillDepthKm: number,
+  spillwayIncisionKm: number,
   biome: SurfaceBiome,
   lithology: SurfaceLithology,
   erosionResistance: number,
@@ -196,6 +199,21 @@ function color(
     return normalized < 0.48
       ? mix([241, 247, 248], [151, 210, 232], normalized / 0.48)
       : mix([151, 210, 232], [18, 72, 138], (normalized - 0.48) / 0.52);
+  }
+  if (mapMode === "depressions") {
+    if (!isLand) return [238, 243, 242];
+    if (spillwayIncisionKm > 0.001) {
+      return mix(
+        [236, 183, 94],
+        [178, 48, 35],
+        clamp(Math.sqrt(spillwayIncisionKm / 0.55)),
+      );
+    }
+    if (isLake) return [50, 119, 177];
+    if (fillDepthKm > 0.005) {
+      return mix([218, 213, 223], [95, 61, 126], clamp(Math.sqrt(fillDepthKm / 0.8)));
+    }
+    return [226, 228, 213];
   }
   if (mapMode === "wind") {
     const angle = Math.atan2(windNorth, windEast);
@@ -390,6 +408,10 @@ const recipe = {
 };
 const world = coupled ? simulateCoupledTectonicWorld(recipe) : simulateTectonicWorld(recipe);
 const minimumRiverAreaKm2 = numberOption("minimum-river-area-km2", 220_000);
+const depressionEvolutionOption = option("depression-evolution") ?? "hybrid";
+if (depressionEvolutionOption !== "hybrid" && depressionEvolutionOption !== "fill-only") {
+  throw new RangeError("--depression-evolution must be hybrid or fill-only");
+}
 const surface = createSurfaceProcessWorld(world, {
   subdivisions: surfaceSubdivisions,
   reliefAmplitudeKm: numberOption("relief-amplitude-km", 0.34),
@@ -398,6 +420,9 @@ const surface = createSurfaceProcessWorld(world, {
   erosionStrengthKm: numberOption("erosion-strength-km", 0.2),
   minimumErosionAreaKm2: numberOption("minimum-erosion-area-km2", 200_000),
   presentationSampleCount: numberOption("presentation-samples", 12),
+  depressionEvolution: depressionEvolutionOption,
+  spillwayErosionScale: numberOption("spillway-erosion-scale", 1),
+  openWaterEvaporationScale: numberOption("open-water-evaporation-scale", 1.05),
 });
 const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
   .filter(([lithology, area]) => lithology !== "oceanic-basalt" && area > 0)
@@ -454,6 +479,8 @@ function renderColorAt(longitude: number, latitude: number): {
       cell.precipitationMPerYear,
       cell.aridityIndex,
       cell.drainageAreaKm2,
+      cell.fillDepthKm,
+      cell.spillwayIncisionKm,
       cell.biome,
       cell.lithology,
       cell.erosionResistance,
@@ -538,7 +565,7 @@ if (mapMode === "natural") {
   }
 }
 
-if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage") {
+if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage" || mapMode === "depressions") {
   const outgoing = new Map<number, (typeof surface.rivers)[number]>();
   const dominantIncoming = new Map<number, (typeof surface.rivers)[number]>();
   for (const river of surface.rivers) {
@@ -634,7 +661,7 @@ const header = Buffer.from([
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">${mapMode.toUpperCase()} MODE · ${escapeXml(seed)}</text>`,
   `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${presentationStyle.toUpperCase()} STYLE · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
-  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · SEDIMENT RESIDUAL ${surface.stats.sedimentResidualKm3.toExponential(2)} KM³ · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
+  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${surface.stats.breachedBasinCount} BREACHED / ${surface.stats.preservedBasinCount} RETAINED BASINS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));
 

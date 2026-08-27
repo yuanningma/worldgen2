@@ -26,6 +26,10 @@ export interface SurfaceProcessOptions {
   readonly presentationSampleCount?: number;
   /** Multiplier on the reduced open-water potential-evaporation estimate. */
   readonly openWaterEvaporationScale?: number;
+  /** Depression evolution applied before the final erosion and lake passes. */
+  readonly depressionEvolution?: "hybrid" | "fill-only";
+  /** Multiplier on discharge-driven spillway incision. */
+  readonly spillwayErosionScale?: number;
 }
 
 export type SurfaceLithology =
@@ -119,6 +123,8 @@ export interface SurfaceProcessCell {
   readonly localRunoffKm3PerYear: number;
   readonly erodedThicknessKm: number;
   readonly depositedThicknessKm: number;
+  /** Terrain removed by the bounded geomorphic spillway pass. */
+  readonly spillwayIncisionKm: number;
   readonly receiverFaceId: number | null;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
@@ -150,6 +156,8 @@ export interface SurfacePresentationSample {
   readonly canonicalFaceId: number;
   readonly isLand: boolean;
   readonly elevationKm: number;
+  readonly fillDepthKm: number;
+  readonly spillwayIncisionKm: number;
   readonly coastDistanceKm: number;
   readonly temperatureC: number;
   readonly seasonalTemperatureRangeC: number;
@@ -198,6 +206,11 @@ export interface SurfaceProcessStats {
   readonly totalOutletRunoffKm3PerYear: number;
   readonly runoffResidualKm3PerYear: number;
   readonly maximumFillDepthKm: number;
+  readonly breachedBasinCount: number;
+  readonly preservedBasinCount: number;
+  readonly spillwayCellCount: number;
+  readonly spillwayExcavatedVolumeKm3: number;
+  readonly maximumSpillwayIncisionKm: number;
   readonly canonicalAnchorMismatches: number;
   /** Stable process-grid level that owns continental drainage divides. */
   readonly drainageAnchorSubdivisions: number;
@@ -244,6 +257,7 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   dischargeKm3PerYear: number;
   erodedThicknessKm: number;
   depositedThicknessKm: number;
+  spillwayIncisionKm: number;
   temperatureC: number;
   seasonalTemperatureRangeC: number;
   continentality: number;
@@ -296,6 +310,14 @@ interface LakeBalanceResult {
 interface BalancedRunoffResult {
   readonly outletRunoffKm3PerYear: number;
   readonly lakeEvaporationKm3PerYear: number;
+}
+
+interface DepressionEvolutionResult {
+  readonly breachedBasinCount: number;
+  readonly preservedBasinCount: number;
+  readonly spillwayCellCount: number;
+  readonly spillwayExcavatedVolumeKm3: number;
+  readonly maximumSpillwayIncisionKm: number;
 }
 
 interface HeapEntry {
@@ -1174,6 +1196,225 @@ function routeSurfaceHydrology(
   return { downstreamOrder, outletRunoffKm3PerYear, anchorMismatches };
 }
 
+/**
+ * Incises a bounded outlet through weak, well-watered spill basins while
+ * retaining dry or structurally supported depressions. Priority-Flood still
+ * owns the receiver graph; this pass changes the terrain that the next flood
+ * sees instead of replacing drainage with a second, incompatible topology.
+ */
+function evolveSurfaceDepressions(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  seaLevelKm: number,
+  radiusKm: number,
+  minimumCatchmentKm2: number,
+  spillwayErosionScale: number,
+): DepressionEvolutionResult {
+  const visited = new Uint8Array(cells.length);
+  const spillwayFaceIds = new Set<number>();
+  const connectedDepressionDepthKm = 0.005;
+  const resolvedDepressionDepthKm = 0.13;
+  const radiusSquared = radiusKm ** 2;
+  let breachedBasinCount = 0;
+  let preservedBasinCount = 0;
+  let spillwayExcavatedVolumeKm3 = 0;
+  let maximumSpillwayIncisionKm = 0;
+
+  for (const start of cells) {
+    if (!start.isLand
+      || start.fillDepthKm < connectedDepressionDepthKm
+      || visited[start.faceId] !== 0) continue;
+    const members: number[] = [];
+    const queue = [start.faceId];
+    visited[start.faceId] = 1;
+    let maximumDepthKm = 0;
+    let maximumCatchmentKm2 = 0;
+    let maximumDischargeKm3PerYear = 0;
+    let maximumFilledElevationKm = -Infinity;
+    let ariditySum = 0;
+    let resistanceSum = 0;
+    let orogenySum = 0;
+    let coldSupportSum = 0;
+    let volcanicCount = 0;
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const faceId = queue[cursor];
+      const cell = cells[faceId];
+      members.push(faceId);
+      maximumDepthKm = Math.max(maximumDepthKm, cell.fillDepthKm);
+      maximumCatchmentKm2 = Math.max(maximumCatchmentKm2, cell.drainageAreaKm2);
+      maximumDischargeKm3PerYear = Math.max(
+        maximumDischargeKm3PerYear,
+        cell.dischargeKm3PerYear,
+      );
+      maximumFilledElevationKm = Math.max(maximumFilledElevationKm, cell.filledElevationKm);
+      ariditySum += cell.aridityIndex;
+      resistanceSum += cell.erosionResistance;
+      orogenySum += cell.orogenStrength;
+      coldSupportSum += clamp((-cell.temperatureC - 2) / 16, 0, 1);
+      if (cell.lithology === "volcanic") volcanicCount += 1;
+      for (const neighborId of adjacency[faceId]) {
+        const neighbor = cells[neighborId];
+        if (visited[neighborId] !== 0
+          || !neighbor.isLand
+          || neighbor.fillDepthKm < connectedDepressionDepthKm) continue;
+        visited[neighborId] = 1;
+        queue.push(neighborId);
+      }
+    }
+    if (maximumDepthKm < resolvedDepressionDepthKm
+      || maximumCatchmentKm2 < minimumCatchmentKm2) continue;
+
+    const memberSet = new Set(members);
+    const outletFaceId = members
+      .filter((faceId) => {
+        const receiverFaceId = cells[faceId].receiverFaceId;
+        return receiverFaceId !== null && !memberSet.has(receiverFaceId);
+      })
+      .sort((a, b) => cells[b].dischargeKm3PerYear - cells[a].dischargeKm3PerYear
+        || cells[a].filledElevationKm - cells[b].filledElevationKm
+        || a - b)[0];
+    if (outletFaceId === undefined) {
+      preservedBasinCount += 1;
+      continue;
+    }
+
+    const memberCount = members.length;
+    const meanAridity = ariditySum / memberCount;
+    const meanResistance = resistanceSum / memberCount;
+    const meanOrogeny = orogenySum / memberCount;
+    const meanColdSupport = coldSupportSum / memberCount;
+    const volcanicFraction = volcanicCount / memberCount;
+    const flowDrive = clamp(
+      Math.log1p(maximumDischargeKm3PerYear / 8) / Math.log(36),
+      0,
+      1,
+    );
+    const catchmentDrive = clamp(
+      Math.log1p(maximumCatchmentKm2 / minimumCatchmentKm2) / Math.log(12),
+      0,
+      1,
+    );
+    const wetnessDrive = clamp((meanAridity - 0.45) / 1.25, 0, 1);
+    const aridPersistence = clamp((0.9 - meanAridity) / 0.65, 0, 1);
+    const persistence = clamp(
+      aridPersistence * 0.4
+        + meanResistance * 0.25
+        + meanOrogeny * 0.2
+        + volcanicFraction * 0.15
+        + meanColdSupport * 0.2,
+      0,
+      1,
+    );
+    const drive = flowDrive * 0.5 + catchmentDrive * 0.3 + wetnessDrive * 0.2;
+    const activation = drive * spillwayErosionScale - persistence * 0.42;
+    if (activation < 0.28) {
+      preservedBasinCount += 1;
+      continue;
+    }
+
+    const requestedIncisionKm = Math.min(
+      maximumDepthKm * clamp(0.18 + activation * 0.75, 0.12, 0.78),
+      0.16 + drive * 0.7,
+    );
+    const targetSpillElevationKm = Math.max(
+      seaLevelKm + 0.004,
+      maximumFilledElevationKm - requestedIncisionKm,
+    );
+    const allowedCutKm = Math.max(
+      0.08,
+      (0.16 + drive * 0.72)
+        * spillwayErosionScale
+        * (1 - persistence * 0.35),
+    );
+    const allowedLengthKm = 450 + drive * 1_500;
+    const minimumChannelGradient = 0.00012;
+    const path: Array<{ faceId: number; incisionKm: number }> = [];
+    const pathVisited = new Set<number>();
+    let cursorFaceId = outletFaceId;
+    let previousFaceId = outletFaceId;
+    let cumulativeDistanceKm = 0;
+    let maximumRequiredCutKm = 0;
+    let weightedResistance = 0;
+    let pathWeight = 0;
+    let reachedLowerTerrain = false;
+    for (let step = 0; step < 64; step += 1) {
+      if (pathVisited.has(cursorFaceId)) break;
+      pathVisited.add(cursorFaceId);
+      const cell = cells[cursorFaceId];
+      if (!cell.isLand) {
+        reachedLowerTerrain = true;
+        break;
+      }
+      if (step > 0) {
+        const previous = sphere.faces[previousFaceId].center;
+        const current = sphere.faces[cursorFaceId].center;
+        cumulativeDistanceKm += Math.acos(clamp(dot3(previous, current), -1, 1)) * radiusKm;
+      }
+      const targetElevationKm = Math.max(
+        seaLevelKm + 0.002,
+        targetSpillElevationKm - cumulativeDistanceKm * minimumChannelGradient,
+      );
+      if (!memberSet.has(cursorFaceId)
+        && cell.fillDepthKm < connectedDepressionDepthKm
+        && cell.elevationKm <= targetElevationKm) {
+        reachedLowerTerrain = true;
+        break;
+      }
+      const incisionKm = Math.max(0, cell.elevationKm - targetElevationKm);
+      if (incisionKm > 0) {
+        path.push({ faceId: cursorFaceId, incisionKm });
+        maximumRequiredCutKm = Math.max(maximumRequiredCutKm, incisionKm);
+        weightedResistance += cell.erosionResistance * incisionKm;
+        pathWeight += incisionKm;
+      }
+      if (cumulativeDistanceKm > allowedLengthKm || cell.receiverFaceId === null) break;
+      previousFaceId = cursorFaceId;
+      cursorFaceId = cell.receiverFaceId;
+    }
+    const meanPathResistance = pathWeight > 0
+      ? weightedResistance / pathWeight
+      : meanResistance;
+    const breachScore = drive * 1.4
+      + (1 - persistence) * 0.45
+      - maximumRequiredCutKm / allowedCutKm * 0.55
+      - cumulativeDistanceKm / allowedLengthKm * 0.25
+      - meanPathResistance * 0.08;
+    const canBreach = reachedLowerTerrain
+      && path.length > 0
+      && maximumRequiredCutKm <= allowedCutKm
+      && cumulativeDistanceKm <= allowedLengthKm
+      && breachScore >= 0.65;
+    if (!canBreach) {
+      preservedBasinCount += 1;
+      continue;
+    }
+
+    breachedBasinCount += 1;
+    for (const segment of path) {
+      const cell = cells[segment.faceId];
+      const incisionKm = Math.min(
+        segment.incisionKm,
+        Math.max(0, cell.elevationKm - seaLevelKm - 0.002),
+      );
+      if (incisionKm <= 0) continue;
+      const areaKm2 = sphere.faces[segment.faceId].areaSteradians * radiusSquared;
+      cell.elevationKm -= incisionKm;
+      cell.spillwayIncisionKm += incisionKm;
+      spillwayFaceIds.add(segment.faceId);
+      spillwayExcavatedVolumeKm3 += incisionKm * areaKm2;
+      maximumSpillwayIncisionKm = Math.max(maximumSpillwayIncisionKm, incisionKm);
+    }
+  }
+  return {
+    breachedBasinCount,
+    preservedBasinCount,
+    spillwayCellCount: spillwayFaceIds.size,
+    spillwayExcavatedVolumeKm3,
+    maximumSpillwayIncisionKm,
+  };
+}
+
 function classifyResolvedLakes(
   cells: MutableSurfaceCell[],
   sphere: GeodesicSphere,
@@ -1655,6 +1896,10 @@ export function createSurfaceProcessWorld(
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
   const radiusSquared = tectonicWorld.recipe.radiusKm ** 2;
+  const inheritedDetailLevels = hierarchyAnchor
+    ? subdivisions - hierarchyAnchor.sphere.subdivisions
+    : 0;
+  const inheritedDescendantsPerAnchor = 4 ** inheritedDetailLevels;
   const cells: MutableSurfaceCell[] = sphere.faces.map((face) => {
     const refined = refinement.sample(face.center);
     const canonicalFaceId = Math.floor(face.id / 4 ** detailLevels);
@@ -1686,9 +1931,18 @@ export function createSurfaceProcessWorld(
         * (0.35 + continentalEnvelope * 0.25 + mountainEnvelope * 0.9)
         * (0.72 + geology.erosionResistance * 0.42)
       : noise * reliefAmplitudeKm * 0.16;
-    const elevationKm = refined.isLand
+    const preSpillwayElevationKm = refined.isLand
       ? Math.max(tectonicWorld.seaLevelKm + 0.002, structuralElevationKm + detail)
       : Math.min(tectonicWorld.seaLevelKm - 0.002, structuralElevationKm + detail);
+    const inheritedSpillwayIncisionKm = hierarchyAnchor && refined.isLand
+      ? hierarchyAnchor.cells[Math.floor(face.id / inheritedDescendantsPerAnchor)].spillwayIncisionKm
+      : 0;
+    const elevationKm = refined.isLand
+      ? Math.max(
+        tectonicWorld.seaLevelKm + 0.002,
+        preSpillwayElevationKm - inheritedSpillwayIncisionKm,
+      )
+      : preSpillwayElevationKm;
     const areaKm2 = face.areaSteradians * radiusSquared;
     return {
       faceId: face.id,
@@ -1716,6 +1970,7 @@ export function createSurfaceProcessWorld(
       localRunoffKm3PerYear: 0,
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
+      spillwayIncisionKm: Math.max(0, preSpillwayElevationKm - elevationKm),
       receiverFaceId: null,
       drainageAreaKm2: refined.isLand ? areaKm2 : 0,
       dischargeKm3PerYear: 0,
@@ -1746,13 +2001,51 @@ export function createSurfaceProcessWorld(
     hierarchyAnchor,
   );
   const totalSurfaceAreaKm2 = sphere.totalAreaSteradians * radiusSquared;
+  const minimumLakeCatchmentKm2 = Math.max(500_000, totalSurfaceAreaKm2 / 1_200);
+  const depressionEvolutionMode = options.depressionEvolution ?? "hybrid";
+  if (depressionEvolutionMode !== "hybrid" && depressionEvolutionMode !== "fill-only") {
+    throw new RangeError("depression evolution must be hybrid or fill-only");
+  }
+  const spillwayErosionScale = clamp(options.spillwayErosionScale ?? 1, 0.25, 2.5);
+  const depressionEvolution: DepressionEvolutionResult = hierarchyAnchor
+    ? {
+      breachedBasinCount: hierarchyAnchor.stats.breachedBasinCount,
+      preservedBasinCount: hierarchyAnchor.stats.preservedBasinCount,
+      spillwayCellCount: cells.filter((cell) => cell.spillwayIncisionKm > 0).length,
+      spillwayExcavatedVolumeKm3: cells.reduce(
+        (sum, cell) => sum + cell.spillwayIncisionKm
+          * sphere.faces[cell.faceId].areaSteradians * radiusSquared,
+        0,
+      ),
+      maximumSpillwayIncisionKm: cells.reduce(
+        (maximum, cell) => Math.max(maximum, cell.spillwayIncisionKm),
+        0,
+      ),
+    }
+    : evolveSurfaceDepressions(
+      cells,
+      sphere,
+      adjacency,
+      tectonicWorld.seaLevelKm,
+      tectonicWorld.recipe.radiusKm,
+      minimumLakeCatchmentKm2,
+      depressionEvolutionMode === "hybrid" ? spillwayErosionScale : 0,
+    );
+  const evolvedDrainage = depressionEvolution.spillwayCellCount > 0 && !hierarchyAnchor
+    ? routeSurfaceHydrology(
+      cells,
+      sphere,
+      adjacency,
+      tectonicWorld.recipe.radiusKm,
+    )
+    : initialDrainage;
   const erosionStrengthKm = clamp(options.erosionStrengthKm ?? 0.2, 0, 0.6);
   const minimumErosionAreaKm2 = options.minimumErosionAreaKm2
     ?? Math.max(180_000, totalSurfaceAreaKm2 / 2_500);
   const sedimentBudget = erodeAndRouteSediment(
     cells,
     sphere,
-    initialDrainage,
+    evolvedDrainage,
     tectonicWorld.seaLevelKm,
     tectonicWorld.recipe.radiusKm,
     erosionStrengthKm,
@@ -1766,7 +2059,6 @@ export function createSurfaceProcessWorld(
     hierarchyAnchor,
   );
 
-  const minimumLakeCatchmentKm2 = Math.max(500_000, totalSurfaceAreaKm2 / 1_200);
   for (const cell of cells) {
     cell.lakeDepthKm = cell.isLand ? Math.max(0, cell.fillDepthKm) : 0;
     cell.isLake = false;
@@ -1876,6 +2168,7 @@ export function createSurfaceProcessWorld(
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
     erodedThicknessKm: cell.erodedThicknessKm,
     depositedThicknessKm: cell.depositedThicknessKm,
+    spillwayIncisionKm: cell.spillwayIncisionKm,
     receiverFaceId: cell.receiverFaceId,
     drainageAreaKm2: cell.drainageAreaKm2,
     dischargeKm3PerYear: cell.dischargeKm3PerYear,
@@ -1902,6 +2195,8 @@ export function createSurfaceProcessWorld(
     if (candidates.length === 0) candidates.push(fallbackId);
     let totalWeight = 0;
     let elevationKm = 0;
+    let fillDepthKm = 0;
+    let spillwayIncisionKm = 0;
     let coastDistanceKm = 0;
     let temperatureC = 0;
     let seasonalTemperatureRangeC = 0;
@@ -1921,6 +2216,8 @@ export function createSurfaceProcessWorld(
       const cell = immutableCells[faceId];
       totalWeight += weight;
       elevationKm += cell.elevationKm * weight;
+      fillDepthKm += cell.fillDepthKm * weight;
+      spillwayIncisionKm += cell.spillwayIncisionKm * weight;
       coastDistanceKm += (Number.isFinite(cell.coastDistanceKm) ? cell.coastDistanceKm : 0) * weight;
       temperatureC += cell.temperatureC * weight;
       seasonalTemperatureRangeC += cell.seasonalTemperatureRangeC * weight;
@@ -1936,6 +2233,8 @@ export function createSurfaceProcessWorld(
       orogenStrength += cell.orogenStrength * weight;
     }
     elevationKm /= totalWeight;
+    fillDepthKm /= totalWeight;
+    spillwayIncisionKm /= totalWeight;
     coastDistanceKm /= totalWeight;
     temperatureC /= totalWeight;
     seasonalTemperatureRangeC /= totalWeight;
@@ -2023,6 +2322,8 @@ export function createSurfaceProcessWorld(
       canonicalFaceId: immutableCells[nearestMatchingId].canonicalFaceId,
       isLand: refined.isLand,
       elevationKm,
+      fillDepthKm,
+      spillwayIncisionKm,
       coastDistanceKm,
       temperatureC,
       seasonalTemperatureRangeC,
@@ -2081,6 +2382,7 @@ export function createSurfaceProcessWorld(
         - balancedRunoff.outletRunoffKm3PerYear
         - balancedRunoff.lakeEvaporationKm3PerYear,
       maximumFillDepthKm: cells.reduce((maximum, cell) => Math.max(maximum, cell.fillDepthKm), 0),
+      ...depressionEvolution,
       canonicalAnchorMismatches: refinementAudit.canonicalAnchorMismatches,
       drainageAnchorSubdivisions,
       drainageAnchorMismatches: finalDrainage.anchorMismatches,
