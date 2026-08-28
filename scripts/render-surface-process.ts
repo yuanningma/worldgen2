@@ -48,6 +48,7 @@ const MAP_MODES = [
   "continentality",
   "drainage",
   "depressions",
+  "geomorphology",
   "wind",
   "lithology",
   "orogeny",
@@ -149,6 +150,8 @@ function color(
   drainageAreaKm2: number,
   fillDepthKm: number,
   spillwayIncisionKm: number,
+  hillslopeChangeKm: number,
+  valleyIncisionKm: number,
   biome: SurfaceBiome,
   lithology: SurfaceLithology,
   erosionResistance: number,
@@ -214,6 +217,31 @@ function color(
       return mix([218, 213, 223], [95, 61, 126], clamp(Math.sqrt(fillDepthKm / 0.8)));
     }
     return [226, 228, 213];
+  }
+  if (mapMode === "geomorphology") {
+    if (!isLand) return [44, 65, 74];
+    if (valleyIncisionKm > 0.002) {
+      return mix(
+        [143, 183, 190],
+        [31, 83, 133],
+        clamp(Math.sqrt(valleyIncisionKm / 0.22)),
+      );
+    }
+    if (hillslopeChangeKm < -0.00005) {
+      return mix(
+        [211, 207, 190],
+        [176, 91, 63],
+        clamp(Math.sqrt(-hillslopeChangeKm / 0.08)),
+      );
+    }
+    if (hillslopeChangeKm > 0.00005) {
+      return mix(
+        [211, 207, 190],
+        [92, 142, 92],
+        clamp(Math.sqrt(hillslopeChangeKm / 0.08)),
+      );
+    }
+    return [211, 207, 190];
   }
   if (mapMode === "wind") {
     const angle = Math.atan2(windNorth, windEast);
@@ -423,6 +451,9 @@ const surface = createSurfaceProcessWorld(world, {
   depressionEvolution: depressionEvolutionOption,
   spillwayErosionScale: numberOption("spillway-erosion-scale", 1),
   openWaterEvaporationScale: numberOption("open-water-evaporation-scale", 1.05),
+  hillslopeDiffusionLengthKm: numberOption("hillslope-diffusion-length-km", 42),
+  hillslopeDiffusionPasses: numberOption("hillslope-diffusion-passes", 4),
+  valleyReliefScale: numberOption("valley-relief-scale", 1),
 });
 const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
   .filter(([lithology, area]) => lithology !== "oceanic-basalt" && area > 0)
@@ -481,6 +512,8 @@ function renderColorAt(longitude: number, latitude: number): {
       cell.drainageAreaKm2,
       cell.fillDepthKm,
       cell.spillwayIncisionKm,
+      cell.hillslopeChangeKm,
+      cell.valleyIncisionKm,
       cell.biome,
       cell.lithology,
       cell.erosionResistance,
@@ -565,7 +598,7 @@ if (mapMode === "natural") {
   }
 }
 
-if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage" || mapMode === "depressions") {
+if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage" || mapMode === "depressions" || mapMode === "geomorphology") {
   const outgoing = new Map<number, (typeof surface.rivers)[number]>();
   const dominantIncoming = new Map<number, (typeof surface.rivers)[number]>();
   for (const river of surface.rivers) {

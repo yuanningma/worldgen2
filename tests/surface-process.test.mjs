@@ -379,6 +379,65 @@ test("fluvial incision conserves sediment and preserves the canonical coast", ()
   assert.ok(eroded.cells.some((cell, index) => cell.elevationKm < uneroded.cells[index].elevationKm - 1e-5));
 });
 
+test("hillslope diffusion conserves terrain volume and preserves land authority", () => {
+  const diffused = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    hillslopeDiffusionLengthKm: 42,
+    hillslopeDiffusionPasses: 4,
+  });
+  const undiffused = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    hillslopeDiffusionLengthKm: 0,
+  });
+  assert.deepEqual(
+    diffused.cells.map((cell) => cell.isLand),
+    undiffused.cells.map((cell) => cell.isLand),
+  );
+  assert.ok(diffused.stats.hillslopeErodedVolumeKm3 > 0);
+  assert.equal(
+    diffused.stats.hillslopeErodedVolumeKm3,
+    diffused.stats.hillslopeDepositedVolumeKm3,
+  );
+  assert.equal(diffused.stats.hillslopeResidualKm3, 0);
+  assert.ok(diffused.stats.hillslopeAdjustedCellCount > 0);
+  assert.ok(diffused.stats.maximumHillslopeChangeKm > 0);
+  assert.equal(undiffused.stats.hillslopeErodedVolumeKm3, 0);
+  assert.equal(undiffused.stats.hillslopeDepositedVolumeKm3, 0);
+  assert.equal(undiffused.stats.hillslopeAdjustedCellCount, 0);
+  const changed = diffused.cells.filter(
+    (cell, index) => Math.abs(cell.elevationKm - undiffused.cells[index].elevationKm) > 1e-9,
+  );
+  assert.ok(changed.length > 0);
+  assert.ok(diffused.cells.every((cell) => cell.hillslopeErosionKm >= 0
+    && cell.hillslopeDepositionKm >= 0));
+});
+
+test("continuous valley relief follows resolved rivers without changing process geography", () => {
+  const withValleys = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    minimumRiverAreaKm2: 20_000,
+    valleyReliefScale: 1,
+  });
+  const withoutValleys = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    minimumRiverAreaKm2: 20_000,
+    valleyReliefScale: 0,
+  });
+  assert.deepEqual(withValleys.cells, withoutValleys.cells);
+  assert.deepEqual(withValleys.rivers, withoutValleys.rivers);
+  const majorRiver = withValleys.rivers.reduce((largest, river) => (
+    river.drainageAreaKm2 > largest.drainageAreaKm2 ? river : largest
+  ));
+  const valleySample = withValleys.sampleContinuous(majorRiver.fromPoint);
+  const flatSample = withoutValleys.sampleContinuous(majorRiver.fromPoint);
+  assert.equal(valleySample.isLand, true);
+  assert.ok(valleySample.valleyIncisionKm > 0.03);
+  assert.equal(flatSample.valleyIncisionKm, 0);
+  assert.ok(valleySample.elevationKm < flatSample.elevationKm);
+  assert.equal(valleySample.faceId, flatSample.faceId);
+  assert.equal(valleySample.biome, flatSample.biome);
+});
+
 test("continuous presentation sampling preserves anchors and removes cell-edge jumps", () => {
   const surface = createSurfaceProcessWorld(tectonic, {
     subdivisions: 4,
@@ -420,6 +479,8 @@ test("continuous presentation sampling preserves anchors and removes cell-edge j
   assert.ok(Number.isFinite(first.dischargeKm3PerYear) && first.dischargeKm3PerYear >= 0);
   assert.ok(Number.isFinite(first.fillDepthKm) && first.fillDepthKm >= 0);
   assert.ok(Number.isFinite(first.spillwayIncisionKm) && first.spillwayIncisionKm >= 0);
+  assert.ok(Number.isFinite(first.hillslopeChangeKm));
+  assert.ok(Number.isFinite(first.valleyIncisionKm) && first.valleyIncisionKm >= 0);
   assert.ok(Number.isFinite(first.surfaceTexture));
   assert.ok(Math.abs(first.surfaceTexture) <= 1.0000001);
   assert.ok(Math.abs(first.surfaceTexture - second.surfaceTexture) > 1e-10);

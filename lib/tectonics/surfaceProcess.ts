@@ -30,6 +30,12 @@ export interface SurfaceProcessOptions {
   readonly depressionEvolution?: "hybrid" | "fill-only";
   /** Multiplier on discharge-driven spillway incision. */
   readonly spillwayErosionScale?: number;
+  /** Physical smoothing length used by conservative hillslope diffusion. */
+  readonly hillslopeDiffusionLengthKm?: number;
+  /** Bounded explicit diffusion iterations. */
+  readonly hillslopeDiffusionPasses?: number;
+  /** Multiplier on renderer-scale drainage-conditioned valley relief. */
+  readonly valleyReliefScale?: number;
 }
 
 export type SurfaceLithology =
@@ -125,6 +131,8 @@ export interface SurfaceProcessCell {
   readonly depositedThicknessKm: number;
   /** Terrain removed by the bounded geomorphic spillway pass. */
   readonly spillwayIncisionKm: number;
+  readonly hillslopeErosionKm: number;
+  readonly hillslopeDepositionKm: number;
   readonly receiverFaceId: number | null;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
@@ -158,6 +166,8 @@ export interface SurfacePresentationSample {
   readonly elevationKm: number;
   readonly fillDepthKm: number;
   readonly spillwayIncisionKm: number;
+  readonly hillslopeChangeKm: number;
+  readonly valleyIncisionKm: number;
   readonly coastDistanceKm: number;
   readonly temperatureC: number;
   readonly seasonalTemperatureRangeC: number;
@@ -211,6 +221,11 @@ export interface SurfaceProcessStats {
   readonly spillwayCellCount: number;
   readonly spillwayExcavatedVolumeKm3: number;
   readonly maximumSpillwayIncisionKm: number;
+  readonly hillslopeErodedVolumeKm3: number;
+  readonly hillslopeDepositedVolumeKm3: number;
+  readonly hillslopeResidualKm3: number;
+  readonly hillslopeAdjustedCellCount: number;
+  readonly maximumHillslopeChangeKm: number;
   readonly canonicalAnchorMismatches: number;
   /** Stable process-grid level that owns continental drainage divides. */
   readonly drainageAnchorSubdivisions: number;
@@ -258,6 +273,8 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   erodedThicknessKm: number;
   depositedThicknessKm: number;
   spillwayIncisionKm: number;
+  hillslopeErosionKm: number;
+  hillslopeDepositionKm: number;
   temperatureC: number;
   seasonalTemperatureRangeC: number;
   continentality: number;
@@ -318,6 +335,14 @@ interface DepressionEvolutionResult {
   readonly spillwayCellCount: number;
   readonly spillwayExcavatedVolumeKm3: number;
   readonly maximumSpillwayIncisionKm: number;
+}
+
+interface HillslopeDiffusionResult {
+  readonly hillslopeErodedVolumeKm3: number;
+  readonly hillslopeDepositedVolumeKm3: number;
+  readonly hillslopeResidualKm3: number;
+  readonly hillslopeAdjustedCellCount: number;
+  readonly maximumHillslopeChangeKm: number;
 }
 
 interface HeapEntry {
@@ -1753,6 +1778,132 @@ function erodeAndRouteSediment(
   };
 }
 
+/**
+ * Redistributes land elevation along land-land edges with an explicit,
+ * resolution-aware diffusion length. Every transfer removes and deposits the
+ * same volume; no material crosses the canonical coast in this pass.
+ */
+function diffuseHillslopes(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  seaLevelKm: number,
+  radiusKm: number,
+  diffusionLengthKm: number,
+  passes: number,
+): HillslopeDiffusionResult {
+  if (diffusionLengthKm <= 0 || passes <= 0) {
+    return {
+      hillslopeErodedVolumeKm3: 0,
+      hillslopeDepositedVolumeKm3: 0,
+      hillslopeResidualKm3: 0,
+      hillslopeAdjustedCellCount: 0,
+      maximumHillslopeChangeKm: 0,
+    };
+  }
+  const radiusSquared = radiusKm ** 2;
+  const areasKm2 = Float64Array.from(
+    sphere.faces,
+    (face) => face.areaSteradians * radiusSquared,
+  );
+  const initialElevationKm = Float64Array.from(cells, (cell) => cell.elevationKm);
+  let hillslopeErodedVolumeKm3 = 0;
+  let hillslopeDepositedVolumeKm3 = 0;
+
+  for (let pass = 0; pass < passes; pass += 1) {
+    const elevationsKm = Float64Array.from(cells, (cell) => cell.elevationKm);
+    const outgoingVolumeKm3 = new Float64Array(cells.length);
+    const transfers: Array<{ highFaceId: number; lowFaceId: number; volumeKm3: number }> = [];
+    for (const edge of sphere.edges) {
+      const firstFaceId = edge.faces[0];
+      const secondFaceId = edge.faces[1];
+      const first = cells[firstFaceId];
+      const second = cells[secondFaceId];
+      if (!first.isLand || !second.isLand) continue;
+      const firstElevationKm = elevationsKm[firstFaceId];
+      const secondElevationKm = elevationsKm[secondFaceId];
+      const elevationDifferenceKm = Math.abs(firstElevationKm - secondElevationKm);
+      if (elevationDifferenceKm <= 1e-8) continue;
+      const highFaceId = firstElevationKm > secondElevationKm ? firstFaceId : secondFaceId;
+      const lowFaceId = highFaceId === firstFaceId ? secondFaceId : firstFaceId;
+      const centerA = sphere.faces[firstFaceId].center;
+      const centerB = sphere.faces[secondFaceId].center;
+      const distanceKm = Math.max(
+        1,
+        Math.acos(clamp(dot3(centerA, centerB), -1, 1)) * radiusKm,
+      );
+      const slope = elevationDifferenceKm / distanceKm;
+      const slopeActivation = clamp((slope - 0.00035) / 0.012, 0, 1);
+      if (slopeActivation <= 0) continue;
+      const high = cells[highFaceId];
+      const low = cells[lowFaceId];
+      const mobility = (0.28 + (1 - (high.erosionResistance + low.erosionResistance) * 0.5) * 0.58)
+        * (1 - (high.orogenStrength + low.orogenStrength) * 0.21);
+      const diffusionCoefficient = clamp(
+        (diffusionLengthKm / distanceKm) ** 2 * 0.075,
+        0,
+        0.12,
+      );
+      const volumeKm3 = elevationDifferenceKm
+        * Math.min(areasKm2[highFaceId], areasKm2[lowFaceId])
+        * diffusionCoefficient
+        * mobility
+        * slopeActivation;
+      if (volumeKm3 <= 1e-12) continue;
+      transfers.push({ highFaceId, lowFaceId, volumeKm3 });
+      outgoingVolumeKm3[highFaceId] += volumeKm3;
+    }
+
+    const outgoingScale = new Float64Array(cells.length);
+    outgoingScale.fill(1);
+    for (const cell of cells) {
+      if (!cell.isLand || outgoingVolumeKm3[cell.faceId] <= 0) continue;
+      const availableVolumeKm3 = Math.max(
+        0,
+        elevationsKm[cell.faceId] - seaLevelKm - 0.002,
+      ) * areasKm2[cell.faceId] * 0.16;
+      outgoingScale[cell.faceId] = Math.min(
+        1,
+        availableVolumeKm3 / outgoingVolumeKm3[cell.faceId],
+      );
+    }
+
+    const elevationVolumeDeltaKm3 = new Float64Array(cells.length);
+    for (const transfer of transfers) {
+      const volumeKm3 = transfer.volumeKm3 * outgoingScale[transfer.highFaceId];
+      if (volumeKm3 <= 1e-12) continue;
+      elevationVolumeDeltaKm3[transfer.highFaceId] -= volumeKm3;
+      elevationVolumeDeltaKm3[transfer.lowFaceId] += volumeKm3;
+      cells[transfer.highFaceId].hillslopeErosionKm += volumeKm3 / areasKm2[transfer.highFaceId];
+      cells[transfer.lowFaceId].hillslopeDepositionKm += volumeKm3 / areasKm2[transfer.lowFaceId];
+      hillslopeErodedVolumeKm3 += volumeKm3;
+      hillslopeDepositedVolumeKm3 += volumeKm3;
+    }
+    for (const cell of cells) {
+      if (!cell.isLand || elevationVolumeDeltaKm3[cell.faceId] === 0) continue;
+      cell.elevationKm += elevationVolumeDeltaKm3[cell.faceId] / areasKm2[cell.faceId];
+    }
+  }
+
+  let hillslopeAdjustedCellCount = 0;
+  let maximumHillslopeChangeKm = 0;
+  for (const cell of cells) {
+    if (cell.hillslopeErosionKm > 0 || cell.hillslopeDepositionKm > 0) {
+      hillslopeAdjustedCellCount += 1;
+    }
+    maximumHillslopeChangeKm = Math.max(
+      maximumHillslopeChangeKm,
+      Math.abs(cell.elevationKm - initialElevationKm[cell.faceId]),
+    );
+  }
+  return {
+    hillslopeErodedVolumeKm3,
+    hillslopeDepositedVolumeKm3,
+    hillslopeResidualKm3: hillslopeErodedVolumeKm3 - hillslopeDepositedVolumeKm3,
+    hillslopeAdjustedCellCount,
+    maximumHillslopeChangeKm,
+  };
+}
+
 function createRiverPresentationPoints(
   cells: readonly MutableSurfaceCell[],
   sphere: GeodesicSphere,
@@ -1892,6 +2043,7 @@ export function createSurfaceProcessWorld(
     throw new Error("surface process refinement changed a canonical topology anchor");
   }
   const reliefAmplitudeKm = clamp(options.reliefAmplitudeKm ?? 0.34, 0, 1.25);
+  const valleyReliefScale = clamp(options.valleyReliefScale ?? 1, 0, 2.5);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
@@ -1971,6 +2123,8 @@ export function createSurfaceProcessWorld(
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
       spillwayIncisionKm: Math.max(0, preSpillwayElevationKm - elevationKm),
+      hillslopeErosionKm: 0,
+      hillslopeDepositionKm: 0,
       receiverFaceId: null,
       drainageAreaKm2: refined.isLand ? areaKm2 : 0,
       dischargeKm3PerYear: 0,
@@ -2050,6 +2204,14 @@ export function createSurfaceProcessWorld(
     tectonicWorld.recipe.radiusKm,
     erosionStrengthKm,
     minimumErosionAreaKm2,
+  );
+  const hillslopeDiffusion = diffuseHillslopes(
+    cells,
+    sphere,
+    tectonicWorld.seaLevelKm,
+    tectonicWorld.recipe.radiusKm,
+    clamp(options.hillslopeDiffusionLengthKm ?? 42, 0, 180),
+    Math.round(clamp(options.hillslopeDiffusionPasses ?? 4, 0, 8)),
   );
   const finalDrainage = routeSurfaceHydrology(
     cells,
@@ -2169,10 +2331,17 @@ export function createSurfaceProcessWorld(
     erodedThicknessKm: cell.erodedThicknessKm,
     depositedThicknessKm: cell.depositedThicknessKm,
     spillwayIncisionKm: cell.spillwayIncisionKm,
+    hillslopeErosionKm: cell.hillslopeErosionKm,
+    hillslopeDepositionKm: cell.hillslopeDepositionKm,
     receiverFaceId: cell.receiverFaceId,
     drainageAreaKm2: cell.drainageAreaKm2,
     dischargeKm3PerYear: cell.dischargeKm3PerYear,
   }));
+  const riverByFaceId = new Map(rivers.map((river) => [river.fromFaceId, river] as const));
+  const maximumRiverDrainageAreaKm2 = rivers.reduce(
+    (maximum, river) => Math.max(maximum, river.drainageAreaKm2),
+    minimumRiverAreaKm2,
+  );
   const centers = sphere.faces.map((face) => face.center);
   const root = buildKdTree(sphere.faces.map((face) => face.id), centers);
   if (!root) throw new Error("surface process grid must contain faces");
@@ -2197,6 +2366,7 @@ export function createSurfaceProcessWorld(
     let elevationKm = 0;
     let fillDepthKm = 0;
     let spillwayIncisionKm = 0;
+    let hillslopeChangeKm = 0;
     let coastDistanceKm = 0;
     let temperatureC = 0;
     let seasonalTemperatureRangeC = 0;
@@ -2218,6 +2388,7 @@ export function createSurfaceProcessWorld(
       elevationKm += cell.elevationKm * weight;
       fillDepthKm += cell.fillDepthKm * weight;
       spillwayIncisionKm += cell.spillwayIncisionKm * weight;
+      hillslopeChangeKm += (cell.hillslopeDepositionKm - cell.hillslopeErosionKm) * weight;
       coastDistanceKm += (Number.isFinite(cell.coastDistanceKm) ? cell.coastDistanceKm : 0) * weight;
       temperatureC += cell.temperatureC * weight;
       seasonalTemperatureRangeC += cell.seasonalTemperatureRangeC * weight;
@@ -2235,6 +2406,7 @@ export function createSurfaceProcessWorld(
     elevationKm /= totalWeight;
     fillDepthKm /= totalWeight;
     spillwayIncisionKm /= totalWeight;
+    hillslopeChangeKm /= totalWeight;
     coastDistanceKm /= totalWeight;
     temperatureC /= totalWeight;
     seasonalTemperatureRangeC /= totalWeight;
@@ -2298,6 +2470,63 @@ export function createSurfaceProcessWorld(
     gradient[0] /= totalWeight;
     gradient[1] /= totalWeight;
     gradient[2] /= totalWeight;
+    let valleyIncisionKm = 0;
+    let valleyGradient: Vec3 = [0, 0, 0];
+    if (refined.isLand && valleyReliefScale > 0) {
+      for (const faceId of candidateIds) {
+        const river = riverByFaceId.get(faceId);
+        if (!river) continue;
+        const from = river.fromPoint;
+        const to = river.toPoint;
+        const chord: Vec3 = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        const chordLengthSquared = dot3(chord, chord);
+        if (chordLengthSquared <= 1e-16) continue;
+        const fromToPoint: Vec3 = [point[0] - from[0], point[1] - from[1], point[2] - from[2]];
+        const segmentT = clamp(dot3(fromToPoint, chord) / chordLengthSquared, 0, 1);
+        const nearest = normalize3([
+          from[0] + chord[0] * segmentT,
+          from[1] + chord[1] * segmentT,
+          from[2] + chord[2] * segmentT,
+        ]);
+        const cosine = clamp(dot3(nearest, point), -1, 1);
+        const distanceKm = Math.acos(cosine) * tectonicWorld.recipe.radiusKm;
+        const hierarchy = clamp(
+          Math.log(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2))
+            / Math.log(Math.max(2, maximumRiverDrainageAreaKm2 / minimumRiverAreaKm2)),
+          0,
+          1,
+        );
+        const widthKm = 6 + hierarchy * 24;
+        if (distanceKm > widthKm * 3.2) continue;
+        const source = immutableCells[river.fromFaceId];
+        const depthKm = Math.min(
+          0.28,
+          0.018
+            + source.erodedThicknessKm * 0.42
+            + hierarchy * 0.13
+            + source.orogenStrength * hierarchy * 0.035,
+        ) * (0.82 + (1 - source.erosionResistance) * 0.28) * valleyReliefScale;
+        const kernel = Math.exp(-0.5 * (distanceKm / widthKm) ** 2);
+        const incisionKm = depthKm * kernel;
+        if (incisionKm <= valleyIncisionKm) continue;
+        valleyIncisionKm = incisionKm;
+        if (distanceKm > 1e-6) {
+          const outward: Vec3 = [
+            point[0] - nearest[0] * cosine,
+            point[1] - nearest[1] * cosine,
+            point[2] - nearest[2] * cosine,
+          ];
+          if (dot3(outward, outward) > 1e-18) {
+            const tangent = normalize3(outward);
+            const slope = depthKm * kernel * distanceKm / widthKm ** 2;
+            valleyGradient = [tangent[0] * slope, tangent[1] * slope, tangent[2] * slope];
+          }
+        }
+      }
+    }
+    gradient[0] += valleyGradient[0];
+    gradient[1] += valleyGradient[1];
+    gradient[2] += valleyGradient[2];
     const surfaceTexture = samplePresentationDetail(point, presentationDetailBands);
     const elevationAboveSeaKm = elevationKm - tectonicWorld.seaLevelKm;
     const detailAmplitudeKm = reliefAmplitudeKm * (refined.isLand
@@ -2309,7 +2538,10 @@ export function createSurfaceProcessWorld(
     // bands remain in elevation/albedo, but shading them directly at world
     // scale creates directional aliasing before a tiled normal map exists.
     elevationKm = refined.isLand
-      ? Math.max(tectonicWorld.seaLevelKm + 0.001, elevationKm + fineRelief)
+      ? Math.max(
+        tectonicWorld.seaLevelKm + 0.001,
+        elevationKm + fineRelief - valleyIncisionKm,
+      )
       : Math.min(tectonicWorld.seaLevelKm - 0.001, elevationKm + fineRelief);
     const nearestMatchingId = candidates[0];
     const nearestMatchingCell = immutableCells[nearestMatchingId];
@@ -2324,6 +2556,8 @@ export function createSurfaceProcessWorld(
       elevationKm,
       fillDepthKm,
       spillwayIncisionKm,
+      hillslopeChangeKm,
+      valleyIncisionKm,
       coastDistanceKm,
       temperatureC,
       seasonalTemperatureRangeC,
@@ -2383,6 +2617,7 @@ export function createSurfaceProcessWorld(
         - balancedRunoff.lakeEvaporationKm3PerYear,
       maximumFillDepthKm: cells.reduce((maximum, cell) => Math.max(maximum, cell.fillDepthKm), 0),
       ...depressionEvolution,
+      ...hillslopeDiffusion,
       canonicalAnchorMismatches: refinementAudit.canonicalAnchorMismatches,
       drainageAnchorSubdivisions,
       drainageAnchorMismatches: finalDrainage.anchorMismatches,
