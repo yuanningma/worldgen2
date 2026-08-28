@@ -36,6 +36,10 @@ export interface SurfaceProcessOptions {
   readonly hillslopeDiffusionPasses?: number;
   /** Multiplier on renderer-scale drainage-conditioned valley relief. */
   readonly valleyReliefScale?: number;
+  /** Strength of world-space, relief-conditioned sub-cell channel bends. */
+  readonly channelRefinementScale?: number;
+  /** Strength of relief-conditioned rocky/passive coastline spectra. */
+  readonly coastalGeomorphologyScale?: number;
 }
 
 export type SurfaceLithology =
@@ -145,15 +149,39 @@ export interface SurfaceRiverSegment {
   readonly fromPoint: Vec3;
   /** Renderer-only shared node inside the receiver process cell. */
   readonly toPoint: Vec3;
+  /** Stable world-space sub-cell channel path, including both shared nodes. */
+  readonly path: readonly Vec3[];
+  /** Relief confinement in [0, 1]; high-gradient mountain channels are straighter. */
+  readonly confinement: number;
+  readonly meanderAmplitudeKm: number;
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
 }
+
+export type SurfaceCoastalLandform =
+  | "delta"
+  | "estuary"
+  | "alluvial-fan"
+  | "simple-mouth"
+  | "lake-inflow";
+
+const SURFACE_COASTAL_LANDFORMS: readonly SurfaceCoastalLandform[] = [
+  "delta",
+  "estuary",
+  "alluvial-fan",
+  "simple-mouth",
+  "lake-inflow",
+];
 
 export interface SurfaceRiverMouth {
   readonly fromFaceId: number;
   readonly toFaceId: number;
   readonly point: Vec3;
   readonly receivingWater: "ocean" | "lake";
+  readonly landform: SurfaceCoastalLandform;
+  readonly sedimentSupplyIndex: number;
+  /** Presentation-only distributaries/fan channels; canonical coast is unchanged. */
+  readonly distributaries: readonly (readonly Vec3[])[];
   readonly drainageAreaKm2: number;
   readonly dischargeKm3PerYear: number;
 }
@@ -169,6 +197,8 @@ export interface SurfacePresentationSample {
   readonly hillslopeChangeKm: number;
   readonly valleyIncisionKm: number;
   readonly coastDistanceKm: number;
+  readonly coastalRuggedness: number;
+  readonly coastalSedimentAffinity: number;
   readonly temperatureC: number;
   readonly seasonalTemperatureRangeC: number;
   readonly continentality: number;
@@ -210,6 +240,7 @@ export interface SurfaceProcessStats {
   readonly riverMouthCount: number;
   readonly oceanRiverMouthCount: number;
   readonly lakeInflowCount: number;
+  readonly coastalLandformCounts: Readonly<Record<SurfaceCoastalLandform, number>>;
   readonly maximumDrainageAreaKm2: number;
   readonly maximumDischargeKm3PerYear: number;
   readonly totalLocalRunoffKm3PerYear: number;
@@ -481,6 +512,12 @@ function emptyBiomeRecord(): Record<SurfaceBiome, number> {
   return Object.fromEntries(
     SURFACE_BIOMES.map((biome) => [biome, 0]),
   ) as Record<SurfaceBiome, number>;
+}
+
+function emptyCoastalLandformRecord(): Record<SurfaceCoastalLandform, number> {
+  return Object.fromEntries(
+    SURFACE_COASTAL_LANDFORMS.map((landform) => [landform, 0]),
+  ) as Record<SurfaceCoastalLandform, number>;
 }
 
 function classifySurfaceBiome(cell: MutableSurfaceCell, seaLevelKm: number): SurfaceBiome {
@@ -2002,6 +2039,105 @@ function createRiverPresentationPoints(
   return points;
 }
 
+function createRiverPresentationPath(
+  fromPoint: Vec3,
+  toPoint: Vec3,
+  source: MutableSurfaceCell,
+  receiver: MutableSurfaceCell,
+  radiusKm: number,
+  minimumRiverAreaKm2: number,
+  maximumRiverAreaKm2: number,
+  seed: number,
+  refinementScale: number,
+): { readonly path: readonly Vec3[]; readonly confinement: number; readonly meanderAmplitudeKm: number } {
+  const cosine = clamp(dot3(fromPoint, toPoint), -1, 1);
+  const segmentRadians = Math.acos(cosine);
+  const segmentKm = Math.max(1, segmentRadians * radiusKm);
+  const elevationDropKm = Math.max(0, source.elevationKm - receiver.elevationKm);
+  const slope = elevationDropKm / segmentKm;
+  const hierarchy = clamp(
+    Math.log(Math.max(1, source.drainageAreaKm2 / minimumRiverAreaKm2))
+      / Math.log(Math.max(2, maximumRiverAreaKm2 / minimumRiverAreaKm2)),
+  );
+  const confinement = clamp(
+    source.orogenStrength * 0.55
+      + clamp(slope / 0.012) * 0.34
+      + source.erosionResistance * 0.11,
+  );
+  const meanderAmplitudeRadians = segmentRadians
+    * clamp(0.018 + (1 - confinement) * (0.035 + hierarchy * 0.075), 0, 0.13)
+    * refinementScale;
+  if (meanderAmplitudeRadians <= 1e-12 || segmentRadians <= 1e-10) {
+    return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
+  }
+  const lateralRaw = cross3(fromPoint, toPoint);
+  if (dot3(lateralRaw, lateralRaw) <= 1e-18) {
+    return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
+  }
+  const lateral = normalize3(lateralRaw);
+  const phase = seedHash(`${seed}:channel:${source.faceId}`) / 0x1_0000_0000 * Math.PI * 2;
+  const path: Vec3[] = [];
+  const pointCount = hierarchy > 0.62 ? 7 : 5;
+  for (let index = 0; index < pointCount; index += 1) {
+    const progress = index / (pointCount - 1);
+    if (index === 0) {
+      path.push(fromPoint);
+      continue;
+    }
+    if (index === pointCount - 1) {
+      path.push(toPoint);
+      continue;
+    }
+    const base = normalize3([
+      fromPoint[0] * (1 - progress) + toPoint[0] * progress,
+      fromPoint[1] * (1 - progress) + toPoint[1] * progress,
+      fromPoint[2] * (1 - progress) + toPoint[2] * progress,
+    ]);
+    const envelope = Math.sin(Math.PI * progress);
+    const bend = Math.sin(Math.PI * 2 * progress + phase)
+      + Math.sin(Math.PI * 4 * progress - phase * 0.47) * 0.28;
+    const offset = meanderAmplitudeRadians * envelope * bend / 1.28;
+    path.push(normalize3([
+      base[0] + lateral[0] * offset,
+      base[1] + lateral[1] * offset,
+      base[2] + lateral[2] * offset,
+    ]));
+  }
+  return {
+    path,
+    confinement,
+    meanderAmplitudeKm: meanderAmplitudeRadians * radiusKm,
+  };
+}
+
+function createMouthDistributaries(
+  landform: SurfaceCoastalLandform,
+  mainPath: readonly Vec3[],
+  coastVertices: readonly [Vec3, Vec3] | undefined,
+  sedimentSupplyIndex: number,
+): readonly (readonly Vec3[])[] {
+  if (!coastVertices || (landform !== "delta" && landform !== "alluvial-fan")) return [];
+  const branchCount = landform === "delta" && sedimentSupplyIndex > 0.72 ? 3 : 2;
+  const branchSource = mainPath[Math.max(0, mainPath.length - 2)];
+  const [coastA, coastB] = coastVertices;
+  const span = landform === "delta" ? 0.44 : 0.24;
+  return Array.from({ length: branchCount }, (_, index) => {
+    const normalizedIndex = index / (branchCount - 1);
+    const along = 0.5 - span * 0.5 + span * normalizedIndex;
+    const endpoint = normalize3([
+      coastA[0] * (1 - along) + coastB[0] * along,
+      coastA[1] * (1 - along) + coastB[1] * along,
+      coastA[2] * (1 - along) + coastB[2] * along,
+    ]);
+    const middle = normalize3([
+      branchSource[0] * 0.55 + endpoint[0] * 0.45,
+      branchSource[1] * 0.55 + endpoint[1] * 0.45,
+      branchSource[2] * 0.55 + endpoint[2] * 0.45,
+    ]);
+    return [branchSource, middle, endpoint];
+  });
+}
+
 /**
  * Creates a persistent high-resolution surface-process model.
  *
@@ -2036,6 +2172,7 @@ export function createSurfaceProcessWorld(
     coastAmplitude: options.coastAmplitude,
     coastalBand: options.coastalBand,
     coastOctaves: options.coastOctaves ?? 5,
+    coastalGeomorphologyScale: options.coastalGeomorphologyScale ?? 1,
     reliefPasses: 2,
   });
   const refinementAudit = refinement.audit();
@@ -2044,6 +2181,7 @@ export function createSurfaceProcessWorld(
   }
   const reliefAmplitudeKm = clamp(options.reliefAmplitudeKm ?? 0.34, 0, 1.25);
   const valleyReliefScale = clamp(options.valleyReliefScale ?? 1, 0, 2.5);
+  const channelRefinementScale = clamp(options.channelRefinementScale ?? 1, 0, 2);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
@@ -2270,13 +2408,53 @@ export function createSurfaceProcessWorld(
     riverFaceIds,
     hashedSeed,
   );
+  const maximumResolvedRiverAreaKm2 = riverCells.reduce(
+    (maximum, cell) => Math.max(maximum, cell.drainageAreaKm2),
+    minimumRiverAreaKm2,
+  );
+  const boundaryVerticesByPair = new Map<string, readonly [Vec3, Vec3]>();
+  for (const edge of sphere.edges) {
+    const low = Math.min(edge.faces[0], edge.faces[1]);
+    const high = Math.max(edge.faces[0], edge.faces[1]);
+    boundaryVerticesByPair.set(
+      `${low}:${high}`,
+      edge.vertices.map((vertexId) => sphere.vertices[vertexId].position) as unknown as readonly [Vec3, Vec3],
+    );
+  }
   const rivers: SurfaceRiverSegment[] = riverCells.map((cell) => {
     const receiverFaceId = cell.receiverFaceId as number;
+    const receiver = cells[receiverFaceId];
+    const low = Math.min(cell.faceId, receiverFaceId);
+    const high = Math.max(cell.faceId, receiverFaceId);
+    const coastVertices = boundaryVerticesByPair.get(`${low}:${high}`);
+    const terminalWater = !receiver.isLand || (receiver.isLake && !cell.isLake);
+    const fromPoint = riverPresentationPoints.get(cell.faceId) ?? sphere.faces[cell.faceId].center;
+    const toPoint = terminalWater && coastVertices
+      ? normalize3([
+        coastVertices[0][0] + coastVertices[1][0],
+        coastVertices[0][1] + coastVertices[1][1],
+        coastVertices[0][2] + coastVertices[1][2],
+      ])
+      : riverPresentationPoints.get(receiverFaceId) ?? sphere.faces[receiverFaceId].center;
+    const channel = createRiverPresentationPath(
+      fromPoint,
+      toPoint,
+      cell,
+      receiver,
+      tectonicWorld.recipe.radiusKm,
+      minimumRiverAreaKm2,
+      maximumResolvedRiverAreaKm2,
+      hashedSeed,
+      channelRefinementScale,
+    );
     return {
       fromFaceId: cell.faceId,
       toFaceId: receiverFaceId,
-      fromPoint: riverPresentationPoints.get(cell.faceId) ?? sphere.faces[cell.faceId].center,
-      toPoint: riverPresentationPoints.get(receiverFaceId) ?? sphere.faces[receiverFaceId].center,
+      fromPoint,
+      toPoint,
+      path: channel.path,
+      confinement: channel.confinement,
+      meanderAmplitudeKm: channel.meanderAmplitudeKm,
       drainageAreaKm2: cell.drainageAreaKm2,
       dischargeKm3PerYear: cell.dischargeKm3PerYear,
     };
@@ -2289,15 +2467,58 @@ export function createSurfaceProcessWorld(
       : receiver.isLake && !source.isLake
         ? "lake"
         : null;
-    return receivingWater === null ? [] : [{
+    if (receivingWater === null) return [];
+    const distanceKm = Math.max(
+      1,
+      Math.acos(clamp(dot3(river.fromPoint, river.toPoint), -1, 1)) * tectonicWorld.recipe.radiusKm,
+    );
+    const slope = Math.max(0, source.elevationKm - receiver.elevationKm) / distanceKm;
+    const hierarchy = clamp(
+      Math.log(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2))
+        / Math.log(Math.max(2, maximumResolvedRiverAreaKm2 / minimumRiverAreaKm2)),
+    );
+    const sedimentSupplyIndex = clamp(
+      hierarchy * 0.32
+        + clamp(source.erodedThicknessKm / 0.24) * 0.28
+        + clamp((source.depositedThicknessKm + source.hillslopeDepositionKm) / 0.08) * 0.2
+        + (1 - source.erosionResistance) * 0.2,
+    );
+    const coastalRuggedness = refinement.sample(river.toPoint).coastalRuggedness;
+    const landform: SurfaceCoastalLandform = receivingWater === "lake"
+      ? "lake-inflow"
+      : source.orogenStrength > 0.48
+          && coastalRuggedness > 0.15
+          && slope > 0.015
+        ? "alluvial-fan"
+        : sedimentSupplyIndex > 0.38
+            && coastalRuggedness < 0.62
+            && slope < 0.03
+          ? "delta"
+          : coastalRuggedness > 0.55 || sedimentSupplyIndex < 0.28
+            ? "estuary"
+            : "simple-mouth";
+    const low = Math.min(river.fromFaceId, river.toFaceId);
+    const high = Math.max(river.fromFaceId, river.toFaceId);
+    const distributaries = createMouthDistributaries(
+      landform,
+      river.path,
+      boundaryVerticesByPair.get(`${low}:${high}`),
+      sedimentSupplyIndex,
+    );
+    return [{
       fromFaceId: river.fromFaceId,
       toFaceId: river.toFaceId,
       point: river.toPoint,
       receivingWater,
+      landform,
+      sedimentSupplyIndex,
+      distributaries,
       drainageAreaKm2: river.drainageAreaKm2,
       dischargeKm3PerYear: river.dischargeKm3PerYear,
     }];
   });
+  const coastalLandformCounts = emptyCoastalLandformRecord();
+  for (const mouth of riverMouths) coastalLandformCounts[mouth.landform] += 1;
 
   const totalRunoff = cells.reduce((sum, cell) => sum + cell.localRunoffKm3PerYear, 0);
   const landArea = cells.reduce(
@@ -2476,20 +2697,31 @@ export function createSurfaceProcessWorld(
       for (const faceId of candidateIds) {
         const river = riverByFaceId.get(faceId);
         if (!river) continue;
-        const from = river.fromPoint;
-        const to = river.toPoint;
-        const chord: Vec3 = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        const chordLengthSquared = dot3(chord, chord);
-        if (chordLengthSquared <= 1e-16) continue;
-        const fromToPoint: Vec3 = [point[0] - from[0], point[1] - from[1], point[2] - from[2]];
-        const segmentT = clamp(dot3(fromToPoint, chord) / chordLengthSquared, 0, 1);
-        const nearest = normalize3([
-          from[0] + chord[0] * segmentT,
-          from[1] + chord[1] * segmentT,
-          from[2] + chord[2] * segmentT,
-        ]);
-        const cosine = clamp(dot3(nearest, point), -1, 1);
-        const distanceKm = Math.acos(cosine) * tectonicWorld.recipe.radiusKm;
+        let nearest: Vec3 | null = null;
+        let cosine = -1;
+        let distanceKm = Infinity;
+        for (let pathIndex = 0; pathIndex + 1 < river.path.length; pathIndex += 1) {
+          const from = river.path[pathIndex];
+          const to = river.path[pathIndex + 1];
+          const chord: Vec3 = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+          const chordLengthSquared = dot3(chord, chord);
+          if (chordLengthSquared <= 1e-16) continue;
+          const fromToPoint: Vec3 = [point[0] - from[0], point[1] - from[1], point[2] - from[2]];
+          const segmentT = clamp(dot3(fromToPoint, chord) / chordLengthSquared, 0, 1);
+          const candidate = normalize3([
+            from[0] + chord[0] * segmentT,
+            from[1] + chord[1] * segmentT,
+            from[2] + chord[2] * segmentT,
+          ]);
+          const candidateCosine = clamp(dot3(candidate, point), -1, 1);
+          const candidateDistanceKm = Math.acos(candidateCosine) * tectonicWorld.recipe.radiusKm;
+          if (candidateDistanceKm < distanceKm) {
+            nearest = candidate;
+            cosine = candidateCosine;
+            distanceKm = candidateDistanceKm;
+          }
+        }
+        if (!nearest) continue;
         const hierarchy = clamp(
           Math.log(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2))
             / Math.log(Math.max(2, maximumRiverDrainageAreaKm2 / minimumRiverAreaKm2)),
@@ -2559,6 +2791,8 @@ export function createSurfaceProcessWorld(
       hillslopeChangeKm,
       valleyIncisionKm,
       coastDistanceKm,
+      coastalRuggedness: refined.coastalRuggedness,
+      coastalSedimentAffinity: refined.coastalSedimentAffinity,
       temperatureC,
       seasonalTemperatureRangeC,
       continentality,
@@ -2608,6 +2842,7 @@ export function createSurfaceProcessWorld(
       riverMouthCount: riverMouths.length,
       oceanRiverMouthCount: riverMouths.filter((mouth) => mouth.receivingWater === "ocean").length,
       lakeInflowCount: riverMouths.filter((mouth) => mouth.receivingWater === "lake").length,
+      coastalLandformCounts,
       maximumDrainageAreaKm2: cells.reduce((maximum, cell) => Math.max(maximum, cell.drainageAreaKm2), 0),
       maximumDischargeKm3PerYear: cells.reduce((maximum, cell) => Math.max(maximum, cell.dischargeKm3PerYear), 0),
       totalLocalRunoffKm3PerYear: totalRunoff,

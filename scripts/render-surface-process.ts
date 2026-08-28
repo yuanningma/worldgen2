@@ -49,6 +49,7 @@ const MAP_MODES = [
   "drainage",
   "depressions",
   "geomorphology",
+  "coasts",
   "wind",
   "lithology",
   "orogeny",
@@ -152,6 +153,8 @@ function color(
   spillwayIncisionKm: number,
   hillslopeChangeKm: number,
   valleyIncisionKm: number,
+  coastalRuggedness: number,
+  coastalSedimentAffinity: number,
   biome: SurfaceBiome,
   lithology: SurfaceLithology,
   erosionResistance: number,
@@ -243,6 +246,17 @@ function color(
     }
     return [211, 207, 190];
   }
+  if (mapMode === "coasts") {
+    if (coastDistanceKm > 180) return isLand ? [220, 218, 202] : [43, 65, 77];
+    const coastFade = 1 - clamp(coastDistanceKm / 180);
+    if (isLand) {
+      const character = coastalRuggedness >= coastalSedimentAffinity
+        ? mix([214, 210, 193], [123, 80, 68], coastalRuggedness)
+        : mix([214, 210, 193], [194, 164, 91], coastalSedimentAffinity);
+      return mix([220, 218, 202], character, coastFade);
+    }
+    return mix([43, 65, 77], [91, 139, 149], coastFade * coastalSedimentAffinity);
+  }
   if (mapMode === "wind") {
     const angle = Math.atan2(windNorth, windEast);
     return hsvToRgb(angle / (Math.PI * 2) + 0.5, 0.68, 0.52 + atmosphericMoisture * 0.34);
@@ -314,6 +328,27 @@ function blendPixel(
   const index = (y * width + wrappedX) * 4;
   for (let channel = 0; channel < 3; channel += 1) {
     pixels[index + channel] = Math.round(pixels[index + channel] * (1 - alpha) + ink[channel] * alpha);
+  }
+}
+
+function drawMarker(
+  pixels: Buffer,
+  width: number,
+  height: number,
+  center: readonly [number, number],
+  radius: number,
+  ink: readonly [number, number, number],
+): void {
+  const minimumX = Math.floor(center[0] - radius);
+  const maximumX = Math.ceil(center[0] + radius);
+  const minimumY = Math.floor(center[1] - radius);
+  const maximumY = Math.ceil(center[1] + radius);
+  for (let y = minimumY; y <= maximumY; y += 1) {
+    for (let x = minimumX; x <= maximumX; x += 1) {
+      const distance = Math.hypot(x + 0.5 - center[0], y + 0.5 - center[1]);
+      if (distance > radius + 0.75) continue;
+      blendPixel(pixels, width, height, x, y, clamp(radius + 0.75 - distance), ink);
+    }
   }
 }
 
@@ -454,6 +489,8 @@ const surface = createSurfaceProcessWorld(world, {
   hillslopeDiffusionLengthKm: numberOption("hillslope-diffusion-length-km", 42),
   hillslopeDiffusionPasses: numberOption("hillslope-diffusion-passes", 4),
   valleyReliefScale: numberOption("valley-relief-scale", 1),
+  channelRefinementScale: numberOption("channel-refinement-scale", 1),
+  coastalGeomorphologyScale: numberOption("coastal-geomorphology-scale", 1),
 });
 const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
   .filter(([lithology, area]) => lithology !== "oceanic-basalt" && area > 0)
@@ -514,6 +551,8 @@ function renderColorAt(longitude: number, latitude: number): {
       cell.spillwayIncisionKm,
       cell.hillslopeChangeKm,
       cell.valleyIncisionKm,
+      cell.coastalRuggedness,
+      cell.coastalSedimentAffinity,
       cell.biome,
       cell.lithology,
       cell.erosionResistance,
@@ -598,7 +637,7 @@ if (mapMode === "natural") {
   }
 }
 
-if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage" || mapMode === "depressions" || mapMode === "geomorphology") {
+if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || mapMode === "lithology" || mapMode === "drainage" || mapMode === "depressions" || mapMode === "geomorphology" || mapMode === "coasts") {
   const outgoing = new Map<number, (typeof surface.rivers)[number]>();
   const dominantIncoming = new Map<number, (typeof surface.rivers)[number]>();
   for (const river of surface.rivers) {
@@ -609,8 +648,6 @@ if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || ma
     }
   }
   for (const river of surface.rivers) {
-    const from = river.fromPoint;
-    const to = river.toPoint;
     const previousRiver = dominantIncoming.get(river.fromFaceId);
     const nextRiver = outgoing.get(river.toFaceId);
     const previous = previousRiver
@@ -629,17 +666,60 @@ if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || ma
     const riverInk: readonly [number, number, number] = presentationStyle === "atlas"
       ? [75, 121, 171]
       : [31, 92, 139];
-    drawRiverCurve(
-      pixels,
-      width,
-      height,
-      previous,
-      longitudeLatitude(from, width, height),
-      longitudeLatitude(to, width, height),
-      next,
-      strength,
-      riverInk,
-    );
+    const projectedPath = river.path.map((point) => longitudeLatitude(point, width, height));
+    for (let index = 0; index + 1 < projectedPath.length; index += 1) {
+      drawRiverCurve(
+        pixels,
+        width,
+        height,
+        index > 0 ? projectedPath[index - 1] : previous,
+        projectedPath[index],
+        projectedPath[index + 1],
+        index + 2 < projectedPath.length ? projectedPath[index + 2] : next,
+        strength,
+        riverInk,
+      );
+    }
+  }
+  for (const mouth of surface.riverMouths) {
+    if (mouth.distributaries.length === 0) continue;
+    const branchStrength = mouth.landform === "delta" ? 0.5 : 0.36;
+    const branchInk: readonly [number, number, number] = presentationStyle === "atlas"
+      ? [75, 121, 171]
+      : [31, 92, 139];
+    for (const branch of mouth.distributaries) {
+      const projected = branch.map((point) => longitudeLatitude(point, width, height));
+      for (let index = 0; index + 1 < projected.length; index += 1) {
+        drawAntiAliasedSegment(
+          pixels,
+          width,
+          height,
+          projected[index],
+          projected[index + 1],
+          branchStrength,
+          branchInk,
+        );
+      }
+    }
+  }
+  if (mapMode === "coasts") {
+    const landformColors = {
+      delta: [45, 138, 91],
+      estuary: [91, 91, 172],
+      "alluvial-fan": [194, 104, 54],
+      "simple-mouth": [70, 112, 133],
+      "lake-inflow": [67, 135, 188],
+    } as const;
+    for (const mouth of surface.riverMouths) {
+      drawMarker(
+        pixels,
+        width,
+        height,
+        longitudeLatitude(mouth.point, width, height),
+        mouth.receivingWater === "ocean" ? 2.2 : 1.5,
+        landformColors[mouth.landform],
+      );
+    }
   }
 }
 

@@ -16,6 +16,8 @@ export interface SurfaceRefinementOptions {
   reliefPasses?: number;
   /** Edge-detail bands retained in the continuous coast, from 3 through 5. */
   coastOctaves?: number;
+  /** Strength of relief-conditioned rocky/fjord and passive-margin coast spectra. */
+  coastalGeomorphologyScale?: number;
 }
 
 export interface RefinedSurfaceSample {
@@ -26,6 +28,10 @@ export interface RefinedSurfaceSample {
   readonly waterDepthKm: number;
   readonly signedCoastDistanceRadians: number | null;
   readonly coastOffsetRadians: number;
+  /** Relief-conditioned rocky-coast support on the nearest canonical coast edge. */
+  readonly coastalRuggedness: number;
+  /** Low-relief passive-margin support on the nearest canonical coast edge. */
+  readonly coastalSedimentAffinity: number;
   readonly presentationOnly: true;
 }
 
@@ -42,6 +48,8 @@ interface CoastEdge {
   readonly faces: readonly [number, number];
   readonly length: number;
   readonly phase: readonly number[];
+  readonly ruggedness: number;
+  readonly sedimentAffinity: number;
 }
 
 interface KdNode {
@@ -190,13 +198,36 @@ const COAST_WEIGHTS = {
   5: [0.57, 0.19, 0.1, 0.08, 0.06],
 } as const;
 
-function edgeOffset(edge: CoastEdge, along: number, amplitude: number): number {
+function edgeOffset(
+  edge: CoastEdge,
+  along: number,
+  amplitude: number,
+  coastalGeomorphologyScale: number,
+): number {
   const endpointFade = Math.sin(Math.PI * clamp(along)) ** 2;
   const weights = COAST_WEIGHTS[edge.phase.length as keyof typeof COAST_WEIGHTS];
+  const adjustedWeights = weights.map((weight, octave) => {
+    if (octave < 2) return weight;
+    const highFrequencyGain = 1
+      + (edge.ruggedness * 0.92 - 0.38) * coastalGeomorphologyScale;
+    return weight * highFrequencyGain;
+  });
+  const weightTotal = adjustedWeights.reduce((sum, weight) => sum + weight, 0);
   const waves = edge.phase.reduce((sum, phase, octave) => (
-    sum + Math.sin(Math.PI * 2 * (along * COAST_FREQUENCIES[octave] + phase)) * weights[octave]
+    sum + Math.sin(Math.PI * 2 * (along * COAST_FREQUENCIES[octave] + phase))
+      * adjustedWeights[octave] / weightTotal
   ), 0);
-  return waves * endpointFade * amplitude * edge.length;
+  // Resistant, elevated margins receive sparse inward notches instead of
+  // uniform extra noise. Subtracting the positive-sine mean keeps the term
+  // approximately area neutral; endpointFade retains canonical vertices.
+  const notchPhase = edge.phase[edge.phase.length - 1];
+  const notchWave = Math.sin(Math.PI * 2 * (along * 11 + notchPhase));
+  const fjordPulse = -(Math.max(0, notchWave) ** 6 - 5 / 32)
+    * edge.ruggedness * coastalGeomorphologyScale * 0.2;
+  const passiveUndulation = Math.sin(Math.PI * 2 * (along * 2 + edge.phase[0]))
+    * edge.sedimentAffinity * coastalGeomorphologyScale * 0.045;
+  return clamp(waves + fjordPulse + passiveUndulation, -1, 1)
+    * endpointFade * amplitude * edge.length;
 }
 
 /**
@@ -216,6 +247,7 @@ export function createSurfaceRefinement(
 } {
   const requestedAmplitude = clamp(options.coastAmplitude ?? 0.21, 0, 0.24);
   const coastOctaves = Math.round(clamp(options.coastOctaves ?? 3, 3, 5));
+  const coastalGeomorphologyScale = clamp(options.coastalGeomorphologyScale ?? 1, 0, 1.5);
   const bandRatio = clamp(options.coastalBand ?? 0.34, requestedAmplitude + 0.04, 0.45);
   const cellsByFace = new Map(model.cells.map((cell) => [cell.faceId, cell]));
   const cells = model.sphere.faces.map((face) => {
@@ -240,6 +272,11 @@ export function createSurfaceRefinement(
   const coastEdges: CoastEdge[] = [];
   for (const edge of model.sphere.edges) {
     if (cells[edge.faces[0]].isLand === cells[edge.faces[1]].isLand) continue;
+    const landFaceId = cells[edge.faces[0]].isLand ? edge.faces[0] : edge.faces[1];
+    const land = cells[landFaceId];
+    const reliefSupport = clamp((land.elevationKm - model.seaLevelKm) / 3.2);
+    const crustSupport = clamp((land.crustThicknessKm - 30) / 30);
+    const ruggedness = clamp(0.08 + reliefSupport * 0.62 + crustSupport * 0.3);
     const coast: CoastEdge = {
       edgeId: edge.id,
       vertices: edge.vertices.map((id) => model.sphere.vertices[id].position) as unknown as readonly [Vec3, Vec3],
@@ -249,6 +286,8 @@ export function createSurfaceRefinement(
         { length: coastOctaves },
         (_, octave) => hashUnit(model.recipe.seed, edge.id, octave),
       ),
+      ruggedness,
+      sedimentAffinity: clamp(1 - ruggedness * 0.92),
     };
     coastEdges.push(coast);
     coastByFace[edge.faces[0]].push(coast);
@@ -266,7 +305,12 @@ export function createSurfaceRefinement(
     }
     if (!nearest) continue;
     const signedDistance = cells[face.id].isLand ? nearest.distance : -nearest.distance;
-    const unitOffset = edgeOffset(nearest.edge, nearest.along, 1);
+    const unitOffset = edgeOffset(
+      nearest.edge,
+      nearest.along,
+      1,
+      coastalGeomorphologyScale,
+    );
     if ((signedDistance > 0 && unitOffset < 0) || (signedDistance < 0 && unitOffset > 0)) {
       safeAmplitude = Math.min(safeAmplitude, Math.abs(signedDistance / unitOffset) * 0.98);
     }
@@ -292,7 +336,7 @@ export function createSurfaceRefinement(
       }
     }
     if (nearestEdge && nearestDistance <= nearestEdge.length * bandRatio) {
-      offset = edgeOffset(nearestEdge, nearestAlong, amplitude);
+      offset = edgeOffset(nearestEdge, nearestAlong, amplitude, coastalGeomorphologyScale);
       signedDistance = canonical.isLand ? nearestDistance : -nearestDistance;
       refinedLand = signedDistance + offset >= 0;
     }
@@ -315,6 +359,8 @@ export function createSurfaceRefinement(
       waterDepthKm: refinedLand ? 0 : Math.max(0.001, model.seaLevelKm - elevationKm),
       signedCoastDistanceRadians: signedDistance,
       coastOffsetRadians: offset,
+      coastalRuggedness: nearestEdge?.ruggedness ?? 0,
+      coastalSedimentAffinity: nearestEdge?.sedimentAffinity ?? 0,
       presentationOnly: true,
     };
   };
@@ -326,7 +372,12 @@ export function createSurfaceRefinement(
     }
     const maximumOffsetRatio = coastEdges.reduce((maximum, edge) => {
       for (let step = 0; step <= 64; step += 1) {
-        maximum = Math.max(maximum, Math.abs(edgeOffset(edge, step / 64, amplitude)) / edge.length);
+        maximum = Math.max(maximum, Math.abs(edgeOffset(
+          edge,
+          step / 64,
+          amplitude,
+          coastalGeomorphologyScale,
+        )) / edge.length);
       }
       return maximum;
     }, 0);

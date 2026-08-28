@@ -263,6 +263,11 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
   );
   assert.ok(surface.stats.oceanRiverMouthCount > 0);
   assert.ok(surface.stats.maximumDrainageAreaKm2 > 20_000);
+  const edgeByFaces = new Map(surface.sphere.edges.map((edge) => {
+    const low = Math.min(...edge.faces);
+    const high = Math.max(...edge.faces);
+    return [`${low}:${high}`, edge];
+  }));
   for (const river of surface.rivers) {
     assert.ok(river.drainageAreaKm2 >= 20_000);
     assert.equal(surface.cells[river.fromFaceId].isLand, true);
@@ -281,15 +286,35 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
       assert.equal(source.isLake, false);
       assert.equal(receiver.isLake, true);
     }
+    const low = Math.min(mouth.fromFaceId, mouth.toFaceId);
+    const high = Math.max(mouth.fromFaceId, mouth.toFaceId);
+    const edge = edgeByFaces.get(`${low}:${high}`);
+    assert.ok(edge);
+    const vertices = edge.vertices.map((vertexId) => surface.sphere.vertices[vertexId].position);
+    const midpointLength = Math.hypot(
+      vertices[0][0] + vertices[1][0],
+      vertices[0][1] + vertices[1][1],
+      vertices[0][2] + vertices[1][2],
+    );
+    const midpoint = [
+      (vertices[0][0] + vertices[1][0]) / midpointLength,
+      (vertices[0][1] + vertices[1][1]) / midpointLength,
+      (vertices[0][2] + vertices[1][2]) / midpointLength,
+    ];
+    const alignment = midpoint[0] * mouth.point[0]
+      + midpoint[1] * mouth.point[1]
+      + midpoint[2] * mouth.point[2];
+    assert.ok(alignment > 1 - 1e-12);
   }
 });
 
-test("river presentation nodes are shared, spherical, and remain inside their process cells", () => {
+test("river presentation nodes are shared while terminal mouths lie on water boundaries", () => {
   const surface = createSurfaceProcessWorld(tectonic, {
     subdivisions: 4,
     minimumRiverAreaKm2: 20_000,
   });
   const pointByFace = new Map();
+  const terminalPairs = new Set(surface.riverMouths.map((mouth) => `${mouth.fromFaceId}:${mouth.toFaceId}`));
   const neighbors = surface.sphere.faces.map(() => new Set());
   for (const edge of surface.sphere.edges) {
     neighbors[edge.faces[0]].add(edge.faces[1]);
@@ -300,9 +325,13 @@ test("river presentation nodes are shared, spherical, and remain inside their pr
       [river.fromFaceId, river.fromPoint],
       [river.toFaceId, river.toPoint],
     ]) {
-      const incumbent = pointByFace.get(faceId);
-      if (incumbent) assert.deepEqual(point, incumbent);
-      else pointByFace.set(faceId, point);
+      const terminal = faceId === river.toFaceId
+        && terminalPairs.has(`${river.fromFaceId}:${river.toFaceId}`);
+      if (!terminal) {
+        const incumbent = pointByFace.get(faceId);
+        if (incumbent) assert.deepEqual(point, incumbent);
+        else pointByFace.set(faceId, point);
+      }
       assert.ok(Math.abs(Math.hypot(...point) - 1) < 1e-12);
       const center = surface.sphere.faces[faceId].center;
       const displacement = Math.acos(Math.max(-1, Math.min(1,
@@ -314,7 +343,56 @@ test("river presentation nodes are shared, spherical, and remain inside their pr
           center[0] * neighbor[0] + center[1] * neighbor[1] + center[2] * neighbor[2],
         )));
       }));
-      assert.ok(displacement <= localStep * 0.381);
+      assert.ok(displacement <= localStep * (terminal ? 0.72 : 0.381));
+    }
+    assert.deepEqual(river.path[0], river.fromPoint);
+    assert.deepEqual(river.path.at(-1), river.toPoint);
+    assert.ok(river.path.length >= 2);
+    assert.ok(river.path.every((point) => Math.abs(Math.hypot(...point) - 1) < 1e-12));
+    if (!terminalPairs.has(`${river.fromFaceId}:${river.toFaceId}`)) {
+      assert.ok(river.path.slice(1, -1).every((point) => surface.sampleContinuous(point).isLand));
+    }
+    assert.ok(river.confinement >= 0 && river.confinement <= 1);
+    assert.ok(river.meanderAmplitudeKm >= 0);
+    const segmentKm = Math.acos(Math.max(-1, Math.min(1,
+      river.fromPoint[0] * river.toPoint[0]
+        + river.fromPoint[1] * river.toPoint[1]
+        + river.fromPoint[2] * river.toPoint[2],
+    ))) * tectonic.recipe.radiusKm;
+    assert.ok(river.meanderAmplitudeKm <= segmentKm * 0.131);
+  }
+});
+
+test("channel refinement and coastal landforms are causal presentation geometry", () => {
+  const refined = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    minimumRiverAreaKm2: 20_000,
+    channelRefinementScale: 1,
+  });
+  const straight = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    minimumRiverAreaKm2: 20_000,
+    channelRefinementScale: 0,
+  });
+  assert.deepEqual(refined.cells, straight.cells);
+  assert.ok(refined.rivers.some((river) => river.path.length > 2 && river.meanderAmplitudeKm > 0));
+  assert.ok(straight.rivers.every((river) => river.path.length === 2 && river.meanderAmplitudeKm === 0));
+  assert.deepEqual(
+    refined.rivers.map((river) => [river.fromFaceId, river.toFaceId, river.drainageAreaKm2]),
+    straight.rivers.map((river) => [river.fromFaceId, river.toFaceId, river.drainageAreaKm2]),
+  );
+  assert.equal(
+    Object.values(refined.stats.coastalLandformCounts).reduce((sum, count) => sum + count, 0),
+    refined.riverMouths.length,
+  );
+  assert.ok(refined.riverMouths.every((mouth) => mouth.sedimentSupplyIndex >= 0
+    && mouth.sedimentSupplyIndex <= 1));
+  assert.ok(refined.riverMouths.some((mouth) => mouth.receivingWater === "ocean"));
+  for (const mouth of refined.riverMouths) {
+    if (mouth.receivingWater === "lake") assert.equal(mouth.landform, "lake-inflow");
+    for (const branch of mouth.distributaries) {
+      assert.ok(branch.length >= 3);
+      assert.ok(branch.every((point) => Math.abs(Math.hypot(...point) - 1) < 1e-12));
     }
   }
 });
@@ -481,6 +559,12 @@ test("continuous presentation sampling preserves anchors and removes cell-edge j
   assert.ok(Number.isFinite(first.spillwayIncisionKm) && first.spillwayIncisionKm >= 0);
   assert.ok(Number.isFinite(first.hillslopeChangeKm));
   assert.ok(Number.isFinite(first.valleyIncisionKm) && first.valleyIncisionKm >= 0);
+  assert.ok(Number.isFinite(first.coastalRuggedness)
+    && first.coastalRuggedness >= 0
+    && first.coastalRuggedness <= 1);
+  assert.ok(Number.isFinite(first.coastalSedimentAffinity)
+    && first.coastalSedimentAffinity >= 0
+    && first.coastalSedimentAffinity <= 1);
   assert.ok(Number.isFinite(first.surfaceTexture));
   assert.ok(Math.abs(first.surfaceTexture) <= 1.0000001);
   assert.ok(Math.abs(first.surfaceTexture - second.surfaceTexture) > 1e-10);

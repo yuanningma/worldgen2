@@ -84,3 +84,39 @@ test("additional coast bands add bounded deterministic detail without moving anc
   assert.equal(fiveBand.audit().topologyAnchorsPreserved, true);
   assert.ok(fiveBand.audit().maximumOffsetRatio <= 0.2400001);
 });
+
+test("coastal geomorphology changes edge spectra without changing topology anchors", () => {
+  const baseline = createSurfaceRefinement(world, {
+    coastOctaves: 5,
+    coastalGeomorphologyScale: 0,
+  });
+  const geomorphic = createSurfaceRefinement(world, {
+    coastOctaves: 5,
+    coastalGeomorphologyScale: 1,
+  });
+  const cells = new Map(world.cells.map((cell) => [cell.faceId, cell]));
+  let difference = 0;
+  let samples = 0;
+  for (const edge of world.sphere.edges) {
+    if (cells.get(edge.faces[0]).isLand === cells.get(edge.faces[1]).isLand) continue;
+    const [a, b] = edge.vertices.map((vertexId) => world.sphere.vertices[vertexId].position);
+    for (let step = 1; step < 16; step += 1) {
+      const progress = step / 16;
+      const direction = normalize3([
+        a[0] * (1 - progress) + b[0] * progress,
+        a[1] * (1 - progress) + b[1] * progress,
+        a[2] * (1 - progress) + b[2] * progress,
+      ]);
+      const plain = baseline.sample(direction);
+      const shaped = geomorphic.sample(direction);
+      difference += Math.abs(shaped.coastOffsetRadians - plain.coastOffsetRadians);
+      assert.ok(shaped.coastalRuggedness >= 0 && shaped.coastalRuggedness <= 1);
+      assert.ok(shaped.coastalSedimentAffinity >= 0 && shaped.coastalSedimentAffinity <= 1);
+      samples += 1;
+    }
+  }
+  assert.ok(samples > 0);
+  assert.ok(difference > 1e-7);
+  assert.equal(geomorphic.audit().canonicalAnchorMismatches, 0);
+  assert.ok(geomorphic.audit().maximumOffsetRatio <= 0.2400001);
+});
