@@ -23,7 +23,11 @@ const image = sharp as unknown as SharpFactory;
 
 function option(name: string): string | undefined {
   const prefix = `--${name}=`;
-  return process.argv.slice(2).find((argument) => argument.startsWith(prefix))?.slice(prefix.length);
+  const arguments_ = process.argv.slice(2);
+  const inline = arguments_.find((argument) => argument.startsWith(prefix));
+  if (inline) return inline.slice(prefix.length);
+  const index = arguments_.indexOf(`--${name}`);
+  return index >= 0 ? arguments_[index + 1] : undefined;
 }
 
 function numberOption(name: string, fallback: number): number {

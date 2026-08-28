@@ -87,7 +87,11 @@ const BIOME_COLORS: Readonly<Record<SurfaceBiome, readonly [number, number, numb
 
 function option(name: string): string | undefined {
   const prefix = `--${name}=`;
-  return process.argv.slice(2).find((argument) => argument.startsWith(prefix))?.slice(prefix.length);
+  const arguments_ = process.argv.slice(2);
+  const inline = arguments_.find((argument) => argument.startsWith(prefix));
+  if (inline) return inline.slice(prefix.length);
+  const index = arguments_.indexOf(`--${name}`);
+  return index >= 0 ? arguments_[index + 1] : undefined;
 }
 
 function numberOption(name: string, fallback: number): number {
@@ -490,6 +494,7 @@ const surface = createSurfaceProcessWorld(world, {
   hillslopeDiffusionPasses: numberOption("hillslope-diffusion-passes", 4),
   valleyReliefScale: numberOption("valley-relief-scale", 1),
   channelRefinementScale: numberOption("channel-refinement-scale", 1),
+  continentalReliefScale: numberOption("continental-relief-scale", 1),
   coastalGeomorphologyScale: numberOption("coastal-geomorphology-scale", 1),
 });
 const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
@@ -774,7 +779,7 @@ const header = Buffer.from([
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">${mapMode.toUpperCase()} MODE · ${escapeXml(seed)}</text>`,
   `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${presentationStyle.toUpperCase()} STYLE · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
-  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${surface.stats.breachedBasinCount} BREACHED / ${surface.stats.preservedBasinCount} RETAINED BASINS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
+  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.continentalReliefCenterCount} INTERIOR RELIEF CENTERS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${surface.stats.breachedBasinCount} BREACHED / ${surface.stats.preservedBasinCount} RETAINED BASINS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));
 

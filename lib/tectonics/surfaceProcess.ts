@@ -38,6 +38,8 @@ export interface SurfaceProcessOptions {
   readonly valleyReliefScale?: number;
   /** Strength of world-space, relief-conditioned sub-cell channel bends. */
   readonly channelRefinementScale?: number;
+  /** Strength of broad, tectonically inherited continental-interior relief. */
+  readonly continentalReliefScale?: number;
   /** Strength of relief-conditioned rocky/passive coastline spectra. */
   readonly coastalGeomorphologyScale?: number;
 }
@@ -237,6 +239,10 @@ export interface SurfaceProcessStats {
   readonly overflowingLakeBodyCount: number;
   readonly lakeEvaporationKm3PerYear: number;
   readonly riverSegmentCount: number;
+  readonly meanRiverSinuosity: number;
+  readonly meanRiverMeanderAmplitudeKm: number;
+  /** Local parallel-flow signal in [0, 1], measured across adjacent channels. */
+  readonly meanNeighboringChannelAlignment: number;
   readonly riverMouthCount: number;
   readonly oceanRiverMouthCount: number;
   readonly lakeInflowCount: number;
@@ -278,6 +284,9 @@ export interface SurfaceProcessStats {
   readonly aridLandFraction: number;
   readonly humidLandFraction: number;
   readonly maximumOrographicLiftKm: number;
+  /** Naturally selected broad continental-interior uplift centers. */
+  readonly continentalReliefCenterCount: number;
+  readonly maximumContinentalReliefKm: number;
 }
 
 export interface SurfaceProcessWorld {
@@ -457,6 +466,30 @@ function sphericalNoise(point: Vec3, seed: number): number {
   return first * 0.52 + second * 0.31 + third * 0.17;
 }
 
+function randomDirection(seed: number, label: string): Vec3 {
+  return normalize3([0, 1, 2].map((axis) => (
+    seedHash(`${seed}:${label}:${axis}`) / 0x1_0000_0000 * 2 - 1
+  )) as unknown as Vec3);
+}
+
+/**
+ * A planet-size-aware signal for continent-scale structure. Frequencies are
+ * expressed relative to an Earth-radius world so a larger planet acquires
+ * more physical-scale relief provinces instead of merely stretching them.
+ */
+function continentalStructureNoise(point: Vec3, seed: number, radiusKm: number): number {
+  const physicalScale = clamp(radiusKm / 6_371, 0.35, 7.85);
+  const directionA = randomDirection(seed, "continental-a");
+  const directionB = randomDirection(seed, "continental-b");
+  const directionC = randomDirection(seed, "continental-c");
+  const phaseA = seedHash(`${seed}:continental-phase-a`) / 0x1_0000_0000 * Math.PI * 2;
+  const phaseB = seedHash(`${seed}:continental-phase-b`) / 0x1_0000_0000 * Math.PI * 2;
+  const phaseC = seedHash(`${seed}:continental-phase-c`) / 0x1_0000_0000 * Math.PI * 2;
+  return Math.sin(dot3(point, directionA) * 5.2 * physicalScale + phaseA) * 0.5
+    + Math.sin(dot3(point, directionB) * 8.7 * physicalScale + phaseB) * 0.31
+    + Math.cos(dot3(point, directionC) * 13.3 * physicalScale + phaseC) * 0.19;
+}
+
 function createPresentationDetailBands(seed: number): readonly PresentationDetailBand[] {
   const frequencies = [173, 347, 691, 1_381, 2_767];
   const weights = [0.34, 0.25, 0.19, 0.13, 0.09];
@@ -565,10 +598,132 @@ function diffuseCanonicalField(
   return field;
 }
 
+interface ContinentalReliefStructure {
+  readonly supportKm: Float64Array;
+  readonly centers: readonly {
+    readonly point: Vec3;
+    readonly strength: number;
+  }[];
+  readonly centerCount: number;
+  readonly maximumSupportKm: number;
+}
+
+function continentalReliefAt(
+  point: Vec3,
+  centers: readonly { readonly point: Vec3; readonly strength: number }[],
+  radiusKm: number,
+): number {
+  let supportKm = 0;
+  for (const center of centers) {
+    const distanceKm = Math.acos(clamp(dot3(point, center.point), -1, 1)) * radiusKm;
+    const influenceRadiusKm = 720 + center.strength * 980;
+    if (distanceKm > influenceRadiusKm * 2.2) continue;
+    const normalizedDistance = distanceKm / influenceRadiusKm;
+    const upliftKm = (0.16 + center.strength * 0.48)
+      * Math.exp(-normalizedDistance * normalizedDistance * 1.8);
+    supportKm = Math.max(supportKm, upliftKm);
+  }
+  return supportKm;
+}
+
+function canonicalContinentalInteriorDistance(
+  world: TectonicWorldModel,
+  adjacency: readonly number[][],
+): Float64Array {
+  const distances = new Float64Array(world.cells.length).fill(Infinity);
+  const heap = new ElevationHeap();
+  const continental = (faceId: number): boolean => {
+    const cell = world.cells[faceId];
+    return (cell.continentalFraction ?? (cell.crustType === "continental" ? 1 : 0)) >= 0.5
+      && cell.isLand;
+  };
+  for (const face of world.sphere.faces) {
+    if (!continental(face.id)) continue;
+    const cell = world.cells[face.id];
+    if (adjacency[face.id].some((neighborId) => !continental(neighborId)
+      || world.cells[neighborId].provenanceId !== cell.provenanceId)) {
+      distances[face.id] = 0;
+      heap.push({ faceId: face.id, priority: 0 });
+    }
+  }
+  while (true) {
+    const entry = heap.pop();
+    if (!entry) break;
+    if (entry.priority > distances[entry.faceId] + 1e-9) continue;
+    const center = world.sphere.faces[entry.faceId].center;
+    for (const neighborId of adjacency[entry.faceId]) {
+      if (!continental(neighborId)) continue;
+      const neighbor = world.sphere.faces[neighborId].center;
+      const stepKm = Math.acos(clamp(dot3(center, neighbor), -1, 1)) * world.recipe.radiusKm;
+      const distance = entry.priority + stepKm;
+      if (distance >= distances[neighborId]) continue;
+      distances[neighborId] = distance;
+      heap.push({ faceId: neighborId, priority: distance });
+    }
+  }
+  return distances;
+}
+
+function createContinentalReliefStructure(
+  world: TectonicWorldModel,
+  adjacency: readonly number[][],
+  orogeny: readonly CanonicalOrogenyCell[],
+): ContinentalReliefStructure {
+  const hashedSeed = seedHash(world.recipe.seed);
+  const interiorDistanceKm = canonicalContinentalInteriorDistance(world, adjacency);
+  const scores = new Float64Array(world.cells.length);
+  for (const face of world.sphere.faces) {
+    const cell = world.cells[face.id];
+    if (!cell.isLand || !Number.isFinite(interiorDistanceKm[face.id])) continue;
+    const interior = clamp((interiorDistanceKm[face.id] - 120) / 760);
+    const stableCraton = clamp((cell.crustAgeMyr - 280) / 1_650);
+    const quietInterior = 1 - orogeny[face.id].strength * 0.62;
+    const worldSignal = continentalStructureNoise(face.center, hashedSeed + 27_311, world.recipe.radiusKm);
+    const terraneSignal = continentalStructureNoise(
+      face.center,
+      hashedSeed + cell.provenanceId * 17 + 91_107,
+      world.recipe.radiusKm,
+    );
+    const signal = clamp((worldSignal * 0.72 + terraneSignal * 0.28) * 0.5 + 0.5);
+    scores[face.id] = interior
+      * (0.38 + signal * 0.62)
+      * (0.72 + stableCraton * 0.28)
+      * quietInterior;
+  }
+
+  const candidates = world.sphere.faces
+    .filter((face) => scores[face.id] >= 0.32
+      && adjacency[face.id].every((neighborId) => scores[face.id] >= scores[neighborId]))
+    .sort((first, second) => scores[second.id] - scores[first.id] || first.id - second.id);
+  const minimumSpacingKm = 1_050;
+  const selectedCenters: { readonly faceId: number; readonly strength: number }[] = [];
+  for (const candidate of candidates) {
+    const tooClose = selectedCenters.some((center) => (
+      Math.acos(clamp(dot3(candidate.center, world.sphere.faces[center.faceId].center), -1, 1))
+        * world.recipe.radiusKm < minimumSpacingKm
+    ));
+    if (!tooClose) selectedCenters.push({ faceId: candidate.id, strength: scores[candidate.id] });
+  }
+  const centers = selectedCenters.map((center) => ({
+    point: world.sphere.faces[center.faceId].center,
+    strength: center.strength,
+  }));
+
+  const supportKm = new Float64Array(world.cells.length);
+  let maximumSupportKm = 0;
+  for (const face of world.sphere.faces) {
+    if (!world.cells[face.id].isLand) continue;
+    supportKm[face.id] = continentalReliefAt(face.center, centers, world.recipe.radiusKm);
+    maximumSupportKm = Math.max(maximumSupportKm, supportKm[face.id]);
+  }
+  return { supportKm, centers, centerCount: centers.length, maximumSupportKm };
+}
+
 function canonicalGeologyContext(world: TectonicWorldModel): {
   readonly sutureStrength: Float64Array;
   readonly activeMarginStrength: Float64Array;
   readonly orogeny: readonly CanonicalOrogenyCell[];
+  readonly continentalRelief: ContinentalReliefStructure;
 } {
   const adjacency = buildAdjacency(world.sphere);
   const continental = (faceId: number): boolean => {
@@ -606,7 +761,13 @@ function canonicalGeologyContext(world: TectonicWorldModel): {
     0.64,
     () => true,
   );
-  return { sutureStrength, activeMarginStrength, orogeny: createCanonicalOrogeny(world) };
+  const orogeny = createCanonicalOrogeny(world);
+  return {
+    sutureStrength,
+    activeMarginStrength,
+    orogeny,
+    continentalRelief: createContinentalReliefStructure(world, adjacency, orogeny),
+  };
 }
 
 function shapedOrogenicHeight(
@@ -2039,16 +2200,68 @@ function createRiverPresentationPoints(
   return points;
 }
 
+function createRiverPresentationTangents(
+  cells: readonly MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  riverFaceIds: ReadonlySet<number>,
+  points: ReadonlyMap<number, Vec3>,
+): ReadonlyMap<number, Vec3> {
+  const dominantIncoming = new Map<number, number>();
+  for (const faceId of riverFaceIds) {
+    const receiverId = cells[faceId].receiverFaceId;
+    if (receiverId === null) continue;
+    const incumbent = dominantIncoming.get(receiverId);
+    if (incumbent === undefined
+      || cells[faceId].drainageAreaKm2 > cells[incumbent].drainageAreaKm2
+      || (cells[faceId].drainageAreaKm2 === cells[incumbent].drainageAreaKm2
+        && faceId < incumbent)) {
+      dominantIncoming.set(receiverId, faceId);
+    }
+  }
+  const tangents = new Map<number, Vec3>();
+  for (const [faceId, point] of points) {
+    const upstreamId = dominantIncoming.get(faceId);
+    const downstreamId = cells[faceId].isLand ? cells[faceId].receiverFaceId : null;
+    const upstream = upstreamId === undefined
+      ? null
+      : points.get(upstreamId) ?? sphere.faces[upstreamId].center;
+    const downstream = downstreamId === null
+      ? null
+      : points.get(downstreamId) ?? sphere.faces[downstreamId].center;
+    if (!upstream && !downstream) continue;
+    const raw: Vec3 = upstream && downstream
+      ? [
+        downstream[0] - upstream[0],
+        downstream[1] - upstream[1],
+        downstream[2] - upstream[2],
+      ]
+      : downstream
+        ? [downstream[0] - point[0], downstream[1] - point[1], downstream[2] - point[2]]
+        : [point[0] - upstream![0], point[1] - upstream![1], point[2] - upstream![2]];
+    const radial = dot3(raw, point);
+    const tangent: Vec3 = [
+      raw[0] - point[0] * radial,
+      raw[1] - point[1] * radial,
+      raw[2] - point[2] * radial,
+    ];
+    if (dot3(tangent, tangent) > 1e-18) tangents.set(faceId, normalize3(tangent));
+  }
+  return tangents;
+}
+
 function createRiverPresentationPath(
   fromPoint: Vec3,
   toPoint: Vec3,
+  fromTangent: Vec3 | undefined,
+  toTangent: Vec3 | undefined,
   source: MutableSurfaceCell,
   receiver: MutableSurfaceCell,
   radiusKm: number,
   minimumRiverAreaKm2: number,
   maximumRiverAreaKm2: number,
-  seed: number,
+  channelPhase: number,
   refinementScale: number,
+  isLandAt: (point: Vec3) => boolean,
 ): { readonly path: readonly Vec3[]; readonly confinement: number; readonly meanderAmplitudeKm: number } {
   const cosine = clamp(dot3(fromPoint, toPoint), -1, 1);
   const segmentRadians = Math.acos(cosine);
@@ -2064,8 +2277,10 @@ function createRiverPresentationPath(
       + clamp(slope / 0.012) * 0.34
       + source.erosionResistance * 0.11,
   );
-  const meanderAmplitudeRadians = segmentRadians
-    * clamp(0.018 + (1 - confinement) * (0.035 + hierarchy * 0.075), 0, 0.13)
+  const coastClearance = clamp((Math.min(source.coastDistanceKm, receiver.coastDistanceKm) - 12) / 180);
+  let meanderAmplitudeRadians = segmentRadians
+    * clamp(0.025 + (1 - confinement) * (0.07 + hierarchy * 0.145), 0, 0.24)
+    * (0.38 + coastClearance * 0.62)
     * refinementScale;
   if (meanderAmplitudeRadians <= 1e-12 || segmentRadians <= 1e-10) {
     return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
@@ -2075,38 +2290,164 @@ function createRiverPresentationPath(
     return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
   }
   const lateral = normalize3(lateralRaw);
-  const phase = seedHash(`${seed}:channel:${source.faceId}`) / 0x1_0000_0000 * Math.PI * 2;
-  const path: Vec3[] = [];
   const pointCount = hierarchy > 0.62 ? 7 : 5;
-  for (let index = 0; index < pointCount; index += 1) {
-    const progress = index / (pointCount - 1);
-    if (index === 0) {
-      path.push(fromPoint);
-      continue;
+  const buildPath = (amplitudeRadians: number, tangentScale: number): Vec3[] => {
+    const path: Vec3[] = [];
+    for (let index = 0; index < pointCount; index += 1) {
+      const progress = index / (pointCount - 1);
+      if (index === 0) {
+        path.push(fromPoint);
+        continue;
+      }
+      if (index === pointCount - 1) {
+        path.push(toPoint);
+        continue;
+      }
+      const progress2 = progress * progress;
+      const progress3 = progress2 * progress;
+      const h00 = 2 * progress3 - 3 * progress2 + 1;
+      const h10 = progress3 - 2 * progress2 + progress;
+      const h01 = -2 * progress3 + 3 * progress2;
+      const h11 = progress3 - progress2;
+      const tangentLength = 2 * Math.sin(segmentRadians * 0.5) * tangentScale;
+      const base = normalize3([
+        fromPoint[0] * h00 + (fromTangent?.[0] ?? 0) * tangentLength * h10
+          + toPoint[0] * h01 + (toTangent?.[0] ?? 0) * tangentLength * h11,
+        fromPoint[1] * h00 + (fromTangent?.[1] ?? 0) * tangentLength * h10
+          + toPoint[1] * h01 + (toTangent?.[1] ?? 0) * tangentLength * h11,
+        fromPoint[2] * h00 + (fromTangent?.[2] ?? 0) * tangentLength * h10
+          + toPoint[2] * h01 + (toTangent?.[2] ?? 0) * tangentLength * h11,
+      ]);
+      const envelope = Math.sin(Math.PI * progress) ** 2;
+      const bend = Math.sin(Math.PI * 2 * progress + channelPhase)
+        + Math.sin(Math.PI * 4 * progress - channelPhase * 0.47) * 0.28;
+      const offset = amplitudeRadians * envelope * bend / 1.28;
+      path.push(normalize3([
+        base[0] + lateral[0] * offset,
+        base[1] + lateral[1] * offset,
+        base[2] + lateral[2] * offset,
+      ]));
     }
-    if (index === pointCount - 1) {
-      path.push(toPoint);
-      continue;
-    }
-    const base = normalize3([
-      fromPoint[0] * (1 - progress) + toPoint[0] * progress,
-      fromPoint[1] * (1 - progress) + toPoint[1] * progress,
-      fromPoint[2] * (1 - progress) + toPoint[2] * progress,
-    ]);
-    const envelope = Math.sin(Math.PI * progress);
-    const bend = Math.sin(Math.PI * 2 * progress + phase)
-      + Math.sin(Math.PI * 4 * progress - phase * 0.47) * 0.28;
-    const offset = meanderAmplitudeRadians * envelope * bend / 1.28;
-    path.push(normalize3([
-      base[0] + lateral[0] * offset,
-      base[1] + lateral[1] * offset,
-      base[2] + lateral[2] * offset,
-    ]));
+    return path;
+  };
+  let tangentScale = 0.46;
+  let path = buildPath(meanderAmplitudeRadians, tangentScale);
+  for (let attempt = 0; attempt < 4 && path.slice(1, -1).some((point) => !isLandAt(point)); attempt += 1) {
+    meanderAmplitudeRadians *= 0.5;
+    tangentScale *= 0.7;
+    path = buildPath(meanderAmplitudeRadians, tangentScale);
   }
   return {
     path,
     confinement,
     meanderAmplitudeKm: meanderAmplitudeRadians * radiusKm,
+  };
+}
+
+function createRiverBasinPhases(
+  cells: readonly MutableSurfaceCell[],
+  riverCells: readonly MutableSurfaceCell[],
+  minimumRiverAreaKm2: number,
+  seed: number,
+): ReadonlyMap<number, number> {
+  const terminalByFaceId = new Map<number, number>();
+  const terminalFor = (startFaceId: number): number => {
+    const visited: number[] = [];
+    let faceId = startFaceId;
+    const seen = new Set<number>();
+    while (true) {
+      const memoized = terminalByFaceId.get(faceId);
+      if (memoized !== undefined) {
+        for (const visitedId of visited) terminalByFaceId.set(visitedId, memoized);
+        return memoized;
+      }
+      if (seen.has(faceId)) {
+        for (const visitedId of visited) terminalByFaceId.set(visitedId, faceId);
+        return faceId;
+      }
+      seen.add(faceId);
+      visited.push(faceId);
+      const receiverId = cells[faceId].receiverFaceId;
+      if (receiverId === null || !cells[receiverId].isLand || cells[receiverId].isLake) {
+        const terminalId = receiverId ?? faceId;
+        for (const visitedId of visited) terminalByFaceId.set(visitedId, terminalId);
+        return terminalId;
+      }
+      faceId = receiverId;
+    }
+  };
+  return new Map(riverCells.map((cell) => {
+    const terminalId = terminalFor(cell.faceId);
+    const basinPhase = seedHash(`${seed}:channel-basin:${terminalId}`)
+      / 0x1_0000_0000 * Math.PI * 2;
+    const downstreamProgress = Math.log1p(cell.drainageAreaKm2 / minimumRiverAreaKm2) * 0.73;
+    return [cell.faceId, basinPhase + downstreamProgress] as const;
+  }));
+}
+
+function riverPresentationDiagnostics(
+  rivers: readonly SurfaceRiverSegment[],
+  sphere: GeodesicSphere,
+): {
+  readonly meanRiverSinuosity: number;
+  readonly meanRiverMeanderAmplitudeKm: number;
+  readonly meanNeighboringChannelAlignment: number;
+} {
+  if (rivers.length === 0) {
+    return {
+      meanRiverSinuosity: 1,
+      meanRiverMeanderAmplitudeKm: 0,
+      meanNeighboringChannelAlignment: 0,
+    };
+  }
+  let sinuosity = 0;
+  let amplitudeKm = 0;
+  const byFaceId = new Map(rivers.map((river) => [river.fromFaceId, river] as const));
+  const tangentAtSource = (river: SurfaceRiverSegment): Vec3 | null => {
+    const point = river.fromPoint;
+    const target = river.path[1] ?? river.toPoint;
+    const raw: Vec3 = [target[0] - point[0], target[1] - point[1], target[2] - point[2]];
+    const radial = dot3(raw, point);
+    const tangent: Vec3 = [
+      raw[0] - point[0] * radial,
+      raw[1] - point[1] * radial,
+      raw[2] - point[2] * radial,
+    ];
+    return dot3(tangent, tangent) > 1e-18 ? normalize3(tangent) : null;
+  };
+  for (const river of rivers) {
+    let pathLength = 0;
+    for (let index = 0; index < river.path.length - 1; index += 1) {
+      pathLength += Math.acos(clamp(dot3(river.path[index], river.path[index + 1]), -1, 1));
+    }
+    const direct = Math.acos(clamp(dot3(river.fromPoint, river.toPoint), -1, 1));
+    sinuosity += direct > 1e-12 ? pathLength / direct : 1;
+    amplitudeKm += river.meanderAmplitudeKm;
+  }
+  let alignment = 0;
+  let alignmentPairs = 0;
+  for (const edge of sphere.edges) {
+    const first = byFaceId.get(edge.faces[0]);
+    const second = byFaceId.get(edge.faces[1]);
+    if (!first || !second) continue;
+    const firstTangent = tangentAtSource(first);
+    const secondTangent = tangentAtSource(second);
+    if (!firstTangent || !secondTangent) continue;
+    const anchor = first.fromPoint;
+    const radial = dot3(secondTangent, anchor);
+    const transported: Vec3 = [
+      secondTangent[0] - anchor[0] * radial,
+      secondTangent[1] - anchor[1] * radial,
+      secondTangent[2] - anchor[2] * radial,
+    ];
+    if (dot3(transported, transported) <= 1e-18) continue;
+    alignment += Math.max(0, dot3(firstTangent, normalize3(transported)));
+    alignmentPairs += 1;
+  }
+  return {
+    meanRiverSinuosity: sinuosity / rivers.length,
+    meanRiverMeanderAmplitudeKm: amplitudeKm / rivers.length,
+    meanNeighboringChannelAlignment: alignmentPairs > 0 ? alignment / alignmentPairs : 0,
   };
 }
 
@@ -2182,6 +2523,7 @@ export function createSurfaceProcessWorld(
   const reliefAmplitudeKm = clamp(options.reliefAmplitudeKm ?? 0.34, 0, 1.25);
   const valleyReliefScale = clamp(options.valleyReliefScale ?? 1, 0, 2.5);
   const channelRefinementScale = clamp(options.channelRefinementScale ?? 1, 0, 2);
+  const continentalReliefScale = clamp(options.continentalReliefScale ?? 1, 0, 2);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
@@ -2196,9 +2538,17 @@ export function createSurfaceProcessWorld(
     const canonical = tectonicWorld.cells[canonicalFaceId];
     const rawAboveSea = refined.elevationKm - tectonicWorld.seaLevelKm;
     const orogeny = geologyContext.orogeny[canonicalFaceId];
-    const aboveSea = refined.isLand
+    const orogenicAboveSea = refined.isLand
       ? shapedOrogenicHeight(rawAboveSea, orogeny, face.center, hashedSeed)
       : rawAboveSea;
+    const continentalReliefKm = refined.isLand
+      ? continentalReliefAt(
+        face.center,
+        geologyContext.continentalRelief.centers,
+        tectonicWorld.recipe.radiusKm,
+      ) * continentalReliefScale
+      : 0;
+    const aboveSea = orogenicAboveSea + continentalReliefKm;
     const structuralElevationKm = tectonicWorld.seaLevelKm + aboveSea;
     const mountainEnvelope = clamp((aboveSea - 0.25) / 4.5);
     const continentalEnvelope = clamp(canonical.continentalFraction
@@ -2408,9 +2758,21 @@ export function createSurfaceProcessWorld(
     riverFaceIds,
     hashedSeed,
   );
+  const riverPresentationTangents = createRiverPresentationTangents(
+    cells,
+    sphere,
+    riverFaceIds,
+    riverPresentationPoints,
+  );
   const maximumResolvedRiverAreaKm2 = riverCells.reduce(
     (maximum, cell) => Math.max(maximum, cell.drainageAreaKm2),
     minimumRiverAreaKm2,
+  );
+  const riverBasinPhases = createRiverBasinPhases(
+    cells,
+    riverCells,
+    minimumRiverAreaKm2,
+    hashedSeed,
   );
   const boundaryVerticesByPair = new Map<string, readonly [Vec3, Vec3]>();
   for (const edge of sphere.edges) {
@@ -2439,13 +2801,16 @@ export function createSurfaceProcessWorld(
     const channel = createRiverPresentationPath(
       fromPoint,
       toPoint,
+      riverPresentationTangents.get(cell.faceId),
+      riverPresentationTangents.get(receiverFaceId),
       cell,
       receiver,
       tectonicWorld.recipe.radiusKm,
       minimumRiverAreaKm2,
       maximumResolvedRiverAreaKm2,
-      hashedSeed,
+      riverBasinPhases.get(cell.faceId) ?? 0,
       channelRefinementScale,
+      (point) => refinement.sample(point).isLand,
     );
     return {
       fromFaceId: cell.faceId,
@@ -2519,6 +2884,7 @@ export function createSurfaceProcessWorld(
   });
   const coastalLandformCounts = emptyCoastalLandformRecord();
   for (const mouth of riverMouths) coastalLandformCounts[mouth.landform] += 1;
+  const riverDiagnostics = riverPresentationDiagnostics(rivers, sphere);
 
   const totalRunoff = cells.reduce((sum, cell) => sum + cell.localRunoffKm3PerYear, 0);
   const landArea = cells.reduce(
@@ -2839,6 +3205,7 @@ export function createSurfaceProcessWorld(
       overflowingLakeBodyCount: lakeBalance.overflowingLakeBodyCount,
       lakeEvaporationKm3PerYear: balancedRunoff.lakeEvaporationKm3PerYear,
       riverSegmentCount: rivers.length,
+      ...riverDiagnostics,
       riverMouthCount: riverMouths.length,
       oceanRiverMouthCount: riverMouths.filter((mouth) => mouth.receivingWater === "ocean").length,
       lakeInflowCount: riverMouths.filter((mouth) => mouth.receivingWater === "lake").length,
@@ -2871,6 +3238,9 @@ export function createSurfaceProcessWorld(
         return areas;
       }, emptyBiomeRecord()),
       ...climateStats,
+      continentalReliefCenterCount: geologyContext.continentalRelief.centerCount,
+      maximumContinentalReliefKm: geologyContext.continentalRelief.maximumSupportKm
+        * continentalReliefScale,
       ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],

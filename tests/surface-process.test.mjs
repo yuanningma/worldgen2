@@ -256,6 +256,11 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
   ) <= tolerance);
   assert.ok(surface.stats.totalOutletRunoffKm3PerYear > 0);
   assert.ok(surface.stats.riverSegmentCount > 0);
+  assert.ok(surface.stats.meanRiverSinuosity > 1.005);
+  assert.ok(surface.stats.meanRiverSinuosity < 1.5);
+  assert.ok(surface.stats.meanRiverMeanderAmplitudeKm > 0);
+  assert.ok(surface.stats.meanNeighboringChannelAlignment >= 0);
+  assert.ok(surface.stats.meanNeighboringChannelAlignment < 0.9);
   assert.equal(surface.riverMouths.length, surface.stats.riverMouthCount);
   assert.equal(
     surface.stats.oceanRiverMouthCount + surface.stats.lakeInflowCount,
@@ -359,7 +364,7 @@ test("river presentation nodes are shared while terminal mouths lie on water bou
         + river.fromPoint[1] * river.toPoint[1]
         + river.fromPoint[2] * river.toPoint[2],
     ))) * tectonic.recipe.radiusKm;
-    assert.ok(river.meanderAmplitudeKm <= segmentKm * 0.131);
+    assert.ok(river.meanderAmplitudeKm <= segmentKm * 0.241);
   }
 });
 
@@ -432,6 +437,39 @@ test("surface processes are deterministic for a world recipe", () => {
   assert.deepEqual(first.stats, second.stats);
   assert.deepEqual(first.rivers, second.rivers);
   assert.deepEqual(first.cells, second.cells);
+});
+
+test("continental interior relief adds broad drainage structure without moving the coast", () => {
+  const structured = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    continentalReliefScale: 1,
+  });
+  const flatInterior = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    continentalReliefScale: 0,
+  });
+  assert.ok(structured.stats.continentalReliefCenterCount > 0);
+  assert.ok(structured.stats.maximumContinentalReliefKm > 0);
+  assert.equal(flatInterior.stats.maximumContinentalReliefKm, 0);
+  assert.deepEqual(
+    structured.cells.map((cell) => cell.isLand),
+    flatInterior.cells.map((cell) => cell.isLand),
+  );
+  assert.ok(structured.cells.some((cell, index) => cell.isLand
+    && Math.abs(cell.elevationKm - flatInterior.cells[index].elevationKm) > 1e-4));
+});
+
+test("larger planets resolve more fixed-physical-scale interior relief provinces", () => {
+  const largerTectonic = simulateTectonicWorld({
+    ...tectonic.recipe,
+    radiusKm: tectonic.recipe.radiusKm * 2,
+  });
+  const earthScale = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
+  const larger = createSurfaceProcessWorld(largerTectonic, { subdivisions: 4 });
+  assert.ok(larger.stats.continentalReliefCenterCount
+    > earthScale.stats.continentalReliefCenterCount);
+  assert.equal(earthScale.stats.canonicalAnchorMismatches, 0);
+  assert.equal(larger.stats.canonicalAnchorMismatches, 0);
 });
 
 test("fluvial incision conserves sediment and preserves the canonical coast", () => {
