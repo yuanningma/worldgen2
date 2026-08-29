@@ -25,7 +25,9 @@ test("orogenic profiles distinguish collision, subduction, island arcs, and inhe
   assert.equal(first.length, tectonic.cells.length);
   assert.ok(first.every((cell) => cell.faceId >= 0
     && cell.strength >= 0 && cell.strength <= 1
-    && cell.foothillStrength >= 0 && cell.foothillStrength <= 1));
+    && cell.foothillStrength >= 0 && cell.foothillStrength <= 1
+    && cell.forelandBasinStrength >= 0 && cell.forelandBasinStrength <= 1
+    && cell.flexuralBulgeStrength >= 0 && cell.flexuralBulgeStrength <= 1));
 
   let collisionCount = 0;
   let subductionCount = 0;
@@ -51,6 +53,8 @@ test("orogenic profiles distinguish collision, subduction, island arcs, and inhe
   assert.ok(collisionCount > 0 && subductionCount > 0 && islandArcCount > 0);
   assert.ok(first.some((cell) => cell.sutureCore > 0));
   assert.ok(first.some((cell) => cell.foothillStrength > 0.1));
+  assert.ok(first.some((cell) => cell.forelandBasinStrength > 0.2));
+  assert.ok(first.some((cell) => cell.flexuralBulgeStrength > 0.15));
 });
 
 test("boundary-supported relief narrows mountains without changing canonical land", () => {
@@ -60,7 +64,10 @@ test("boundary-supported relief narrows mountains without changing canonical lan
     cells: tectonic.cells.map((cell) => ({ ...cell, provenanceId: 1 })),
   };
   const quietOrogeny = createCanonicalOrogeny(quietWorld);
-  assert.ok(quietOrogeny.every((cell) => cell.regime === "none" && cell.strength === 0));
+  assert.ok(quietOrogeny.every((cell) => cell.regime === "none"
+    && cell.strength === 0
+    && cell.forelandBasinStrength === 0
+    && cell.flexuralBulgeStrength === 0));
 
   const active = createSurfaceProcessWorld(tectonic, { subdivisions: 3, erosionStrengthKm: 0 });
   const quiet = createSurfaceProcessWorld(quietWorld, { subdivisions: 3, erosionStrengthKm: 0 });
@@ -75,4 +82,34 @@ test("boundary-supported relief narrows mountains without changing canonical lan
   assert.ok(maximumRelief(active) > maximumRelief(quiet) + 1.5);
   assert.equal(quiet.cells.filter((cell) => cell.isLand
     && cell.elevationKm - tectonic.seaLevelKm > 3).length, 0);
+});
+
+test("flexural loading creates bounded sedimentary forelands without moving the coast", () => {
+  const flexed = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 3,
+    erosionStrengthKm: 0,
+    flexuralReliefScale: 1,
+  });
+  const rigid = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 3,
+    erosionStrengthKm: 0,
+    flexuralReliefScale: 0,
+  });
+  assert.deepEqual(
+    flexed.cells.map((cell) => cell.isLand),
+    rigid.cells.map((cell) => cell.isLand),
+  );
+  assert.ok(flexed.stats.forelandBasinCellCount > 0);
+  assert.ok(flexed.stats.flexuralBulgeCellCount > 0);
+  assert.ok(flexed.stats.maximumForelandSubsidenceKm > 0);
+  assert.ok(flexed.stats.maximumForelandSubsidenceKm <= 1.24);
+  assert.ok(flexed.stats.maximumFlexuralBulgeKm > 0);
+  assert.ok(flexed.stats.maximumFlexuralBulgeKm <= 0.32);
+  assert.equal(rigid.stats.maximumForelandSubsidenceKm, 0);
+  assert.equal(rigid.stats.maximumFlexuralBulgeKm, 0);
+  assert.ok(flexed.cells.some((cell, index) => cell.isLand
+    && cell.flexuralReliefKm < -1e-4
+    && cell.elevationKm < rigid.cells[index].elevationKm - 1e-4));
+  assert.ok(flexed.cells.some((cell) => cell.forelandBasinStrength > 0.28
+    && cell.lithology === "sedimentary"));
 });

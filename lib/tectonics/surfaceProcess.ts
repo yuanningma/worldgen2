@@ -40,6 +40,8 @@ export interface SurfaceProcessOptions {
   readonly channelRefinementScale?: number;
   /** Strength of broad, tectonically inherited continental-interior relief. */
   readonly continentalReliefScale?: number;
+  /** Strength of convergent-margin foreland subsidence and outer flexural rise. */
+  readonly flexuralReliefScale?: number;
   /** Strength of relief-conditioned rocky/passive coastline spectra. */
   readonly coastalGeomorphologyScale?: number;
 }
@@ -132,6 +134,12 @@ export interface SurfaceProcessCell {
   readonly orogeny: OrogenRegime;
   /** Combined narrow-core and broad-foothill support in [0, 1]. */
   readonly orogenStrength: number;
+  /** Continental flexural depression outside a convergent mountain belt. */
+  readonly forelandBasinStrength: number;
+  /** Low outer rise beyond a foreland basin. */
+  readonly flexuralBulgeStrength: number;
+  /** Signed tectonic flexure applied before geomorphic evolution. */
+  readonly flexuralReliefKm: number;
   readonly localRunoffKm3PerYear: number;
   readonly erodedThicknessKm: number;
   readonly depositedThicknessKm: number;
@@ -221,6 +229,9 @@ export interface SurfacePresentationSample {
   readonly erosionResistance: number;
   readonly orogeny: OrogenRegime;
   readonly orogenStrength: number;
+  readonly forelandBasinStrength: number;
+  readonly flexuralBulgeStrength: number;
+  readonly flexuralReliefKm: number;
   /** Stable world-space detail used for albedo modulation, in [-1, 1]. */
   readonly surfaceTexture: number;
   /** Tangential rise/run vector used for continuous hill shading. */
@@ -287,6 +298,10 @@ export interface SurfaceProcessStats {
   /** Naturally selected broad continental-interior uplift centers. */
   readonly continentalReliefCenterCount: number;
   readonly maximumContinentalReliefKm: number;
+  readonly forelandBasinCellCount: number;
+  readonly flexuralBulgeCellCount: number;
+  readonly maximumForelandSubsidenceKm: number;
+  readonly maximumFlexuralBulgeKm: number;
 }
 
 export interface SurfaceProcessWorld {
@@ -816,6 +831,20 @@ function shapedOrogenicHeight(
   return Math.max(0.002, shaped);
 }
 
+function flexuralRelief(
+  elevationAboveSeaKm: number,
+  orogeny: CanonicalOrogenyCell,
+  scale: number,
+): number {
+  if (elevationAboveSeaKm <= 0 || scale <= 0) return 0;
+  const availableReliefKm = Math.max(0, elevationAboveSeaKm - 0.035);
+  const desiredSubsidenceKm = orogeny.forelandBasinStrength * 0.62;
+  const basinFraction = 0.2 + orogeny.forelandBasinStrength * 0.54;
+  const subsidenceKm = Math.min(desiredSubsidenceKm, availableReliefKm * basinFraction);
+  const bulgeKm = orogeny.flexuralBulgeStrength * 0.16;
+  return (bulgeKm - subsidenceKm) * scale;
+}
+
 function surfaceGeology(
   isLand: boolean,
   point: Vec3,
@@ -824,6 +853,7 @@ function surfaceGeology(
   world: TectonicWorldModel,
   sutureStrength: number,
   activeMarginStrength: number,
+  forelandBasinStrength: number,
   seed: number,
 ): { readonly lithology: SurfaceLithology; readonly erosionResistance: number } {
   if (!isLand) return { lithology: "oceanic-basalt", erosionResistance: 0.78 };
@@ -836,7 +866,10 @@ function surfaceGeology(
   const warmLatitude = Math.abs(point[2]) < 0.72;
   let lithology: SurfaceLithology;
   let baseResistance: number;
-  if (sutureStrength > 0.34 || (elevationAboveSeaKm > 2.4 && continentalFraction > 0.55)) {
+  if (forelandBasinStrength > 0.28 && elevationAboveSeaKm < 1.35) {
+    lithology = "sedimentary";
+    baseResistance = 0.26 + (1 - forelandBasinStrength) * 0.12;
+  } else if (sutureStrength > 0.34 || (elevationAboveSeaKm > 2.4 && continentalFraction > 0.55)) {
     lithology = "metamorphic";
     baseResistance = 0.86;
   } else if (canonical.crustAgeMyr < 320
@@ -2524,6 +2557,7 @@ export function createSurfaceProcessWorld(
   const valleyReliefScale = clamp(options.valleyReliefScale ?? 1, 0, 2.5);
   const channelRefinementScale = clamp(options.channelRefinementScale ?? 1, 0, 2);
   const continentalReliefScale = clamp(options.continentalReliefScale ?? 1, 0, 2);
+  const flexuralReliefScale = clamp(options.flexuralReliefScale ?? 1, 0, 2);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
@@ -2548,7 +2582,10 @@ export function createSurfaceProcessWorld(
         tectonicWorld.recipe.radiusKm,
       ) * continentalReliefScale
       : 0;
-    const aboveSea = orogenicAboveSea + continentalReliefKm;
+    const flexuralReliefKm = refined.isLand
+      ? flexuralRelief(orogenicAboveSea + continentalReliefKm, orogeny, flexuralReliefScale)
+      : 0;
+    const aboveSea = orogenicAboveSea + continentalReliefKm + flexuralReliefKm;
     const structuralElevationKm = tectonicWorld.seaLevelKm + aboveSea;
     const mountainEnvelope = clamp((aboveSea - 0.25) / 4.5);
     const continentalEnvelope = clamp(canonical.continentalFraction
@@ -2561,6 +2598,7 @@ export function createSurfaceProcessWorld(
       tectonicWorld,
       geologyContext.sutureStrength[canonicalFaceId],
       geologyContext.activeMarginStrength[canonicalFaceId],
+      orogeny.forelandBasinStrength,
       hashedSeed,
     );
     const noise = sphericalNoise(face.center, hashedSeed);
@@ -2607,6 +2645,9 @@ export function createSurfaceProcessWorld(
       erosionResistance: geology.erosionResistance,
       orogeny: orogeny.regime,
       orogenStrength: orogeny.strength,
+      forelandBasinStrength: orogeny.forelandBasinStrength,
+      flexuralBulgeStrength: orogeny.flexuralBulgeStrength,
+      flexuralReliefKm,
       localRunoffKm3PerYear: 0,
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
@@ -2914,6 +2955,9 @@ export function createSurfaceProcessWorld(
     erosionResistance: cell.erosionResistance,
     orogeny: cell.orogeny,
     orogenStrength: cell.orogenStrength,
+    forelandBasinStrength: cell.forelandBasinStrength,
+    flexuralBulgeStrength: cell.flexuralBulgeStrength,
+    flexuralReliefKm: cell.flexuralReliefKm,
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
     erodedThicknessKm: cell.erodedThicknessKm,
     depositedThicknessKm: cell.depositedThicknessKm,
@@ -2968,6 +3012,9 @@ export function createSurfaceProcessWorld(
     let orographicLiftKm = 0;
     let erosionResistance = 0;
     let orogenStrength = 0;
+    let forelandBasinStrength = 0;
+    let flexuralBulgeStrength = 0;
+    let flexuralReliefKm = 0;
     for (const faceId of candidates) {
       const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
       const cell = immutableCells[faceId];
@@ -2989,6 +3036,9 @@ export function createSurfaceProcessWorld(
       orographicLiftKm += cell.orographicLiftKm * weight;
       erosionResistance += cell.erosionResistance * weight;
       orogenStrength += cell.orogenStrength * weight;
+      forelandBasinStrength += cell.forelandBasinStrength * weight;
+      flexuralBulgeStrength += cell.flexuralBulgeStrength * weight;
+      flexuralReliefKm += cell.flexuralReliefKm * weight;
     }
     elevationKm /= totalWeight;
     fillDepthKm /= totalWeight;
@@ -3007,6 +3057,9 @@ export function createSurfaceProcessWorld(
     orographicLiftKm /= totalWeight;
     erosionResistance /= totalWeight;
     orogenStrength /= totalWeight;
+    forelandBasinStrength /= totalWeight;
+    flexuralBulgeStrength /= totalWeight;
+    flexuralReliefKm /= totalWeight;
     if (refined.isLand) {
       let lakePotential = 0;
       let basinWeight = 0;
@@ -3179,6 +3232,9 @@ export function createSurfaceProcessWorld(
       erosionResistance,
       orogeny: nearestMatchingCell.orogeny,
       orogenStrength,
+      forelandBasinStrength,
+      flexuralBulgeStrength,
+      flexuralReliefKm,
       surfaceTexture,
       terrainGradient: gradient,
       presentationOnly: true,
@@ -3241,6 +3297,20 @@ export function createSurfaceProcessWorld(
       continentalReliefCenterCount: geologyContext.continentalRelief.centerCount,
       maximumContinentalReliefKm: geologyContext.continentalRelief.maximumSupportKm
         * continentalReliefScale,
+      forelandBasinCellCount: cells.filter((cell) => (
+        cell.isLand && cell.forelandBasinStrength >= 0.25
+      )).length,
+      flexuralBulgeCellCount: cells.filter((cell) => (
+        cell.isLand && cell.flexuralBulgeStrength >= 0.2
+      )).length,
+      maximumForelandSubsidenceKm: cells.reduce(
+        (maximum, cell) => Math.max(maximum, -Math.min(0, cell.flexuralReliefKm)),
+        0,
+      ),
+      maximumFlexuralBulgeKm: cells.reduce(
+        (maximum, cell) => Math.max(maximum, Math.max(0, cell.flexuralReliefKm)),
+        0,
+      ),
       ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],

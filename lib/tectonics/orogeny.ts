@@ -10,6 +10,10 @@ export interface CanonicalOrogenyCell {
   readonly islandArcCore: number;
   readonly sutureCore: number;
   readonly foothillStrength: number;
+  /** Flexurally subsiding continental belt outside an active orogenic core. */
+  readonly forelandBasinStrength: number;
+  /** Low-amplitude outer rise beyond the flexural basin. */
+  readonly flexuralBulgeStrength: number;
   readonly strength: number;
 }
 
@@ -43,6 +47,99 @@ function diffuseMaximum(
     field = next;
   }
   return field;
+}
+
+interface DistanceEntry {
+  readonly faceId: number;
+  readonly distanceKm: number;
+}
+
+class DistanceHeap {
+  readonly #entries: DistanceEntry[] = [];
+
+  push(entry: DistanceEntry): void {
+    this.#entries.push(entry);
+    let index = this.#entries.length - 1;
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (this.#entries[parent].distanceKm <= entry.distanceKm) break;
+      this.#entries[index] = this.#entries[parent];
+      index = parent;
+    }
+    this.#entries[index] = entry;
+  }
+
+  pop(): DistanceEntry | undefined {
+    const root = this.#entries[0];
+    const last = this.#entries.pop();
+    if (!root || !last || this.#entries.length === 0) return root;
+    let index = 0;
+    while (true) {
+      const left = index * 2 + 1;
+      if (left >= this.#entries.length) break;
+      const right = left + 1;
+      const child = right < this.#entries.length
+        && this.#entries[right].distanceKm < this.#entries[left].distanceKm
+        ? right
+        : left;
+      if (this.#entries[child].distanceKm >= last.distanceKm) break;
+      this.#entries[index] = this.#entries[child];
+      index = child;
+    }
+    this.#entries[index] = last;
+    return root;
+  }
+}
+
+function angularDistance(first: readonly number[], second: readonly number[]): number {
+  return Math.acos(clamp(
+    first[0] * second[0] + first[1] * second[1] + first[2] * second[2],
+    -1,
+    1,
+  ));
+}
+
+/**
+ * Computes distance through continental crust from the nearest active source.
+ * Carrying the source amplitude separately preserves boundary maturity while
+ * keeping the profile width in kilometres rather than mesh rings.
+ */
+function continentalSourceDistance(
+  world: TectonicWorldModel,
+  adjacency: readonly number[][],
+  sources: Float64Array,
+): { readonly distanceKm: Float64Array; readonly sourceStrength: Float64Array } {
+  const distanceKm = new Float64Array(sources.length).fill(Infinity);
+  const sourceStrength = new Float64Array(sources.length);
+  const heap = new DistanceHeap();
+  for (let faceId = 0; faceId < sources.length; faceId += 1) {
+    if (sources[faceId] <= 0 || continentalFraction(world, faceId) < 0.48) continue;
+    distanceKm[faceId] = 0;
+    sourceStrength[faceId] = sources[faceId];
+    heap.push({ faceId, distanceKm: 0 });
+  }
+  while (true) {
+    const entry = heap.pop();
+    if (!entry) break;
+    if (entry.distanceKm > distanceKm[entry.faceId] + 1e-9) continue;
+    const center = world.sphere.faces[entry.faceId].center;
+    for (const neighborId of adjacency[entry.faceId]) {
+      if (continentalFraction(world, neighborId) < 0.48) continue;
+      const stepKm = angularDistance(center, world.sphere.faces[neighborId].center)
+        * world.recipe.radiusKm;
+      const candidate = entry.distanceKm + stepKm;
+      if (candidate >= distanceKm[neighborId]) continue;
+      distanceKm[neighborId] = candidate;
+      sourceStrength[neighborId] = sourceStrength[entry.faceId];
+      heap.push({ faceId: neighborId, distanceKm: candidate });
+    }
+  }
+  return { distanceKm, sourceStrength };
+}
+
+function gaussianProfile(distanceKm: number, peakKm: number, widthKm: number): number {
+  if (!Number.isFinite(distanceKm)) return 0;
+  return Math.exp(-0.5 * ((distanceKm - peakKm) / widthKm) ** 2);
 }
 
 function continentalFraction(world: TectonicWorldModel, faceId: number): number {
@@ -116,6 +213,15 @@ export function createCanonicalOrogeny(
     sutureSeeds[faceId] * 0.55,
   ));
   const broadEnvelope = diffuseMaximum(activeSeeds, adjacency, 5, 0.7);
+  const collisionDistance = continentalSourceDistance(world, adjacency, collisionSeeds);
+  const subductionDistance = continentalSourceDistance(world, adjacency, subductionSeeds);
+  const characteristicKm = world.recipe.radiusKm
+    * Math.sqrt(4 * Math.PI / Math.max(1, world.sphere.faces.length));
+  const collisionBasinPeakKm = Math.max(620, characteristicKm * 1.12);
+  const subductionBasinPeakKm = Math.max(760, characteristicKm * 1.28);
+  const basinWidthKm = Math.max(360, characteristicKm * 0.78);
+  const bulgeOffsetKm = Math.max(680, characteristicKm * 1.18);
+  const bulgeWidthKm = Math.max(420, characteristicKm * 0.82);
 
   return world.sphere.faces.map((face) => {
     const faceId = face.id;
@@ -135,6 +241,34 @@ export function createCanonicalOrogeny(
       islandArcCore[faceId],
       sutureCore[faceId] * 0.72,
     );
+    const collisionForeland = gaussianProfile(
+      collisionDistance.distanceKm[faceId],
+      collisionBasinPeakKm,
+      basinWidthKm,
+    ) * collisionDistance.sourceStrength[faceId];
+    const subductionForeland = gaussianProfile(
+      subductionDistance.distanceKm[faceId],
+      subductionBasinPeakKm,
+      basinWidthKm,
+    ) * subductionDistance.sourceStrength[faceId];
+    const forelandBasinStrength = clamp(
+      Math.max(collisionForeland, subductionForeland) * (1 - core * 0.78),
+    );
+    const collisionBulge = gaussianProfile(
+      collisionDistance.distanceKm[faceId],
+      collisionBasinPeakKm + bulgeOffsetKm,
+      bulgeWidthKm,
+    ) * collisionDistance.sourceStrength[faceId];
+    const subductionBulge = gaussianProfile(
+      subductionDistance.distanceKm[faceId],
+      subductionBasinPeakKm + bulgeOffsetKm,
+      bulgeWidthKm,
+    ) * subductionDistance.sourceStrength[faceId];
+    const flexuralBulgeStrength = clamp(
+      Math.max(collisionBulge, subductionBulge)
+        * (1 - forelandBasinStrength * 0.62)
+        * (1 - core * 0.88),
+    );
     return {
       faceId,
       regime: dominant >= 0.08 ? regime : "none",
@@ -143,6 +277,8 @@ export function createCanonicalOrogeny(
       islandArcCore: islandArcCore[faceId],
       sutureCore: sutureCore[faceId],
       foothillStrength: clamp(broadEnvelope[faceId] - core * 0.52),
+      forelandBasinStrength,
+      flexuralBulgeStrength,
       strength: clamp(core + broadEnvelope[faceId] * 0.34),
     };
   });
