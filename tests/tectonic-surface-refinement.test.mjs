@@ -112,6 +112,8 @@ test("coastal geomorphology changes edge spectra without changing topology ancho
       difference += Math.abs(shaped.coastOffsetRadians - plain.coastOffsetRadians);
       assert.ok(shaped.coastalRuggedness >= 0 && shaped.coastalRuggedness <= 1);
       assert.ok(shaped.coastalSedimentAffinity >= 0 && shaped.coastalSedimentAffinity <= 1);
+      assert.ok(shaped.activeMarginStrength >= 0 && shaped.activeMarginStrength <= 1);
+      assert.ok(shaped.passiveMarginStrength >= 0 && shaped.passiveMarginStrength <= 1);
       samples += 1;
     }
   }

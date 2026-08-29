@@ -4,6 +4,7 @@ import {
   type CanonicalOrogenyCell,
   type OrogenRegime,
 } from "./orogeny.ts";
+import { createCanonicalMargins, type CanonicalMarginCell } from "./margins.ts";
 import { createSurfaceRefinement } from "./surfaceRefinement.ts";
 import { cross3, dot3, normalize3, type Vec3 } from "./vector.ts";
 import type { TectonicWorldModel } from "./worldSimulation.ts";
@@ -44,6 +45,8 @@ export interface SurfaceProcessOptions {
   readonly flexuralReliefScale?: number;
   /** Strength of relief-conditioned rocky/passive coastline spectra. */
   readonly coastalGeomorphologyScale?: number;
+  /** Strength of tectonically quiet coastal-plain relief adjustment. */
+  readonly coastalPlainScale?: number;
 }
 
 export type SurfaceLithology =
@@ -53,6 +56,8 @@ export type SurfaceLithology =
   | "volcanic"
   | "carbonate"
   | "sedimentary";
+
+export type SurfaceMarginRegime = "interior" | "active" | "passive" | "transitional";
 
 const SURFACE_LITHOLOGIES: readonly SurfaceLithology[] = [
   "oceanic-basalt",
@@ -140,6 +145,15 @@ export interface SurfaceProcessCell {
   readonly flexuralBulgeStrength: number;
   /** Signed tectonic flexure applied before geomorphic evolution. */
   readonly flexuralReliefKm: number;
+  /** Present-day plate-boundary influence, physically decayed across continental crust. */
+  readonly activeMarginStrength: number;
+  /** Tectonically quiet, low-relief continental-margin support. */
+  readonly passiveMarginStrength: number;
+  readonly marginRegime: SurfaceMarginRegime;
+  /** Broad low-relief coastal surface support in [0, 1]. */
+  readonly coastalPlainStrength: number;
+  /** Signed pre-climate coastal-plain relief adjustment; non-positive on land. */
+  readonly coastalPlainReliefKm: number;
   readonly localRunoffKm3PerYear: number;
   readonly erodedThicknessKm: number;
   readonly depositedThicknessKm: number;
@@ -190,6 +204,12 @@ export interface SurfaceRiverMouth {
   readonly receivingWater: "ocean" | "lake";
   readonly landform: SurfaceCoastalLandform;
   readonly sedimentSupplyIndex: number;
+  /** Sediment volume delivered across this terminal edge during the reduced geomorphic pass. */
+  readonly sedimentFluxKm3: number;
+  /** Presentation-scale delta/plain radius derived from actual terminal sediment flux. */
+  readonly deltaPlainRadiusKm: number;
+  /** Bounded presentation-only shoreline extension; canonical coast is unchanged. */
+  readonly deltaProgradationKm: number;
   /** Presentation-only distributaries/fan channels; canonical coast is unchanged. */
   readonly distributaries: readonly (readonly Vec3[])[];
   readonly drainageAreaKm2: number;
@@ -209,6 +229,11 @@ export interface SurfacePresentationSample {
   readonly coastDistanceKm: number;
   readonly coastalRuggedness: number;
   readonly coastalSedimentAffinity: number;
+  readonly activeMarginStrength: number;
+  readonly passiveMarginStrength: number;
+  readonly marginRegime: SurfaceMarginRegime;
+  readonly coastalPlainStrength: number;
+  readonly coastalPlainReliefKm: number;
   readonly temperatureC: number;
   readonly seasonalTemperatureRangeC: number;
   readonly continentality: number;
@@ -302,6 +327,11 @@ export interface SurfaceProcessStats {
   readonly flexuralBulgeCellCount: number;
   readonly maximumForelandSubsidenceKm: number;
   readonly maximumFlexuralBulgeKm: number;
+  readonly activeMarginCellCount: number;
+  readonly passiveMarginCellCount: number;
+  readonly coastalPlainCellCount: number;
+  readonly coastalPlainAreaKm2: number;
+  readonly maximumCoastalPlainLoweringKm: number;
 }
 
 export interface SurfaceProcessWorld {
@@ -341,7 +371,13 @@ interface MutableSurfaceCell extends SurfaceProcessCell {
   lakeSurfaceDepthThresholdKm: number;
   atmosphericMoisture: number;
   orographicLiftKm: number;
+  lithology: SurfaceLithology;
+  erosionResistance: number;
+  marginRegime: SurfaceMarginRegime;
+  coastalPlainStrength: number;
+  coastalPlainReliefKm: number;
   localRunoffKm3PerYear: number;
+  sedimentExportKm3: number;
   floodOrder: number;
 }
 
@@ -368,6 +404,14 @@ interface SedimentBudget {
   readonly incisedCellCount: number;
   readonly depositionalCellCount: number;
   readonly erodedVolumeByLithologyKm3: Readonly<Record<SurfaceLithology, number>>;
+}
+
+interface CoastalMarginStats {
+  readonly activeMarginCellCount: number;
+  readonly passiveMarginCellCount: number;
+  readonly coastalPlainCellCount: number;
+  readonly coastalPlainAreaKm2: number;
+  readonly maximumCoastalPlainLoweringKm: number;
 }
 
 interface LakeBalanceResult {
@@ -736,7 +780,7 @@ function createContinentalReliefStructure(
 
 function canonicalGeologyContext(world: TectonicWorldModel): {
   readonly sutureStrength: Float64Array;
-  readonly activeMarginStrength: Float64Array;
+  readonly margins: readonly CanonicalMarginCell[];
   readonly orogeny: readonly CanonicalOrogenyCell[];
   readonly continentalRelief: ContinentalReliefStructure;
 } {
@@ -756,30 +800,11 @@ function canonicalGeologyContext(world: TectonicWorldModel): {
   }
   const sutureStrength = diffuseCanonicalField(sutureSeeds, adjacency, 4, 0.58, continental);
 
-  const activeSeeds = new Float64Array(world.cells.length);
-  for (const boundary of world.boundaries) {
-    const edge = world.sphere.edges[boundary.edgeId];
-    const strength = boundary.kind === "convergent"
-      ? 1
-      : boundary.kind === "divergent"
-        ? 0.72
-        : boundary.kind === "transform"
-          ? 0.42
-          : 0;
-    activeSeeds[edge.faces[0]] = Math.max(activeSeeds[edge.faces[0]], strength);
-    activeSeeds[edge.faces[1]] = Math.max(activeSeeds[edge.faces[1]], strength);
-  }
-  const activeMarginStrength = diffuseCanonicalField(
-    activeSeeds,
-    adjacency,
-    5,
-    0.64,
-    () => true,
-  );
+  const margins = createCanonicalMargins(world);
   const orogeny = createCanonicalOrogeny(world);
   return {
     sutureStrength,
-    activeMarginStrength,
+    margins,
     orogeny,
     continentalRelief: createContinentalReliefStructure(world, adjacency, orogeny),
   };
@@ -1104,6 +1129,84 @@ function computeCoastDistances(
       coastHeap.push({ faceId: neighborId, priority: distance });
     }
   }
+}
+
+function applyCoastalMargins(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  seaLevelKm: number,
+  radiusKm: number,
+  scale: number,
+): CoastalMarginStats {
+  let activeMarginCellCount = 0;
+  let passiveMarginCellCount = 0;
+  let coastalPlainCellCount = 0;
+  let coastalPlainAreaKm2 = 0;
+  let maximumCoastalPlainLoweringKm = 0;
+  for (const cell of cells) {
+    if (!cell.isLand) {
+      cell.marginRegime = "interior";
+      continue;
+    }
+    const active = cell.activeMarginStrength;
+    const passive = cell.passiveMarginStrength;
+    const coastDistanceKm = cell.coastDistanceKm;
+    if (coastDistanceKm <= 420 && active >= 0.5) {
+      cell.marginRegime = "active";
+      activeMarginCellCount += 1;
+    } else if (coastDistanceKm <= 780 && passive >= 0.42) {
+      cell.marginRegime = "passive";
+      passiveMarginCellCount += 1;
+    } else if (coastDistanceKm <= 900 || active >= 0.25) {
+      cell.marginRegime = "transitional";
+    } else {
+      cell.marginRegime = "interior";
+    }
+    if (cell.marginRegime !== "passive") continue;
+
+    const widthKm = 260 + passive * 520;
+    const normalizedDistance = clamp(coastDistanceKm / widthKm);
+    const distanceFade = (1 - normalizedDistance) ** 1.45;
+    const aboveSeaKm = Math.max(0, cell.elevationKm - seaLevelKm);
+    const lowReliefSupport = 1 - clamp((aboveSeaKm - 0.12) / 1.7);
+    const plainStrength = clamp(
+      passive * distanceFade * (0.58 + lowReliefSupport * 0.42),
+    );
+    cell.coastalPlainStrength = plainStrength;
+    const targetAboveSeaKm = 0.035
+      + 0.3 * normalizedDistance ** 1.35
+      + (1 - passive) * 0.1;
+    const availableReliefKm = Math.max(0, aboveSeaKm - 0.002);
+    const desiredLoweringKm = Math.max(0, aboveSeaKm - targetAboveSeaKm);
+    const loweringKm = Math.min(
+      desiredLoweringKm,
+      availableReliefKm * 0.68,
+      plainStrength * 0.62,
+    ) * scale;
+    cell.coastalPlainReliefKm = -loweringKm;
+    if (loweringKm > 0) {
+      cell.elevationKm = Math.max(seaLevelKm + 0.002, cell.elevationKm - loweringKm);
+      cell.filledElevationKm = cell.elevationKm;
+      maximumCoastalPlainLoweringKm = Math.max(maximumCoastalPlainLoweringKm, loweringKm);
+    }
+    if (plainStrength < 0.26) continue;
+    coastalPlainCellCount += 1;
+    coastalPlainAreaKm2 += sphere.faces[cell.faceId].areaSteradians * radiusKm ** 2;
+    if (cell.elevationKm - seaLevelKm < 1.1) {
+      cell.lithology = "sedimentary";
+      cell.erosionResistance = Math.min(
+        cell.erosionResistance,
+        clamp(0.5 - plainStrength * 0.19, 0.24, 0.5),
+      );
+    }
+  }
+  return {
+    activeMarginCellCount,
+    passiveMarginCellCount,
+    coastalPlainCellCount,
+    coastalPlainAreaKm2,
+    maximumCoastalPlainLoweringKm,
+  };
 }
 
 function simulateSurfaceClimate(
@@ -1983,7 +2086,10 @@ function erodeAndRouteSediment(
     depositedThicknessKm[cell.faceId] = depositedKm3 / areaKm2;
     depositedVolumeKm3 += depositedKm3;
     if (receiver.isLand) sedimentFluxKm3[receiver.faceId] += availableSedimentKm3;
-    else exportedSedimentVolumeKm3 += availableSedimentKm3;
+    else {
+      cell.sedimentExportKm3 += availableSedimentKm3;
+      exportedSedimentVolumeKm3 += availableSedimentKm3;
+    }
   }
 
   let incisedCellCount = 0;
@@ -2558,6 +2664,7 @@ export function createSurfaceProcessWorld(
   const channelRefinementScale = clamp(options.channelRefinementScale ?? 1, 0, 2);
   const continentalReliefScale = clamp(options.continentalReliefScale ?? 1, 0, 2);
   const flexuralReliefScale = clamp(options.flexuralReliefScale ?? 1, 0, 2);
+  const coastalPlainScale = clamp(options.coastalPlainScale ?? 1, 0, 2);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
@@ -2572,6 +2679,7 @@ export function createSurfaceProcessWorld(
     const canonical = tectonicWorld.cells[canonicalFaceId];
     const rawAboveSea = refined.elevationKm - tectonicWorld.seaLevelKm;
     const orogeny = geologyContext.orogeny[canonicalFaceId];
+    const canonicalMargin = geologyContext.margins[canonicalFaceId];
     const orogenicAboveSea = refined.isLand
       ? shapedOrogenicHeight(rawAboveSea, orogeny, face.center, hashedSeed)
       : rawAboveSea;
@@ -2597,7 +2705,7 @@ export function createSurfaceProcessWorld(
       canonicalFaceId,
       tectonicWorld,
       geologyContext.sutureStrength[canonicalFaceId],
-      geologyContext.activeMarginStrength[canonicalFaceId],
+      canonicalMargin.activeBoundaryStrength,
       orogeny.forelandBasinStrength,
       hashedSeed,
     );
@@ -2622,6 +2730,17 @@ export function createSurfaceProcessWorld(
       )
       : preSpillwayElevationKm;
     const areaKm2 = face.areaSteradians * radiusSquared;
+    const activeMarginStrength = refined.isLand
+      ? clamp(canonicalMargin.activeBoundaryStrength
+        * (0.72 + refined.coastalRuggedness * 0.28))
+      : 0;
+    const passiveMarginStrength = refined.isLand
+      ? clamp(
+        (1 - activeMarginStrength) ** 1.35
+          * (1 - orogeny.strength * 0.62)
+          * (0.78 + refined.coastalSedimentAffinity * 0.22),
+      )
+      : 0;
     return {
       faceId: face.id,
       canonicalFaceId,
@@ -2648,7 +2767,13 @@ export function createSurfaceProcessWorld(
       forelandBasinStrength: orogeny.forelandBasinStrength,
       flexuralBulgeStrength: orogeny.flexuralBulgeStrength,
       flexuralReliefKm,
+      activeMarginStrength,
+      passiveMarginStrength,
+      marginRegime: "interior",
+      coastalPlainStrength: 0,
+      coastalPlainReliefKm: 0,
       localRunoffKm3PerYear: 0,
+      sedimentExportKm3: 0,
       erodedThicknessKm: 0,
       depositedThicknessKm: 0,
       spillwayIncisionKm: Math.max(0, preSpillwayElevationKm - elevationKm),
@@ -2666,6 +2791,13 @@ export function createSurfaceProcessWorld(
     sphere,
     adjacency,
     tectonicWorld.recipe.radiusKm,
+  );
+  const coastalMarginStats = applyCoastalMargins(
+    cells,
+    sphere,
+    tectonicWorld.seaLevelKm,
+    tectonicWorld.recipe.radiusKm,
+    coastalPlainScale,
   );
   const climateStats = simulateSurfaceClimate(
     cells,
@@ -2865,6 +2997,10 @@ export function createSurfaceProcessWorld(
       dischargeKm3PerYear: cell.dischargeKm3PerYear,
     };
   });
+  const maximumTerminalSedimentFluxKm3 = cells.reduce(
+    (maximum, cell) => Math.max(maximum, cell.sedimentExportKm3),
+    0,
+  );
   const riverMouths: SurfaceRiverMouth[] = rivers.flatMap((river) => {
     const source = cells[river.fromFaceId];
     const receiver = cells[river.toFaceId];
@@ -2883,11 +3019,15 @@ export function createSurfaceProcessWorld(
       Math.log(Math.max(1, river.drainageAreaKm2 / minimumRiverAreaKm2))
         / Math.log(Math.max(2, maximumResolvedRiverAreaKm2 / minimumRiverAreaKm2)),
     );
+    const sedimentFluxKm3 = receivingWater === "ocean" ? source.sedimentExportKm3 : 0;
+    const fluxHierarchy = maximumTerminalSedimentFluxKm3 > 0
+      ? clamp(Math.log1p(sedimentFluxKm3) / Math.log1p(maximumTerminalSedimentFluxKm3))
+      : 0;
     const sedimentSupplyIndex = clamp(
-      hierarchy * 0.32
-        + clamp(source.erodedThicknessKm / 0.24) * 0.28
-        + clamp((source.depositedThicknessKm + source.hillslopeDepositionKm) / 0.08) * 0.2
-        + (1 - source.erosionResistance) * 0.2,
+      fluxHierarchy * 0.42
+        + hierarchy * 0.25
+        + clamp((source.depositedThicknessKm + source.hillslopeDepositionKm) / 0.08) * 0.18
+        + (1 - source.erosionResistance) * 0.15,
     );
     const coastalRuggedness = refinement.sample(river.toPoint).coastalRuggedness;
     const landform: SurfaceCoastalLandform = receivingWater === "lake"
@@ -2896,7 +3036,8 @@ export function createSurfaceProcessWorld(
           && coastalRuggedness > 0.15
           && slope > 0.015
         ? "alluvial-fan"
-        : sedimentSupplyIndex > 0.38
+        : sedimentSupplyIndex > 0.32
+            && source.passiveMarginStrength > 0.32
             && coastalRuggedness < 0.62
             && slope < 0.03
           ? "delta"
@@ -2911,6 +3052,16 @@ export function createSurfaceProcessWorld(
       boundaryVerticesByPair.get(`${low}:${high}`),
       sedimentSupplyIndex,
     );
+    const deltaPlainRadiusKm = landform === "delta"
+      ? 16 + sedimentSupplyIndex * 58 + hierarchy * 30
+      : landform === "alluvial-fan"
+        ? 9 + sedimentSupplyIndex * 30 + hierarchy * 12
+        : 0;
+    const deltaProgradationKm = landform === "delta"
+      ? clamp(1.5 + fluxHierarchy * 11 + hierarchy * 5.5, 0, 18)
+      : landform === "alluvial-fan"
+        ? clamp(1 + fluxHierarchy * 4, 0, 6)
+        : 0;
     return [{
       fromFaceId: river.fromFaceId,
       toFaceId: river.toFaceId,
@@ -2918,6 +3069,9 @@ export function createSurfaceProcessWorld(
       receivingWater,
       landform,
       sedimentSupplyIndex,
+      sedimentFluxKm3,
+      deltaPlainRadiusKm,
+      deltaProgradationKm,
       distributaries,
       drainageAreaKm2: river.drainageAreaKm2,
       dischargeKm3PerYear: river.dischargeKm3PerYear,
@@ -2958,6 +3112,11 @@ export function createSurfaceProcessWorld(
     forelandBasinStrength: cell.forelandBasinStrength,
     flexuralBulgeStrength: cell.flexuralBulgeStrength,
     flexuralReliefKm: cell.flexuralReliefKm,
+    activeMarginStrength: cell.activeMarginStrength,
+    passiveMarginStrength: cell.passiveMarginStrength,
+    marginRegime: cell.marginRegime,
+    coastalPlainStrength: cell.coastalPlainStrength,
+    coastalPlainReliefKm: cell.coastalPlainReliefKm,
     localRunoffKm3PerYear: cell.localRunoffKm3PerYear,
     erodedThicknessKm: cell.erodedThicknessKm,
     depositedThicknessKm: cell.depositedThicknessKm,
@@ -3015,6 +3174,10 @@ export function createSurfaceProcessWorld(
     let forelandBasinStrength = 0;
     let flexuralBulgeStrength = 0;
     let flexuralReliefKm = 0;
+    let activeMarginStrength = 0;
+    let passiveMarginStrength = 0;
+    let coastalPlainStrength = 0;
+    let coastalPlainReliefKm = 0;
     for (const faceId of candidates) {
       const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
       const cell = immutableCells[faceId];
@@ -3039,6 +3202,10 @@ export function createSurfaceProcessWorld(
       forelandBasinStrength += cell.forelandBasinStrength * weight;
       flexuralBulgeStrength += cell.flexuralBulgeStrength * weight;
       flexuralReliefKm += cell.flexuralReliefKm * weight;
+      activeMarginStrength += cell.activeMarginStrength * weight;
+      passiveMarginStrength += cell.passiveMarginStrength * weight;
+      coastalPlainStrength += cell.coastalPlainStrength * weight;
+      coastalPlainReliefKm += cell.coastalPlainReliefKm * weight;
     }
     elevationKm /= totalWeight;
     fillDepthKm /= totalWeight;
@@ -3060,6 +3227,10 @@ export function createSurfaceProcessWorld(
     forelandBasinStrength /= totalWeight;
     flexuralBulgeStrength /= totalWeight;
     flexuralReliefKm /= totalWeight;
+    activeMarginStrength /= totalWeight;
+    passiveMarginStrength /= totalWeight;
+    coastalPlainStrength /= totalWeight;
+    coastalPlainReliefKm /= totalWeight;
     if (refined.isLand) {
       let lakePotential = 0;
       let basinWeight = 0;
@@ -3212,6 +3383,11 @@ export function createSurfaceProcessWorld(
       coastDistanceKm,
       coastalRuggedness: refined.coastalRuggedness,
       coastalSedimentAffinity: refined.coastalSedimentAffinity,
+      activeMarginStrength,
+      passiveMarginStrength,
+      marginRegime: nearestMatchingCell.marginRegime,
+      coastalPlainStrength,
+      coastalPlainReliefKm,
       temperatureC,
       seasonalTemperatureRangeC,
       continentality,
@@ -3311,6 +3487,7 @@ export function createSurfaceProcessWorld(
         (maximum, cell) => Math.max(maximum, Math.max(0, cell.flexuralReliefKm)),
         0,
       ),
+      ...coastalMarginStats,
       ...sedimentBudget,
     },
     sample: (direction) => immutableCells[exactFaceAtPoint(sphere, root, centers, adjacency, direction)],

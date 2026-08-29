@@ -48,6 +48,41 @@ test("terrane geology produces distinct rock provinces with closed area accounti
     <= Math.max(1e-9, surface.stats.erodedVolumeKm3 * 1e-12));
 });
 
+test("quiet continental margins form bounded coastal plains without changing coast topology", () => {
+  const baseline = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    coastalPlainScale: 0,
+  });
+  const shaped = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    coastalPlainScale: 1,
+  });
+  assert.deepEqual(
+    shaped.cells.map((cell) => cell.isLand),
+    baseline.cells.map((cell) => cell.isLand),
+  );
+  assert.equal(shaped.stats.canonicalAnchorMismatches, 0);
+  assert.ok(shaped.stats.activeMarginCellCount > 0);
+  assert.ok(shaped.stats.passiveMarginCellCount > 0);
+  assert.ok(shaped.stats.coastalPlainCellCount > 0);
+  assert.ok(shaped.stats.coastalPlainAreaKm2 > 0);
+  assert.ok(shaped.stats.maximumCoastalPlainLoweringKm > 0);
+  assert.equal(baseline.stats.maximumCoastalPlainLoweringKm, 0);
+  assert.ok(shaped.cells.every((cell) => cell.activeMarginStrength >= 0
+    && cell.activeMarginStrength <= 1
+    && cell.passiveMarginStrength >= 0
+    && cell.passiveMarginStrength <= 1
+    && cell.coastalPlainStrength >= 0
+    && cell.coastalPlainStrength <= 1
+    && cell.coastalPlainReliefKm <= 1e-12));
+  assert.ok(shaped.cells.filter((cell) => cell.marginRegime === "active")
+    .every((cell) => cell.coastalPlainReliefKm === 0));
+  assert.ok(shaped.cells.some((cell, faceId) => (
+    cell.coastalPlainReliefKm < -0.01
+      && cell.elevationKm < baseline.cells[faceId].elevationKm
+  )));
+});
+
 test("annual physical atlas derives closed biome areas and inland lakes", () => {
   const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
   const expectedAreaKm2 = surface.sphere.totalAreaSteradians * tectonic.recipe.radiusKm ** 2;
@@ -394,12 +429,26 @@ test("channel refinement and coastal landforms are causal presentation geometry"
     && mouth.sedimentSupplyIndex <= 1));
   assert.ok(refined.riverMouths.some((mouth) => mouth.receivingWater === "ocean"));
   for (const mouth of refined.riverMouths) {
+    assert.ok(mouth.sedimentFluxKm3 >= 0);
+    assert.ok(mouth.deltaPlainRadiusKm >= 0);
+    assert.ok(mouth.deltaProgradationKm >= 0 && mouth.deltaProgradationKm <= 18);
     if (mouth.receivingWater === "lake") assert.equal(mouth.landform, "lake-inflow");
+    if (mouth.receivingWater === "lake") assert.equal(mouth.sedimentFluxKm3, 0);
+    if (mouth.landform !== "delta" && mouth.landform !== "alluvial-fan") {
+      assert.equal(mouth.deltaPlainRadiusKm, 0);
+      assert.equal(mouth.deltaProgradationKm, 0);
+    }
     for (const branch of mouth.distributaries) {
       assert.ok(branch.length >= 3);
       assert.ok(branch.every((point) => Math.abs(Math.hypot(...point) - 1) < 1e-12));
     }
   }
+  const resolvedOceanSedimentKm3 = refined.riverMouths
+    .filter((mouth) => mouth.receivingWater === "ocean")
+    .reduce((sum, mouth) => sum + mouth.sedimentFluxKm3, 0);
+  assert.ok(resolvedOceanSedimentKm3 > 0);
+  assert.ok(resolvedOceanSedimentKm3 <= refined.stats.exportedSedimentVolumeKm3
+    + Math.max(1e-9, refined.stats.exportedSedimentVolumeKm3 * 1e-12));
 });
 
 test("continuous lake coverage interpolates canonical lake shores", () => {

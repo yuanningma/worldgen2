@@ -6,6 +6,7 @@ import {
   subtract3,
   type Vec3,
 } from "./vector.ts";
+import { createCanonicalMargins } from "./margins.ts";
 import type { TectonicWorldModel, WorldCellState } from "./worldSimulation.ts";
 
 export interface SurfaceRefinementOptions {
@@ -32,6 +33,10 @@ export interface RefinedSurfaceSample {
   readonly coastalRuggedness: number;
   /** Low-relief passive-margin support on the nearest canonical coast edge. */
   readonly coastalSedimentAffinity: number;
+  /** Present-day plate-boundary influence at the nearest continental coast. */
+  readonly activeMarginStrength: number;
+  /** Tectonically quiet, low-relief continental-margin support. */
+  readonly passiveMarginStrength: number;
   readonly presentationOnly: true;
 }
 
@@ -50,6 +55,8 @@ interface CoastEdge {
   readonly phase: readonly number[];
   readonly ruggedness: number;
   readonly sedimentAffinity: number;
+  readonly activeMarginStrength: number;
+  readonly passiveMarginStrength: number;
 }
 
 interface KdNode {
@@ -260,6 +267,7 @@ export function createSurfaceRefinement(
   const root = buildKdTree(model.sphere.faces.map((face) => face.id), centers);
   if (!root) throw new Error("surface refinement requires at least one canonical face");
   const relief = smoothRelief(model, cells, neighbors, Math.max(0, Math.round(options.reliefPasses ?? 3)));
+  const margins = createCanonicalMargins(model);
   const reliefCandidates = model.sphere.faces.map((face) => {
     const nearby = new Set<number>([face.id]);
     for (const neighbor of neighbors[face.id]) {
@@ -276,7 +284,16 @@ export function createSurfaceRefinement(
     const land = cells[landFaceId];
     const reliefSupport = clamp((land.elevationKm - model.seaLevelKm) / 3.2);
     const crustSupport = clamp((land.crustThicknessKm - 30) / 30);
-    const ruggedness = clamp(0.08 + reliefSupport * 0.62 + crustSupport * 0.3);
+    const activeMarginStrength = margins[landFaceId].activeBoundaryStrength;
+    const ruggedness = clamp(
+      0.05 + reliefSupport * 0.46 + crustSupport * 0.2 + activeMarginStrength * 0.36,
+    );
+    const sedimentAffinity = clamp(
+      (1 - ruggedness * 0.76) * (1 - activeMarginStrength * 0.72),
+    );
+    const passiveMarginStrength = clamp(
+      sedimentAffinity * (1 - activeMarginStrength) ** 1.25,
+    );
     const coast: CoastEdge = {
       edgeId: edge.id,
       vertices: edge.vertices.map((id) => model.sphere.vertices[id].position) as unknown as readonly [Vec3, Vec3],
@@ -287,7 +304,9 @@ export function createSurfaceRefinement(
         (_, octave) => hashUnit(model.recipe.seed, edge.id, octave),
       ),
       ruggedness,
-      sedimentAffinity: clamp(1 - ruggedness * 0.92),
+      sedimentAffinity,
+      activeMarginStrength,
+      passiveMarginStrength,
     };
     coastEdges.push(coast);
     coastByFace[edge.faces[0]].push(coast);
@@ -361,6 +380,8 @@ export function createSurfaceRefinement(
       coastOffsetRadians: offset,
       coastalRuggedness: nearestEdge?.ruggedness ?? 0,
       coastalSedimentAffinity: nearestEdge?.sedimentAffinity ?? 0,
+      activeMarginStrength: nearestEdge?.activeMarginStrength ?? 0,
+      passiveMarginStrength: nearestEdge?.passiveMarginStrength ?? 0,
       presentationOnly: true,
     };
   };

@@ -159,6 +159,9 @@ function color(
   valleyIncisionKm: number,
   coastalRuggedness: number,
   coastalSedimentAffinity: number,
+  activeMarginStrength: number,
+  passiveMarginStrength: number,
+  coastalPlainStrength: number,
   biome: SurfaceBiome,
   lithology: SurfaceLithology,
   erosionResistance: number,
@@ -253,13 +256,23 @@ function color(
     return [211, 207, 190];
   }
   if (mapMode === "coasts") {
-    if (coastDistanceKm > 180) return isLand ? [220, 218, 202] : [43, 65, 77];
-    const coastFade = 1 - clamp(coastDistanceKm / 180);
+    if (coastDistanceKm > 780) return isLand ? [220, 218, 202] : [43, 65, 77];
+    const coastFade = 1 - clamp(coastDistanceKm / 780);
     if (isLand) {
-      const character = coastalRuggedness >= coastalSedimentAffinity
-        ? mix([214, 210, 193], [123, 80, 68], coastalRuggedness)
-        : mix([214, 210, 193], [194, 164, 91], coastalSedimentAffinity);
-      return mix([220, 218, 202], character, coastFade);
+      const quietCharacter = mix(
+        [214, 210, 193],
+        [116, 157, 104],
+        clamp(passiveMarginStrength * 0.58 + coastalPlainStrength * 0.72),
+      );
+      const activeCharacter = mix(
+        [198, 163, 112],
+        [121, 63, 57],
+        clamp(activeMarginStrength * 0.72 + coastalRuggedness * 0.4),
+      );
+      const character = activeMarginStrength >= passiveMarginStrength
+        ? activeCharacter
+        : quietCharacter;
+      return mix([220, 218, 202], character, coastFade * 0.92 + coastalPlainStrength * 0.08);
     }
     return mix([43, 65, 77], [91, 139, 149], coastFade * coastalSedimentAffinity);
   }
@@ -505,6 +518,7 @@ const surface = createSurfaceProcessWorld(world, {
   continentalReliefScale: numberOption("continental-relief-scale", 1),
   flexuralReliefScale: numberOption("flexural-relief-scale", 1),
   coastalGeomorphologyScale: numberOption("coastal-geomorphology-scale", 1),
+  coastalPlainScale: numberOption("coastal-plain-scale", 1),
 });
 const landRockTypeCount = Object.entries(surface.stats.lithologyAreaKm2)
   .filter(([lithology, area]) => lithology !== "oceanic-basalt" && area > 0)
@@ -567,6 +581,9 @@ function renderColorAt(longitude: number, latitude: number): {
       cell.valleyIncisionKm,
       cell.coastalRuggedness,
       cell.coastalSedimentAffinity,
+      cell.activeMarginStrength,
+      cell.passiveMarginStrength,
+      cell.coastalPlainStrength,
       cell.biome,
       cell.lithology,
       cell.erosionResistance,
@@ -727,12 +744,16 @@ if (mapMode === "natural" || mapMode === "climate" || mapMode === "biomes" || ma
       "lake-inflow": [67, 135, 188],
     } as const;
     for (const mouth of surface.riverMouths) {
+      const planetKmPerPixel = Math.PI * 2 * world.recipe.radiusKm / width;
+      const markerRadius = mouth.receivingWater === "ocean"
+        ? clamp(1.8 + mouth.deltaProgradationKm / Math.max(planetKmPerPixel, 1) * 0.7, 1.8, 6)
+        : 1.5;
       drawMarker(
         pixels,
         width,
         height,
         longitudeLatitude(mouth.point, width, height),
-        mouth.receivingWater === "ocean" ? 2.2 : 1.5,
+        markerRadius,
         landformColors[mouth.landform],
       );
     }
@@ -790,7 +811,7 @@ const header = Buffer.from([
   `<rect width="100%" height="100%" fill="#071721"/>`,
   `<text x="24" y="32" fill="#e8ece4" font-family="monospace" font-size="18" font-weight="700" letter-spacing="1.4">${mapMode.toUpperCase()} MODE · ${escapeXml(seed)}</text>`,
   `<text x="24" y="61" fill="#9aadb0" font-family="monospace" font-size="11">${quality.toUpperCase()} ${width}×${height} · ${presentationStyle.toUpperCase()} STYLE · ${coupled ? "COUPLED" : "FIXED"} TECTONICS · SUB${subdivisions} → SURFACE SUB${surfaceSubdivisions} · ${world.stats.continentalTerraneCount} TERRANES · ${landRockTypeCount} ROCK TYPES · ${(surface.stats.landFraction * 100).toFixed(1)}% LAND</text>`,
-  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.continentalReliefCenterCount} INTERIOR CENTERS · ${surface.stats.forelandBasinCellCount.toLocaleString("en-US")} FORELAND CELLS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${surface.stats.breachedBasinCount} BREACHED / ${surface.stats.preservedBasinCount} RETAINED BASINS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ${(surface.stats.humidLandFraction * 100).toFixed(0)}% HUMID · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
+  `<text x="24" y="80" fill="#688b94" font-family="monospace" font-size="10">SPHERICAL MOISTURE + LITHOLOGY-AWARE INCISION · ${surface.rivers.length.toLocaleString("en-US")} RIVERS · ${surface.stats.activeMarginCellCount.toLocaleString("en-US")} ACTIVE / ${surface.stats.passiveMarginCellCount.toLocaleString("en-US")} PASSIVE MARGIN CELLS · ${surface.stats.coastalPlainCellCount.toLocaleString("en-US")} PLAIN CELLS · ${surface.stats.forelandBasinCellCount.toLocaleString("en-US")} FORELAND CELLS · ${surface.stats.lakeCellCount.toLocaleString("en-US")} LAKE CELLS · ${(surface.stats.aridLandFraction * 100).toFixed(0)}% ARID · ANCHOR CHANGES ${surface.stats.canonicalAnchorMismatches}</text>`,
   `</svg>`,
 ].join(""));
 

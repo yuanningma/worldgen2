@@ -18,7 +18,7 @@
     "review:surface-atlas": "node --experimental-strip-types scripts/create-surface-atlas-review.ts",
     "start": "vinext start",
     "test": "npm run build && node --experimental-strip-types --test tests/*.test.mjs",
-    "test:tectonics": "node --experimental-strip-types --test tests/tectonics.test.mjs tests/tectonics-debug.test.mjs tests/orogeny.test.mjs tests/parcel-transport.test.mjs tests/parcel-remap-conformance.test.mjs tests/tectonic-world.test.mjs tests/tectonic-surface-refinement.test.mjs tests/surface-process.test.mjs tests/surface-resolution-comparison.test.mjs tests/surface-style.test.mjs tests/spherical-metrics.test.mjs tests/tectonic-world-evaluation.test.mjs tests/refinement-gate.test.mjs tests/tectonic-atlas.test.mjs",
+    "test:tectonics": "node --experimental-strip-types --test tests/tectonics.test.mjs tests/tectonics-debug.test.mjs tests/orogeny.test.mjs tests/margins.test.mjs tests/parcel-transport.test.mjs tests/parcel-remap-conformance.test.mjs tests/tectonic-world.test.mjs tests/tectonic-surface-refinement.test.mjs tests/surface-process.test.mjs tests/surface-resolution-comparison.test.mjs tests/surface-style.test.mjs tests/spherical-metrics.test.mjs tests/tectonic-world-evaluation.test.mjs tests/refinement-gate.test.mjs tests/tectonic-atlas.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "typecheck": "tsc --noEmit"
   },

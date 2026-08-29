@@ -96,12 +96,14 @@ export {
 export {
   createSurfaceProcessWorld,
   type SurfaceLithology,
+  type SurfaceMarginRegime,
   type SurfaceProcessCell,
   type SurfaceProcessOptions,
   type SurfacePresentationSample,
   type SurfaceProcessStats,
   type SurfaceProcessWorld,
   type SurfaceRiverSegment,
+  type SurfaceRiverMouth,
 } from "./surfaceProcess.ts";
 
 export {
@@ -115,3 +117,8 @@ export {
   type CanonicalOrogenyCell,
   type OrogenRegime,
 } from "./orogeny.ts";
+
+export {
+  createCanonicalMargins,
+  type CanonicalMarginCell,
+} from "./margins.ts";
