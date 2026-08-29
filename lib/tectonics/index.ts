@@ -96,6 +96,8 @@ export {
 export {
   createSurfaceProcessWorld,
   type SurfaceLithology,
+  type SurfaceLakeBody,
+  type SurfaceLakeRegime,
   type SurfaceMarginRegime,
   type SurfaceProcessCell,
   type SurfaceProcessOptions,

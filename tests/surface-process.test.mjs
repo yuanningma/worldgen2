@@ -106,13 +106,41 @@ test("annual physical atlas derives closed biome areas and inland lakes", () => 
   );
   assert.ok(Math.abs(expectedLakeAreaKm2 - surface.stats.lakeAreaKm2)
     <= Math.max(1e-9, expectedLakeAreaKm2 * 1e-12));
-  assert.equal(surface.stats.biomeAreaKm2["freshwater-lake"], surface.stats.lakeAreaKm2);
+  assert.ok(Math.abs(surface.stats.biomeAreaKm2["freshwater-lake"] - surface.stats.lakeAreaKm2)
+    <= Math.max(1e-9, surface.stats.lakeAreaKm2 * 1e-12));
   assert.equal(
     surface.stats.closedLakeBodyCount + surface.stats.overflowingLakeBodyCount,
     surface.stats.lakeBodyCount,
   );
   assert.ok(surface.stats.lakeBodyCount > 0);
   assert.ok(surface.stats.lakeEvaporationKm3PerYear > 0);
+  assert.equal(surface.lakes.length, surface.stats.lakeBodyCount);
+  const bodyFaceIds = surface.lakes.flatMap((lake) => lake.faceIds).sort((a, b) => a - b);
+  assert.equal(new Set(bodyFaceIds).size, bodyFaceIds.length);
+  assert.deepEqual(bodyFaceIds, lakes.map((cell) => cell.faceId).sort((a, b) => a - b));
+  assert.equal(
+    surface.lakes.filter((lake) => lake.regime === "closed").length,
+    surface.stats.closedLakeBodyCount,
+  );
+  assert.equal(
+    surface.lakes.filter((lake) => lake.regime === "overflowing").length,
+    surface.stats.overflowingLakeBodyCount,
+  );
+  assert.ok(surface.lakes.every((lake) => lake.areaKm2 > 0
+    && lake.volumeKm3 > 0
+    && lake.maximumDepthKm > 0
+    && lake.inflowKm3PerYear >= lake.evaporationKm3PerYear
+    && lake.structuralSupport >= 0
+    && lake.structuralSupport <= 1));
+  const totalLakeVolumeKm3 = surface.lakes.reduce((sum, lake) => sum + lake.volumeKm3, 0);
+  const largestLakeAreaKm2 = Math.max(...surface.lakes.map((lake) => lake.areaKm2));
+  const largestLakeVolumeKm3 = Math.max(...surface.lakes.map((lake) => lake.volumeKm3));
+  assert.ok(Math.abs(totalLakeVolumeKm3 - surface.stats.totalLakeVolumeKm3)
+    <= Math.max(1e-9, totalLakeVolumeKm3 * 1e-12));
+  assert.equal(largestLakeAreaKm2, surface.stats.largestLakeAreaKm2);
+  assert.equal(largestLakeVolumeKm3, surface.stats.largestLakeVolumeKm3);
+  assert.ok(Math.abs(surface.stats.dominantLakeAreaFraction
+    - largestLakeAreaKm2 / surface.stats.lakeAreaKm2) <= 1e-12);
 });
 
 test("annual lake equilibrium responds causally to open-water evaporation", () => {
@@ -135,6 +163,11 @@ test("hybrid depression evolution breaches weak wet basins and retains supported
     subdivisions: 4,
     depressionEvolution: "hybrid",
   });
+  const noLargeBasinPressure = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    depressionEvolution: "hybrid",
+    largeBasinOutletScale: 0,
+  });
   const fillOnly = createSurfaceProcessWorld(tectonic, {
     subdivisions: 4,
     depressionEvolution: "fill-only",
@@ -152,6 +185,14 @@ test("hybrid depression evolution breaches weak wet basins and retains supported
   );
   assert.ok(hybrid.stats.lakeAreaKm2 < fillOnly.stats.lakeAreaKm2);
   assert.ok(hybrid.stats.lakeBodyCount < fillOnly.stats.lakeBodyCount);
+  assert.ok(hybrid.stats.breachedBasinCount >= noLargeBasinPressure.stats.breachedBasinCount);
+  assert.ok(hybrid.stats.preservedBasinCount <= noLargeBasinPressure.stats.preservedBasinCount);
+  assert.ok(hybrid.stats.lakeAreaKm2 < noLargeBasinPressure.stats.lakeAreaKm2);
+  assert.ok(hybrid.stats.largestLakeAreaKm2 <= noLargeBasinPressure.stats.largestLakeAreaKm2);
+  assert.deepEqual(
+    hybrid.cells.map((cell) => cell.isLand),
+    noLargeBasinPressure.cells.map((cell) => cell.isLand),
+  );
   assert.ok(hybrid.stats.spillwayCellCount > 0);
   assert.ok(hybrid.stats.spillwayExcavatedVolumeKm3 > 0);
   assert.ok(hybrid.stats.maximumSpillwayIncisionKm > 0);
@@ -167,6 +208,34 @@ test("hybrid depression evolution breaches weak wet basins and retains supported
   );
   assert.ok(Math.abs(excavatedVolumeKm3 - hybrid.stats.spillwayExcavatedVolumeKm3)
     <= hybrid.stats.spillwayExcavatedVolumeKm3 * 1e-12);
+});
+
+test("large wet basin outlets evolve causally across deterministic worlds", () => {
+  for (const seed of ["LAKE-EPOCH-A", "LAKE-EPOCH-B", "LAKE-EPOCH-C"]) {
+    const world = simulateTectonicWorld({
+      seed,
+      subdivisions: 3,
+      plateCount: 11,
+      historyMyr: 180,
+      timestepMyr: 3,
+      oceanFraction: 0.68,
+    });
+    const control = createSurfaceProcessWorld(world, {
+      subdivisions: 4,
+      largeBasinOutletScale: 0,
+    });
+    const evolved = createSurfaceProcessWorld(world, { subdivisions: 4 });
+    assert.deepEqual(
+      evolved.cells.map((cell) => cell.isLand),
+      control.cells.map((cell) => cell.isLand),
+    );
+    assert.ok(evolved.stats.breachedBasinCount >= control.stats.breachedBasinCount);
+    assert.ok(evolved.stats.preservedBasinCount <= control.stats.preservedBasinCount);
+    assert.ok(evolved.stats.lakeAreaKm2 < control.stats.lakeAreaKm2);
+    assert.ok(evolved.stats.largestLakeAreaKm2 <= control.stats.largestLakeAreaKm2);
+    assert.ok(evolved.stats.lakeBodyCount > 0);
+    assert.ok(Math.abs(evolved.stats.runoffResidualKm3PerYear) <= 1e-8);
+  }
 });
 
 test("spherical circulation creates longitudinal rainfall structure and orographic enhancement", () => {
