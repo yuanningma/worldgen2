@@ -512,6 +512,7 @@ const surface = createSurfaceProcessWorld(world, {
   spillwayErosionScale: numberOption("spillway-erosion-scale", 1),
   largeBasinOutletScale: numberOption("large-basin-outlet-scale", 1),
   openWaterEvaporationScale: numberOption("open-water-evaporation-scale", 1.05),
+  lakeSeasonalityScale: numberOption("lake-seasonality-scale", 1),
   hillslopeDiffusionLengthKm: numberOption("hillslope-diffusion-length-km", 42),
   hillslopeDiffusionPasses: numberOption("hillslope-diffusion-passes", 4),
   valleyReliefScale: numberOption("valley-relief-scale", 1),

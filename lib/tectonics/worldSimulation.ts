@@ -51,6 +51,10 @@ export interface WorldCellState {
   readonly continentalFraction?: number;
   readonly crustAgeMyr: number;
   readonly thermalAgeMyr: number;
+  /** Accumulated extensional exposure retained from the tectonic history. */
+  readonly riftExposureMyr?: number;
+  /** Accumulated compressional exposure retained from the tectonic history. */
+  readonly convergenceExposureMyr?: number;
   readonly crustThicknessKm: number;
   readonly densityKgM3: number;
   readonly provenanceId: number;
@@ -336,7 +340,11 @@ function continentalGraphRegions(
     }
   }
 
-  const communityCount = 2 + random.integer(0, 2);
+  // Seed several widely separated crustal communities, then let subordinate
+  // terranes cluster around them. These are initial material provinces rather
+  // than requested final continents; rifting, collision, and flooding remain
+  // free to merge or split them during the simulated history.
+  const communityCount = 3 + random.integer(0, 3);
   const roots: number[] = [];
   while (roots.length < communityCount) {
     const candidates = plates
@@ -355,7 +363,7 @@ function continentalGraphRegions(
     roots.push(candidates[0].id);
   }
 
-  const nucleusCount = Math.min(7, Math.max(4, Math.round(Math.sqrt(plates.length)) + random.integer(0, 3)));
+  const nucleusCount = Math.min(8, Math.max(5, Math.round(Math.sqrt(plates.length)) + random.integer(1, 4)));
   const nucleusPlates = [...roots];
   while (nucleusPlates.length < nucleusCount) {
     const candidates = plates
@@ -393,11 +401,11 @@ function continentalGraphRegions(
   const frontRawWeights: number[] = [];
   for (let regionId = 0; regionId < nucleusFaces.length; regionId += 1) {
     const groupBudgetShare = rawWeights[regionId] / totalWeight;
-    const subordinateCount = 2 + random.integer(0, 3);
+    const subordinateCount = 3 + random.integer(0, 4);
     const lobeFaces = [nucleusFaces[regionId]];
     for (let lobe = 0; lobe < subordinateCount; lobe += 1) {
       let faceId = nucleusFaces[regionId];
-      const walkSteps = 3 + random.integer(0, 3 + sphere.subdivisions * 2);
+      const walkSteps = 3 + random.integer(0, 5 + sphere.subdivisions * 2);
       for (let step = 0; step < walkSteps; step += 1) {
         const candidates = adjacency[faceId]
           .slice()
@@ -410,7 +418,7 @@ function continentalGraphRegions(
       }
       if (!lobeFaces.includes(faceId)) lobeFaces.push(faceId);
     }
-    const lobeWeights = lobeFaces.map((_, index) => index === 0 ? 1.8 : random.range(0.42, 0.95));
+    const lobeWeights = lobeFaces.map((_, index) => index === 0 ? 1.7 : random.range(0.34, 1.08));
     const lobeWeightTotal = lobeWeights.reduce((sum, weight) => sum + weight, 0);
     for (let index = 0; index < lobeFaces.length; index += 1) {
       frontFaces.push(lobeFaces[index]);
@@ -419,7 +427,14 @@ function continentalGraphRegions(
     }
   }
   const directions = frontFaces.map(() => randomUnitVector(random));
-  const budgets = frontRawWeights.map((weight) => targetArea * weight);
+  // Individual lobes compete for the same cells. Giving their private budgets
+  // exactly the target total guarantees an area deficit wherever fronts meet,
+  // and the old union-front fallback then inflated a smooth outer hull. A
+  // bounded reserve lets surviving terranes continue around one another until
+  // the global inventory closes, preserving bays, reentrants, and subordinate
+  // peninsulas without prescribing a final continent count.
+  const frontBudgetReserve = 1.2;
+  const budgets = frontRawWeights.map((weight) => targetArea * weight * frontBudgetReserve);
   const frontAreas = new Float64Array(frontFaces.length);
   const regions = new Int32Array(sphere.faces.length).fill(-1);
   const terranes = new Int32Array(sphere.faces.length).fill(-1);
@@ -1395,6 +1410,8 @@ export function simulateTectonicWorld(
       continentalFraction: cell.continentalFraction,
       crustAgeMyr: cell.crustAgeMyr,
       thermalAgeMyr: cell.crustType === "oceanic" ? cell.crustAgeMyr : Math.max(0, cell.crustAgeMyr - 250),
+      riftExposureMyr: cell.riftExposureMyr,
+      convergenceExposureMyr: cell.convergenceExposureMyr,
       crustThicknessKm: cell.crustThicknessKm,
       densityKgM3: cell.densityKgM3,
       provenanceId: cell.provenanceId,
@@ -1495,6 +1512,8 @@ export function simulateMovingCrustSnapshot(
       continentalFraction: face.continentalFraction,
       crustAgeMyr: face.crustAgeMyr,
       thermalAgeMyr: face.thermalAgeMyr,
+      riftExposureMyr: face.riftExposureMyr,
+      convergenceExposureMyr: face.convergenceExposureMyr,
       crustThicknessKm: face.crustThicknessKm,
       densityKgM3: face.densityKgM3,
       provenanceId: face.dominantProvenanceId,
@@ -1664,6 +1683,8 @@ export function simulateCoupledTectonicWorld(
       thermalAgeMyr: cell.crustType === "oceanic"
         ? cell.crustAgeMyr
         : Math.max(0, cell.crustAgeMyr - 250),
+      riftExposureMyr: cell.riftExposureMyr,
+      convergenceExposureMyr: cell.convergenceExposureMyr,
       crustThicknessKm: cell.crustThicknessKm,
       densityKgM3: cell.densityKgM3,
       provenanceId: cell.provenanceId,

@@ -74,11 +74,15 @@ test("crust state remains finite, positive, and carries provenance", () => {
     assert.ok(Number.isFinite(cell.waterDepthKm));
     assert.ok(cell.crustAgeMyr >= 0);
     assert.ok(cell.thermalAgeMyr >= 0);
+    assert.ok(Number.isFinite(cell.riftExposureMyr) && cell.riftExposureMyr >= 0);
+    assert.ok(Number.isFinite(cell.convergenceExposureMyr) && cell.convergenceExposureMyr >= 0);
     assert.ok(cell.crustThicknessKm > 0);
     assert.ok(cell.densityKgM3 > 0);
     assert.ok(Number.isInteger(cell.provenanceId));
     assert.ok(cell.plateId >= 0 && cell.plateId < world.plates.length);
   }
+  assert.ok(world.cells.some((cell) => cell.riftExposureMyr > 0));
+  assert.ok(world.cells.some((cell) => cell.convergenceExposureMyr > 0));
 });
 
 test("continental growth preserves a hierarchy of adjacent accreted terranes", () => {

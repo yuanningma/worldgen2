@@ -27,6 +27,8 @@ export interface SurfaceProcessOptions {
   readonly presentationSampleCount?: number;
   /** Multiplier on the reduced open-water potential-evaporation estimate. */
   readonly openWaterEvaporationScale?: number;
+  /** Strength of deterministic monthly runoff and lake-temperature seasonality. */
+  readonly lakeSeasonalityScale?: number;
   /** Depression evolution applied before the final erosion and lake passes. */
   readonly depressionEvolution?: "hybrid" | "fill-only";
   /** Multiplier on discharge-driven spillway incision. */
@@ -219,6 +221,24 @@ export interface SurfaceRiverMouth {
 }
 
 export type SurfaceLakeRegime = "closed" | "overflowing";
+export type SurfaceLakeBasinOrigin = "rift" | "foreland" | "volcanic" | "glacial" | "cratonic" | "mixed";
+
+export interface SurfaceLakeMonth {
+  /** Zero-based month index. Month 0 is January. */
+  readonly monthIndex: number;
+  readonly meanTemperatureC: number;
+  /** Water volume entering during this month. */
+  readonly inflowKm3: number;
+  /** Actual open-water evaporation during this month. */
+  readonly evaporationKm3: number;
+  /** Spillway discharge leaving during this month. */
+  readonly outflowKm3: number;
+  /** End-of-month stored water volume. */
+  readonly storageKm3: number;
+  /** Approximate lake level relative to the annual mean storage. */
+  readonly levelAnomalyM: number;
+  readonly iceFraction: number;
+}
 
 export interface SurfaceLakeBody {
   readonly id: number;
@@ -230,8 +250,24 @@ export interface SurfaceLakeBody {
   readonly maximumDepthKm: number;
   readonly inflowKm3PerYear: number;
   readonly evaporationKm3PerYear: number;
+  readonly outflowKm3PerYear: number;
   /** Resistance, orogenic confinement, volcanism, and cold-basin support in [0, 1]. */
   readonly structuralSupport: number;
+  readonly basinOrigin: SurfaceLakeBasinOrigin;
+  readonly meanCrustAgeMyr: number;
+  readonly meanRiftExposureMyr: number;
+  readonly meanConvergenceExposureMyr: number;
+  readonly tectonicSupport: number;
+  readonly seasonalStorageRangeKm3: number;
+  readonly seasonalLevelRangeM: number;
+  readonly minimumStorageFraction: number;
+  readonly overflowMonthCount: number;
+  readonly dryMonthCount: number;
+  readonly perennial: boolean;
+  /** Combined hydroclimate and tectonic longevity evidence in [0, 1]. */
+  readonly persistenceScore: number;
+  readonly longLived: boolean;
+  readonly monthlyWaterBalance: readonly SurfaceLakeMonth[];
 }
 
 export interface SurfacePresentationSample {
@@ -296,6 +332,13 @@ export interface SurfaceProcessStats {
   readonly largestLakeAreaKm2: number;
   readonly largestLakeVolumeKm3: number;
   readonly dominantLakeAreaFraction: number;
+  readonly perennialLakeBodyCount: number;
+  readonly ephemeralLakeBodyCount: number;
+  readonly longLivedLakeBodyCount: number;
+  readonly seasonallyOverflowingLakeBodyCount: number;
+  readonly meanLakeSeasonalLevelRangeM: number;
+  readonly maximumLakeSeasonalLevelRangeM: number;
+  readonly seasonalLakeWaterResidualKm3PerYear: number;
   readonly riverSegmentCount: number;
   readonly meanRiverSinuosity: number;
   readonly meanRiverMeanderAmplitudeKm: number;
@@ -445,6 +488,21 @@ interface LakeBalanceResult {
   readonly overflowingLakeBodyCount: number;
   readonly overflowOutletFaceIds: ReadonlySet<number>;
   readonly bodies: readonly SurfaceLakeBody[];
+}
+
+interface SeasonalLakeBalanceResult {
+  readonly evaporationSinkKm3PerYear: Float64Array;
+  readonly closedLakeBodyCount: number;
+  readonly overflowingLakeBodyCount: number;
+  readonly overflowOutletFaceIds: ReadonlySet<number>;
+  readonly bodies: readonly SurfaceLakeBody[];
+  readonly perennialLakeBodyCount: number;
+  readonly ephemeralLakeBodyCount: number;
+  readonly longLivedLakeBodyCount: number;
+  readonly seasonallyOverflowingLakeBodyCount: number;
+  readonly meanLakeSeasonalLevelRangeM: number;
+  readonly maximumLakeSeasonalLevelRangeM: number;
+  readonly seasonalLakeWaterResidualKm3PerYear: number;
 }
 
 interface BalancedRunoffResult {
@@ -1868,7 +1926,22 @@ function summarizeLakeBody(
     maximumDepthKm,
     inflowKm3PerYear,
     evaporationKm3PerYear,
+    outflowKm3PerYear: Math.max(0, inflowKm3PerYear - evaporationKm3PerYear),
     structuralSupport: weightedStructuralSupport / Math.max(areaKm2, Number.EPSILON),
+    basinOrigin: "mixed",
+    meanCrustAgeMyr: 0,
+    meanRiftExposureMyr: 0,
+    meanConvergenceExposureMyr: 0,
+    tectonicSupport: 0,
+    seasonalStorageRangeKm3: 0,
+    seasonalLevelRangeM: 0,
+    minimumStorageFraction: 1,
+    overflowMonthCount: regime === "overflowing" ? 12 : 0,
+    dryMonthCount: 0,
+    perennial: true,
+    persistenceScore: 0,
+    longLived: false,
+    monthlyWaterBalance: [],
   };
 }
 
@@ -2154,6 +2227,393 @@ function inheritResolvedLakeBalance(
   };
 }
 
+function monthlyRunoffFractions(
+  cell: MutableSurfaceCell,
+  point: Vec3,
+  seasonalityScale: number,
+): readonly number[] {
+  const latitude = Math.asin(clamp(point[2], -1, 1));
+  const absoluteLatitudeFraction = Math.abs(latitude) / (Math.PI / 2);
+  const summerPeakMonth = latitude >= 0 ? 6 : 0;
+  const temperatures = Array.from({ length: 12 }, (_, monthIndex) => (
+    cell.temperatureC
+      + cell.seasonalTemperatureRangeC * 0.5 * seasonalityScale
+        * Math.cos((monthIndex - summerPeakMonth) * Math.PI * 2 / 12)
+  ));
+  const equatorialEnvelope = Math.exp(-((Math.abs(latitude) / 0.25) ** 2));
+  const monsoonEnvelope = Math.exp(-(((Math.abs(latitude) - 0.3) / 0.3) ** 2));
+  const stormTrackEnvelope = Math.exp(-(((Math.abs(latitude) - 0.92) / 0.3) ** 2));
+  const moistureResponse = clamp(cell.precipitationMPerYear / 1.4, 0, 1);
+  const coldSeasonPotential = clamp(
+    (cell.seasonalTemperatureRangeC - 8) / 38,
+    0,
+    1,
+  ) * absoluteLatitudeFraction;
+  const raw = temperatures.map((temperatureC, monthIndex) => {
+    const phase = (monthIndex - summerPeakMonth) * Math.PI * 2 / 12;
+    const localSummer = Math.cos(phase);
+    const localWinter = -localSummer;
+    const equinoctialPulse = -Math.cos(phase * 2);
+    const precipitationWeight = Math.max(
+      0.08,
+      1
+        + monsoonEnvelope * (0.28 + moistureResponse * 0.32) * localSummer * seasonalityScale
+        + stormTrackEnvelope * 0.34 * localWinter * seasonalityScale
+        + equatorialEnvelope * 0.22 * equinoctialPulse * seasonalityScale,
+    );
+    const previousTemperatureC = temperatures[(monthIndex + 11) % 12];
+    const thawFraction = clamp((temperatureC + 6) / 14, 0.08, 1);
+    const warmingPulse = clamp((temperatureC - previousTemperatureC) / 8, 0, 1);
+    const snowmeltPulse = warmingPulse * coldSeasonPotential * 1.25 * seasonalityScale;
+    return precipitationWeight * (0.2 + thawFraction * 0.8) + snowmeltPulse;
+  });
+  const total = raw.reduce((sum, value) => sum + value, 0);
+  return raw.map((value) => value / Math.max(total, Number.EPSILON));
+}
+
+function simulateSeasonalLakeBalance(
+  cells: MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  downstreamOrder: readonly MutableSurfaceCell[],
+  bodies: readonly SurfaceLakeBody[],
+  tectonicWorld: TectonicWorldModel,
+  seasonalityScale: number,
+): SeasonalLakeBalanceResult {
+  if (bodies.length === 0) {
+    return {
+      evaporationSinkKm3PerYear: new Float64Array(cells.length),
+      closedLakeBodyCount: 0,
+      overflowingLakeBodyCount: 0,
+      overflowOutletFaceIds: new Set<number>(),
+      bodies: [],
+      perennialLakeBodyCount: 0,
+      ephemeralLakeBodyCount: 0,
+      longLivedLakeBodyCount: 0,
+      seasonallyOverflowingLakeBodyCount: 0,
+      meanLakeSeasonalLevelRangeM: 0,
+      maximumLakeSeasonalLevelRangeM: 0,
+      seasonalLakeWaterResidualKm3PerYear: 0,
+    };
+  }
+
+  const lakeIdByFace = new Int32Array(cells.length);
+  lakeIdByFace.fill(-1);
+  for (const body of bodies) {
+    for (const faceId of body.faceIds) lakeIdByFace[faceId] = body.id;
+  }
+  const targetLakeByFace = new Int32Array(cells.length);
+  targetLakeByFace.fill(-2);
+  for (let orderIndex = downstreamOrder.length - 1; orderIndex >= 0; orderIndex -= 1) {
+    const cell = downstreamOrder[orderIndex];
+    const lakeId = lakeIdByFace[cell.faceId];
+    if (lakeId >= 0) {
+      targetLakeByFace[cell.faceId] = lakeId;
+      continue;
+    }
+    const receiverFaceId = cell.receiverFaceId;
+    targetLakeByFace[cell.faceId] = receiverFaceId !== null && cells[receiverFaceId].isLand
+      ? Math.max(-1, targetLakeByFace[receiverFaceId])
+      : -1;
+  }
+
+  const inflowProfiles = bodies.map(() => new Float64Array(12));
+  for (const cell of cells) {
+    if (!cell.isLand || cell.localRunoffKm3PerYear <= 0) continue;
+    const targetLakeId = targetLakeByFace[cell.faceId];
+    if (targetLakeId < 0) continue;
+    const fractions = monthlyRunoffFractions(
+      cell,
+      sphere.faces[cell.faceId].center,
+      seasonalityScale,
+    );
+    const profile = inflowProfiles[targetLakeId];
+    for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
+      profile[monthIndex] += cell.localRunoffKm3PerYear * fractions[monthIndex];
+    }
+  }
+
+  const downstreamLakeIds = new Int32Array(bodies.length);
+  downstreamLakeIds.fill(-1);
+  for (const body of bodies) {
+    let cursorFaceId = cells[body.outletFaceId].receiverFaceId;
+    const visited = new Set<number>();
+    while (cursorFaceId !== null
+      && cells[cursorFaceId].isLand
+      && lakeIdByFace[cursorFaceId] === body.id
+      && !visited.has(cursorFaceId)) {
+      visited.add(cursorFaceId);
+      cursorFaceId = cells[cursorFaceId].receiverFaceId;
+    }
+    if (cursorFaceId !== null && cells[cursorFaceId].isLand) {
+      const downstreamLakeId = targetLakeByFace[cursorFaceId];
+      if (downstreamLakeId >= 0 && downstreamLakeId !== body.id) {
+        downstreamLakeIds[body.id] = downstreamLakeId;
+      }
+    }
+  }
+
+  const indegrees = new Int32Array(bodies.length);
+  for (const downstreamLakeId of downstreamLakeIds) {
+    if (downstreamLakeId >= 0) indegrees[downstreamLakeId] += 1;
+  }
+  const ready = bodies.map((body) => body.id).filter((id) => indegrees[id] === 0);
+  ready.sort((a, b) => a - b);
+  const lakeOrder: number[] = [];
+  while (ready.length > 0) {
+    const lakeId = ready.shift() as number;
+    lakeOrder.push(lakeId);
+    const downstreamLakeId = downstreamLakeIds[lakeId];
+    if (downstreamLakeId < 0) continue;
+    indegrees[downstreamLakeId] -= 1;
+    if (indegrees[downstreamLakeId] === 0) {
+      ready.push(downstreamLakeId);
+      ready.sort((a, b) => a - b);
+    }
+  }
+  for (const body of bodies) {
+    if (!lakeOrder.includes(body.id)) lakeOrder.push(body.id);
+  }
+
+  const radiusSquared = tectonicWorld.recipe.radiusKm ** 2;
+  const updatedBodies = new Array<SurfaceLakeBody>(bodies.length);
+  const evaporationSinkKm3PerYear = new Float64Array(cells.length);
+  const overflowOutletFaceIds = new Set<number>();
+  let seasonalLakeWaterResidualKm3PerYear = 0;
+  for (const lakeId of lakeOrder) {
+    const body = bodies[lakeId];
+    const inflow = inflowProfiles[lakeId];
+    let areaWeight = 0;
+    let crustAgeSum = 0;
+    let riftExposureSum = 0;
+    let convergenceExposureSum = 0;
+    let volcanicArea = 0;
+    let coldArea = 0;
+    let forelandSum = 0;
+    const monthlyTemperatures = new Float64Array(12);
+    for (const faceId of body.faceIds) {
+      const cell = cells[faceId];
+      const areaKm2 = sphere.faces[faceId].areaSteradians * radiusSquared;
+      const canonical = tectonicWorld.cells[cell.canonicalFaceId];
+      const latitude = Math.asin(clamp(sphere.faces[faceId].center[2], -1, 1));
+      const summerPeakMonth = latitude >= 0 ? 6 : 0;
+      areaWeight += areaKm2;
+      crustAgeSum += canonical.crustAgeMyr * areaKm2;
+      riftExposureSum += (canonical.riftExposureMyr ?? 0) * areaKm2;
+      convergenceExposureSum += (canonical.convergenceExposureMyr ?? 0) * areaKm2;
+      if (cell.lithology === "volcanic") volcanicArea += areaKm2;
+      coldArea += clamp((-cell.temperatureC + 1) / 18, 0, 1) * areaKm2;
+      forelandSum += cell.forelandBasinStrength * areaKm2;
+      for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
+        monthlyTemperatures[monthIndex] += (
+          cell.temperatureC
+            + cell.seasonalTemperatureRangeC * 0.5 * seasonalityScale
+              * Math.cos((monthIndex - summerPeakMonth) * Math.PI * 2 / 12)
+        ) * areaKm2;
+      }
+    }
+    const meanCrustAgeMyr = crustAgeSum / Math.max(areaWeight, Number.EPSILON);
+    const meanRiftExposureMyr = riftExposureSum / Math.max(areaWeight, Number.EPSILON);
+    const meanConvergenceExposureMyr = convergenceExposureSum
+      / Math.max(areaWeight, Number.EPSILON);
+    const volcanicFraction = volcanicArea / Math.max(areaWeight, Number.EPSILON);
+    const coldFraction = coldArea / Math.max(areaWeight, Number.EPSILON);
+    const meanForelandStrength = forelandSum / Math.max(areaWeight, Number.EPSILON);
+    for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
+      monthlyTemperatures[monthIndex] /= Math.max(areaWeight, Number.EPSILON);
+    }
+
+    const routedAnnualInflowKm3 = inflow.reduce((sum, value) => sum + value, 0);
+    const annualEvaporationTargetKm3 = Math.min(
+      body.evaporationKm3PerYear,
+      routedAnnualInflowKm3,
+    );
+    const evaporationWeights = Array.from(monthlyTemperatures, (temperatureC) => {
+      const iceFraction = clamp((-temperatureC + 1) / 11, 0, 1);
+      const openWaterPotential = 0.22 + Math.max(0, temperatureC + 5) * 0.04;
+      return Math.max(0.02, openWaterPotential * (1 - iceFraction * 0.84));
+    });
+    const evaporationWeightTotal = evaporationWeights.reduce((sum, value) => sum + value, 0);
+    const evaporationCapacity = evaporationWeights.map((weight) => (
+      annualEvaporationTargetKm3 * weight / Math.max(evaporationWeightTotal, Number.EPSILON)
+    ));
+    const storageCapacityKm3 = Math.max(body.volumeKm3, Number.EPSILON);
+
+    const runYear = (initialStorageKm3: number, capture: boolean) => {
+      let storageKm3 = initialStorageKm3;
+      const months: Array<Omit<SurfaceLakeMonth, "levelAnomalyM">> = [];
+      for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
+        const availableKm3 = storageKm3 + inflow[monthIndex];
+        const evaporationKm3 = Math.min(evaporationCapacity[monthIndex], availableKm3);
+        const afterEvaporationKm3 = availableKm3 - evaporationKm3;
+        const outflowKm3 = Math.max(0, afterEvaporationKm3 - storageCapacityKm3);
+        storageKm3 = Math.min(storageCapacityKm3, afterEvaporationKm3);
+        if (capture) {
+          months.push({
+            monthIndex,
+            meanTemperatureC: monthlyTemperatures[monthIndex],
+            inflowKm3: inflow[monthIndex],
+            evaporationKm3,
+            outflowKm3,
+            storageKm3,
+            iceFraction: clamp((-monthlyTemperatures[monthIndex] + 1) / 11, 0, 1),
+          });
+        }
+      }
+      return { storageKm3, months };
+    };
+
+    let storageKm3 = body.regime === "overflowing"
+      ? storageCapacityKm3
+      : storageCapacityKm3 * 0.72;
+    for (let spinupYear = 0; spinupYear < 64; spinupYear += 1) {
+      const nextStorageKm3 = runYear(storageKm3, false).storageKm3;
+      const converged = Math.abs(nextStorageKm3 - storageKm3)
+        <= Math.max(1e-8, storageCapacityKm3 * 1e-10);
+      storageKm3 = nextStorageKm3;
+      if (converged && spinupYear >= 3) break;
+    }
+    const cycleStartStorageKm3 = storageKm3;
+    const cycle = runYear(cycleStartStorageKm3, true);
+    const meanStorageKm3 = cycle.months.reduce((sum, month) => sum + month.storageKm3, 0) / 12;
+    const monthlyWaterBalance: SurfaceLakeMonth[] = cycle.months.map((month) => ({
+      ...month,
+      levelAnomalyM: (month.storageKm3 - meanStorageKm3)
+        / Math.max(body.areaKm2, Number.EPSILON) * 1000,
+    }));
+    const annualInflowKm3 = monthlyWaterBalance.reduce((sum, month) => sum + month.inflowKm3, 0);
+    const annualEvaporationKm3 = monthlyWaterBalance.reduce(
+      (sum, month) => sum + month.evaporationKm3,
+      0,
+    );
+    const annualOutflowKm3 = monthlyWaterBalance.reduce((sum, month) => sum + month.outflowKm3, 0);
+    const minimumStorageKm3 = monthlyWaterBalance.reduce(
+      (minimum, month) => Math.min(minimum, month.storageKm3),
+      Infinity,
+    );
+    const maximumStorageKm3 = monthlyWaterBalance.reduce(
+      (maximum, month) => Math.max(maximum, month.storageKm3),
+      0,
+    );
+    const seasonalStorageRangeKm3 = maximumStorageKm3 - minimumStorageKm3;
+    const seasonalLevelRangeM = seasonalStorageRangeKm3
+      / Math.max(body.areaKm2, Number.EPSILON) * 1000;
+    const minimumStorageFraction = minimumStorageKm3 / storageCapacityKm3;
+    const overflowMonthCount = monthlyWaterBalance.filter((month) => month.outflowKm3 > 1e-9).length;
+    const dryMonthCount = monthlyWaterBalance.filter((month) => (
+      month.storageKm3 <= storageCapacityKm3 * 0.005
+    )).length;
+    const perennial = dryMonthCount === 0 && minimumStorageFraction > 0.01;
+    const regime: SurfaceLakeRegime = annualOutflowKm3 > Math.max(1e-9, annualInflowKm3 * 1e-8)
+      ? "overflowing"
+      : "closed";
+    if (regime === "overflowing") overflowOutletFaceIds.add(body.outletFaceId);
+    evaporationSinkKm3PerYear[body.outletFaceId] = annualEvaporationKm3;
+
+    const stableCratonSupport = clamp((meanCrustAgeMyr - 350) / 1_400, 0, 1);
+    const riftSupport = clamp(meanRiftExposureMyr / 90, 0, 1);
+    const convergenceSupport = clamp(meanConvergenceExposureMyr / 110, 0, 1);
+    const tectonicSupport = clamp(
+      body.structuralSupport * 0.42
+        + riftSupport * 0.2
+        + convergenceSupport * 0.14
+        + stableCratonSupport * 0.14
+        + volcanicFraction * 0.1,
+      0,
+      1,
+    );
+    let basinOrigin: SurfaceLakeBasinOrigin = "mixed";
+    if (coldFraction >= 0.58) basinOrigin = "glacial";
+    else if (volcanicFraction >= 0.28) basinOrigin = "volcanic";
+    else if (meanRiftExposureMyr >= 24
+      && meanRiftExposureMyr >= meanConvergenceExposureMyr * 1.05) basinOrigin = "rift";
+    else if (meanForelandStrength >= 0.16 || meanConvergenceExposureMyr >= 28) {
+      basinOrigin = "foreland";
+    } else if (meanCrustAgeMyr >= 850 && body.structuralSupport >= 0.52) {
+      basinOrigin = "cratonic";
+    }
+    const hydroclimatePersistence = clamp(
+      clamp(minimumStorageFraction / 0.45, 0, 1) * 0.45
+        + (1 - dryMonthCount / 12) * 0.25
+        + (1 - clamp(seasonalStorageRangeKm3 / storageCapacityKm3, 0, 1)) * 0.2
+        + (regime === "closed" ? 1 : overflowMonthCount / 12) * 0.1,
+      0,
+      1,
+    );
+    const persistenceScore = clamp(
+      hydroclimatePersistence * 0.45 + tectonicSupport * 0.55,
+      0,
+      1,
+    );
+    const hasNamedGeologicSupport = basinOrigin !== "mixed";
+    const longLived = perennial
+      && persistenceScore >= 0.56
+      && (hasNamedGeologicSupport || tectonicSupport >= 0.42);
+    // The monthly reduction can exceed routed inflow by a last-bit rounding
+    // difference when a closed lake evaporates its entire annual supply.
+    // Preserve the physical inequality exposed by the public annual record.
+    const boundedAnnualEvaporationKm3 = Math.min(annualEvaporationKm3, annualInflowKm3);
+    updatedBodies[lakeId] = {
+      ...body,
+      regime,
+      inflowKm3PerYear: annualInflowKm3,
+      evaporationKm3PerYear: boundedAnnualEvaporationKm3,
+      outflowKm3PerYear: annualOutflowKm3,
+      basinOrigin,
+      meanCrustAgeMyr,
+      meanRiftExposureMyr,
+      meanConvergenceExposureMyr,
+      tectonicSupport,
+      seasonalStorageRangeKm3,
+      seasonalLevelRangeM,
+      minimumStorageFraction,
+      overflowMonthCount,
+      dryMonthCount,
+      perennial,
+      persistenceScore,
+      longLived,
+      monthlyWaterBalance,
+    };
+    seasonalLakeWaterResidualKm3PerYear += cycleStartStorageKm3
+      + annualInflowKm3
+      - annualEvaporationKm3
+      - annualOutflowKm3
+      - cycle.storageKm3;
+    const downstreamLakeId = downstreamLakeIds[lakeId];
+    if (downstreamLakeId >= 0) {
+      for (let monthIndex = 0; monthIndex < 12; monthIndex += 1) {
+        inflowProfiles[downstreamLakeId][monthIndex] += monthlyWaterBalance[monthIndex].outflowKm3;
+      }
+    }
+  }
+
+  const perennialLakeBodyCount = updatedBodies.filter((body) => body.perennial).length;
+  const longLivedLakeBodyCount = updatedBodies.filter((body) => body.longLived).length;
+  const seasonallyOverflowingLakeBodyCount = updatedBodies.filter(
+    (body) => body.overflowMonthCount > 0,
+  ).length;
+  const lakeAreaKm2 = updatedBodies.reduce((sum, body) => sum + body.areaKm2, 0);
+  return {
+    evaporationSinkKm3PerYear,
+    closedLakeBodyCount: updatedBodies.filter((body) => body.regime === "closed").length,
+    overflowingLakeBodyCount: updatedBodies.filter((body) => body.regime === "overflowing").length,
+    overflowOutletFaceIds,
+    bodies: updatedBodies,
+    perennialLakeBodyCount,
+    ephemeralLakeBodyCount: updatedBodies.length - perennialLakeBodyCount,
+    longLivedLakeBodyCount,
+    seasonallyOverflowingLakeBodyCount,
+    meanLakeSeasonalLevelRangeM: updatedBodies.reduce(
+      (sum, body) => sum + body.seasonalLevelRangeM * body.areaKm2,
+      0,
+    ) / Math.max(lakeAreaKm2, Number.EPSILON),
+    maximumLakeSeasonalLevelRangeM: updatedBodies.reduce(
+      (maximum, body) => Math.max(maximum, body.seasonalLevelRangeM),
+      0,
+    ),
+    seasonalLakeWaterResidualKm3PerYear,
+  };
+}
+
 function erodeAndRouteSediment(
   cells: MutableSurfaceCell[],
   sphere: GeodesicSphere,
@@ -2396,7 +2856,11 @@ function createRiverPresentationPoints(
   }
   let points = new Map<number, Vec3>();
   for (const faceId of nodeIds) points.set(faceId, sphere.faces[faceId].center);
-  for (let pass = 0; pass < 2; pass += 1) {
+  // Relax the dominant drainage spine substantially farther than the process
+  // cell radius. The receiver graph remains authoritative, but this removes
+  // the visual memory of successive icosphere edge directions from the shared
+  // centerline used by every tributary and downstream segment.
+  for (let pass = 0; pass < 5; pass += 1) {
     const next = new Map<number, Vec3>();
     for (const faceId of nodeIds) {
       const center = sphere.faces[faceId].center;
@@ -2404,11 +2868,11 @@ function createRiverPresentationPoints(
       const downstreamId = cells[faceId].isLand ? cells[faceId].receiverFaceId : null;
       const upstream = upstreamId === undefined ? null : points.get(upstreamId) ?? sphere.faces[upstreamId].center;
       const downstream = downstreamId === null ? null : points.get(downstreamId) ?? sphere.faces[downstreamId].center;
-      let centerWeight = 0.58;
-      let neighborWeight = 0.21;
+      let centerWeight = 0.34;
+      let neighborWeight = 0.33;
       if (!upstream || !downstream) {
-        centerWeight = 0.72;
-        neighborWeight = 0.28;
+        centerWeight = 0.64;
+        neighborWeight = 0.36;
       }
       const candidate: [number, number, number] = [
         center[0] * centerWeight,
@@ -2454,7 +2918,7 @@ function createRiverPresentationPoints(
         Math.acos(clamp(dot3(center, sphere.faces[neighborId].center), -1, 1)),
       ), Infinity);
       const displacement = Math.acos(clamp(dot3(center, smoothed), -1, 1));
-      const limit = localStep * 0.38;
+      const limit = localStep * 0.68;
       if (displacement > limit) {
         const amount = limit / displacement;
         smoothed = normalize3([
@@ -2499,11 +2963,21 @@ function createRiverPresentationTangents(
       ? null
       : points.get(downstreamId) ?? sphere.faces[downstreamId].center;
     if (!upstream && !downstream) continue;
+    const secondUpstreamId = upstreamId === undefined ? undefined : dominantIncoming.get(upstreamId);
+    const secondDownstreamId = downstreamId !== null && cells[downstreamId].isLand
+      ? cells[downstreamId].receiverFaceId
+      : null;
+    const secondUpstream = secondUpstreamId === undefined
+      ? upstream
+      : points.get(secondUpstreamId) ?? sphere.faces[secondUpstreamId].center;
+    const secondDownstream = secondDownstreamId === null
+      ? downstream
+      : points.get(secondDownstreamId) ?? sphere.faces[secondDownstreamId].center;
     const raw: Vec3 = upstream && downstream
       ? [
-        downstream[0] - upstream[0],
-        downstream[1] - upstream[1],
-        downstream[2] - upstream[2],
+        downstream[0] - upstream[0] + ((secondDownstream?.[0] ?? downstream[0]) - (secondUpstream?.[0] ?? upstream[0])) * 0.32,
+        downstream[1] - upstream[1] + ((secondDownstream?.[1] ?? downstream[1]) - (secondUpstream?.[1] ?? upstream[1])) * 0.32,
+        downstream[2] - upstream[2] + ((secondDownstream?.[2] ?? downstream[2]) - (secondUpstream?.[2] ?? upstream[2])) * 0.32,
       ]
       : downstream
         ? [downstream[0] - point[0], downstream[1] - point[1], downstream[2] - point[2]]
@@ -2560,7 +3034,7 @@ function createRiverPresentationPath(
     return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
   }
   const lateral = normalize3(lateralRaw);
-  const pointCount = hierarchy > 0.62 ? 7 : 5;
+  const pointCount = hierarchy > 0.62 ? 11 : 7;
   const buildPath = (amplitudeRadians: number, tangentScale: number): Vec3[] => {
     const path: Vec3[] = [];
     for (let index = 0; index < pointCount; index += 1) {
@@ -3060,7 +3534,8 @@ export function createSurfaceProcessWorld(
     cell.isLake = false;
   }
   const openWaterEvaporationScale = clamp(options.openWaterEvaporationScale ?? 1.05, 0.4, 2.5);
-  const lakeBalance = hierarchyAnchor
+  const lakeSeasonalityScale = clamp(options.lakeSeasonalityScale ?? 1, 0, 2);
+  const resolvedLakeBalance = hierarchyAnchor
     ? inheritResolvedLakeBalance(
       cells,
       sphere,
@@ -3078,6 +3553,22 @@ export function createSurfaceProcessWorld(
       minimumLakeCatchmentKm2,
       openWaterEvaporationScale,
     );
+  const seasonalLakeBalance = simulateSeasonalLakeBalance(
+    cells,
+    sphere,
+    finalDrainage.downstreamOrder,
+    resolvedLakeBalance.bodies,
+    tectonicWorld,
+    lakeSeasonalityScale,
+  );
+  const lakeBalance: LakeBalanceResult = {
+    ...resolvedLakeBalance,
+    evaporationSinkKm3PerYear: seasonalLakeBalance.evaporationSinkKm3PerYear,
+    closedLakeBodyCount: seasonalLakeBalance.closedLakeBodyCount,
+    overflowingLakeBodyCount: seasonalLakeBalance.overflowingLakeBodyCount,
+    overflowOutletFaceIds: seasonalLakeBalance.overflowOutletFaceIds,
+    bodies: seasonalLakeBalance.bodies,
+  };
   const balancedRunoff = balanceRunoffAcrossLakes(
     cells,
     finalDrainage.downstreamOrder,
@@ -3308,7 +3799,20 @@ export function createSurfaceProcessWorld(
   const centers = sphere.faces.map((face) => face.center);
   const root = buildKdTree(sphere.faces.map((face) => face.id), centers);
   if (!root) throw new Error("surface process grid must contain faces");
-  const presentationSampleCount = Math.round(clamp(options.presentationSampleCount ?? 12, 6, 24));
+  const requestedPresentationSampleCount = Math.round(clamp(
+    options.presentationSampleCount ?? 12,
+    6,
+    24,
+  ));
+  // K-nearest Gaussian neighborhoods can change membership exactly on a
+  // Voronoi edge. Restrict the public setting to calibrated support tiers
+  // whose omitted tail is negligible on this mesh, avoiding rare terrain
+  // seams while keeping whole-atlas sampling bounded.
+  const presentationSampleCount = requestedPresentationSampleCount <= 14
+    ? 12
+    : requestedPresentationSampleCount <= 20
+      ? 16
+      : 24;
   const presentationCandidateCount = presentationSampleCount * 4;
   const characteristicRadians = Math.sqrt(sphere.totalAreaSteradians / sphere.faces.length);
   const kernelSharpness = 1.7 / characteristicRadians ** 2;
@@ -3624,6 +4128,13 @@ export function createSurfaceProcessWorld(
       largestLakeAreaKm2,
       largestLakeVolumeKm3,
       dominantLakeAreaFraction: lakeAreaKm2 > 0 ? largestLakeAreaKm2 / lakeAreaKm2 : 0,
+      perennialLakeBodyCount: seasonalLakeBalance.perennialLakeBodyCount,
+      ephemeralLakeBodyCount: seasonalLakeBalance.ephemeralLakeBodyCount,
+      longLivedLakeBodyCount: seasonalLakeBalance.longLivedLakeBodyCount,
+      seasonallyOverflowingLakeBodyCount: seasonalLakeBalance.seasonallyOverflowingLakeBodyCount,
+      meanLakeSeasonalLevelRangeM: seasonalLakeBalance.meanLakeSeasonalLevelRangeM,
+      maximumLakeSeasonalLevelRangeM: seasonalLakeBalance.maximumLakeSeasonalLevelRangeM,
+      seasonalLakeWaterResidualKm3PerYear: seasonalLakeBalance.seasonalLakeWaterResidualKm3PerYear,
       riverSegmentCount: rivers.length,
       ...riverDiagnostics,
       riverMouthCount: riverMouths.length,

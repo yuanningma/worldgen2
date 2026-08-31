@@ -36,6 +36,7 @@ The replacement geology core is being developed separately from the current visu
 - persistent continental and oceanic crust state with age, thickness, density, provenance, uplift, rifting, and arc accretion;
 - persistent Lagrangian parcel IDs, exact Euler advection, and conservative local capacitated-flow remapping with explicit gap/overlap and transport-distance diagnostics;
 - an opt-in coupled finite-volume history where plate mixtures, fractional continental material, provenance, relief, and deformation memory cross only adjacent geodesic edges and feed back into the next tectonic step;
+- several widely separated initial crustal communities, each assembled from unequal competing terrane lobes with reserve growth capacity, so overlap no longer forces a smooth union-hull fallback and final landmass count still emerges from tectonics and flooding;
 - isostatic elevation, age-dependent ocean depth, and one area-weighted canonical sea level shared by every projection;
 - plate-aware irregular continental graph growth without a user-facing continent-count control;
 - persistent subordinate accreted terranes with unequal area hierarchy, provenance, shelf tapering, and finite-width interior sutures;
@@ -50,8 +51,10 @@ The replacement geology core is being developed separately from the current visu
 - exact scientific and smoothed presentation atlas renderers;
 - a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, spherical moisture circulation, conservative runoff, hierarchical Priority-Flood drainage, resolved river networks, bounded stream-power incision, and conservative downstream sediment transfer;
 - a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
-- shared sub-cell river junctions and basin-aware continuous lake contours that remove most process-cell facets without changing receiver topology, runoff, canonical lake area, or sediment budgets;
+- five-pass basin-spine river relaxation, multi-step shared junction tangents, and denser sub-cell channel curves that suppress triangular receiver-grid directions without changing receiver topology, runoff, or sediment budgets;
+- basin-aware continuous lake contours that remove most process-cell facets without changing canonical lake area or water budgets;
 - annual-equilibrium lake area, open-water evaporation, closed/overflowing lake classification, water-budget closure, and resolution-stable inherited lake levels;
+- deterministic monthly runoff, lake temperature, ice, storage, evaporation, and overflow cycles with perennial/ephemeral and tectonic-persistence diagnostics while the annual atmosphere remains the conserved climate backbone;
 - hybrid fill-or-breach depression evolution that lets high-discharge rivers incise bounded, lithology-aware spillways while preserving dry, cold, volcanic, and structurally resistant basins;
 - conservative land-only hillslope diffusion that redistributes exactly equal terrain volume from unstable high cells to lower neighbors, then reroutes drainage without changing canonical coast authority;
 - drainage-conditioned continuous valley relief that resolves narrow fluvial cuts below the process-cell scale while leaving process elevation, basins, lakes, and river topology unchanged;

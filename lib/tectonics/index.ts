@@ -96,7 +96,9 @@ export {
 export {
   createSurfaceProcessWorld,
   type SurfaceLithology,
+  type SurfaceLakeBasinOrigin,
   type SurfaceLakeBody,
+  type SurfaceLakeMonth,
   type SurfaceLakeRegime,
   type SurfaceMarginRegime,
   type SurfaceProcessCell,

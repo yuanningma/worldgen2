@@ -164,7 +164,7 @@ test("placement gates reject a visually dominant polar cap", () => {
 });
 
 test("visually fragmented moving snapshots fail the coastline fine-noise gate", () => {
-  const world = simulateMovingCrustSnapshot({ seed: "EPOCH-11", subdivisions: 4 }, 15);
+  const world = simulateMovingCrustSnapshot({ seed: "EPOCH-11", subdivisions: 4 }, 25);
   const report = evaluateTectonicWorld(world, {
     width: 240,
     height: 120,
