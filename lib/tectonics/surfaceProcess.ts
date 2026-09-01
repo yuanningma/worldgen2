@@ -547,6 +547,17 @@ interface PresentationDetailBand {
   readonly weight: number;
 }
 
+interface PhysicalReliefBand {
+  readonly directionA: Vec3;
+  readonly directionB: Vec3;
+  readonly directionC: Vec3;
+  readonly frequency: number;
+  readonly phaseA: number;
+  readonly phaseB: number;
+  readonly phaseC: number;
+  readonly weight: number;
+}
+
 class ElevationHeap {
   private readonly values: HeapEntry[] = [];
 
@@ -665,6 +676,68 @@ function samplePresentationDetail(
     value += sineA * sineB * band.weight;
   }
   return value;
+}
+
+/**
+ * Builds isotropic, fixed-physical-scale terrain bands for drainage-scale
+ * relief. The previous three plane waves left a visible preferred direction
+ * in broad lowlands. Several warped orientations per octave create secondary
+ * divides and valleys without moving the authoritative land/sea boundary.
+ */
+function createPhysicalReliefBands(seed: number, radiusKm: number): readonly PhysicalReliefBand[] {
+  // These bands span broad secondary divides down to tributary-scale relief.
+  // Climate aggregates them to a fixed orographic support on fine meshes;
+  // hydrology and erosion retain the full physical spectrum.
+  const wavelengthsKm = [1_500, 850, 480, 270, 150];
+  const weights = [0.31, 0.25, 0.2, 0.15, 0.09];
+  return wavelengthsKm.map((wavelengthKm, octave) => {
+    const direction = (label: string): Vec3 => randomDirection(
+      seed + octave * 17_171,
+      `drainage-relief-${label}`,
+    );
+    const phase = (label: string): number => (
+      seedHash(`${seed}:drainage-relief:${octave}:${label}`)
+        / 0x1_0000_0000 * Math.PI * 2
+    );
+    return {
+      directionA: direction("a"),
+      directionB: direction("b"),
+      directionC: direction("c"),
+      frequency: Math.PI * 2 * radiusKm / wavelengthKm,
+      phaseA: phase("a"),
+      phaseB: phase("b"),
+      phaseC: phase("c"),
+      weight: weights[octave],
+    };
+  });
+}
+
+function samplePhysicalRelief(
+  point: Vec3,
+  bands: readonly PhysicalReliefBand[],
+): { readonly noise: number; readonly ridge: number } {
+  let noise = 0;
+  let ridge = 0;
+  for (const band of bands) {
+    const argumentB = dot3(point, band.directionB) * band.frequency * 0.83 + band.phaseB;
+    const argumentC = dot3(point, band.directionC) * band.frequency * 0.61 + band.phaseC;
+    const waveB = Math.sin(argumentB);
+    const waveC = Math.sin(argumentC);
+    // Domain-warp the dominant orientation with two unrelated directions.
+    // This retains coherent valleys at each physical wavelength but avoids
+    // the sheet-like stripes produced by an unwarped sum of plane waves.
+    const argumentA = dot3(point, band.directionA) * band.frequency
+      + band.phaseA
+      + waveB * 0.92
+      + waveC * 0.43;
+    const waveA = Math.sin(argumentA);
+    const cellularCross = Math.sin(argumentB + waveC * 0.67) * Math.cos(argumentC - waveA * 0.38);
+    noise += (waveA * 0.54 + waveB * 0.24 + waveC * 0.12 + cellularCross * 0.1)
+      * band.weight;
+    ridge += (1 - Math.abs(Math.sin(argumentA + waveB * 0.31 - waveC * 0.22)))
+      * band.weight;
+  }
+  return { noise, ridge };
 }
 
 function buildAdjacency(sphere: GeodesicSphere): readonly number[][] {
@@ -1291,6 +1364,49 @@ function applyCoastalMargins(
   };
 }
 
+function climateScaleElevation(
+  cells: readonly MutableSurfaceCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  seaLevelKm: number,
+  radiusKm: number,
+): Float64Array {
+  const rawElevation = Float64Array.from(cells.map((cell) => (
+    cell.isLand ? Math.max(0, cell.elevationKm - seaLevelKm) : 0
+  )));
+  if (sphere.subdivisions <= 4) return rawElevation;
+  let elevation = new Float64Array(rawElevation);
+  const characteristicStepKm = sphere.edges.reduce(
+    (sum, edge) => sum + edge.arcLengthRadians * radiusKm,
+    0,
+  ) / Math.max(1, sphere.edges.length);
+  // Climate sees a fixed physical orographic footprint rather than every
+  // newly resolved drainage wrinkle. This is a compact subgrid-orography
+  // model: hydrology retains the full terrain, while lapse rate and moisture
+  // transport sample approximately 220 km support at every mesh density.
+  const diffusionAmount = (220 / Math.max(1, characteristicStepKm)) ** 2;
+  const passes = Math.max(1, Math.ceil(diffusionAmount / 0.45));
+  const blend = Math.min(0.45, diffusionAmount / passes);
+  for (let pass = 0; pass < passes; pass += 1) {
+    const next = new Float64Array(elevation.length);
+    for (const cell of cells) {
+      const neighbors = adjacency[cell.faceId];
+      const neighborMean = neighbors.reduce(
+        (sum, neighborId) => sum + elevation[neighborId],
+        0,
+      ) / Math.max(1, neighbors.length);
+      next[cell.faceId] = elevation[cell.faceId] * (1 - blend) + neighborMean * blend;
+    }
+    elevation = next;
+  }
+  // Preserve resolved windward barriers while suppressing only the portion
+  // of their climate response that is not stable at the coarser process mesh.
+  return Float64Array.from(
+    rawElevation,
+    (value, faceId) => value * 0.68 + elevation[faceId] * 0.32,
+  );
+}
+
 function simulateSurfaceClimate(
   cells: MutableSurfaceCell[],
   sphere: GeodesicSphere,
@@ -1311,9 +1427,13 @@ function simulateSurfaceClimate(
     0,
   ) / Math.max(1, sphere.edges.length);
   const distanceScale = characteristicStepKm / referenceTransportStepKm;
-  const elevationAboveSea = Float64Array.from(cells.map((cell) => (
-    cell.isLand ? Math.max(0, cell.elevationKm - seaLevelKm) : 0
-  )));
+  const elevationAboveSea = climateScaleElevation(
+    cells,
+    sphere,
+    adjacency,
+    seaLevelKm,
+    radiusKm,
+  );
   const humidity = new Float64Array(cells.length);
   const saturation = new Float64Array(cells.length);
   const equatorialConvection = new Float64Array(cells.length);
@@ -2989,7 +3109,7 @@ function createRiverPresentationPoints(
             ? riverBendValue(bendWave, bendWave.phaseRadians)
             : sphericalNoise(center, seed + 18_821);
           const meander = coherentBend
-            * localStep * (0.065 + hierarchy * 0.12)
+            * localStep * (0.08 + hierarchy * 0.17)
             * (1 - cells[faceId].orogenStrength * 0.62);
           smoothed = normalize3([
             smoothed[0] + lateral[0] / lateralLength * meander,
@@ -3133,7 +3253,7 @@ function createRiverPresentationPath(
   // A bend envelope tied only to the current process edge shrinks toward zero
   // as surface resolution increases. Preserve a modest physical cartographic
   // scale, still bounded by this reach and backed down by the land predicate.
-  const physicalAmplitudeKm = (7 + hierarchy * 31)
+  const physicalAmplitudeKm = (10 + hierarchy * 44)
     * (0.28 + (1 - confinement) * 0.72)
     * (0.42 + coastClearance * 0.58)
     * refinementScale;
@@ -3443,6 +3563,10 @@ export function createSurfaceProcessWorld(
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
+  const physicalReliefBands = createPhysicalReliefBands(
+    hashedSeed + 23_911,
+    tectonicWorld.recipe.radiusKm,
+  );
   const radiusSquared = tectonicWorld.recipe.radiusKm ** 2;
   const inheritedDetailLevels = hierarchyAnchor
     ? subdivisions - hierarchyAnchor.sphere.subdivisions
@@ -3484,8 +3608,9 @@ export function createSurfaceProcessWorld(
       orogeny.forelandBasinStrength,
       hashedSeed,
     );
-    const noise = sphericalNoise(face.center, hashedSeed);
-    const ridge = 1 - Math.abs(sphericalNoise(face.center, hashedSeed + 337));
+    const physicalRelief = samplePhysicalRelief(face.center, physicalReliefBands);
+    const noise = physicalRelief.noise;
+    const ridge = physicalRelief.ridge;
     const detail = refined.isLand
       ? (noise * 0.48 + (ridge - 0.5) * (0.28 + mountainEnvelope * 0.72))
         * reliefAmplitudeKm

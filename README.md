@@ -38,6 +38,7 @@ The replacement geology core is being developed separately from the current visu
 - an opt-in coupled finite-volume history where plate mixtures, fractional continental material, provenance, relief, and deformation memory cross only adjacent geodesic edges and feed back into the next tectonic step;
 - five to seven irregularly spaced primordial crustal communities, each assembled from unequal competing terrane lobes; fronts from one community may suture while fronts from different communities retain oceanic separators, so the initializer neither packs identical continents nor welds every source into one union hull;
 - persistence-, speed-, continuity-, and ocean-connection-gated rifting that distinguishes shallow failed rifts from mature breakup corridors while retaining old-craton resistance;
+- production-tier canonical shoreline shaping confined to the first four coastal control rings, with fixed-physical-scale rift embayments, terrane capes, and collision-supported promontories solved before the global ocean quantile; coarse subdivision-3 worlds remain unchanged because those features are not resolved there;
 - isostatic elevation, age-dependent ocean depth, and one area-weighted canonical sea level shared by every projection;
 - plate-aware irregular continental graph growth without a user-facing continent-count control;
 - persistent subordinate accreted terranes with unequal area hierarchy, provenance, shelf tapering, and finite-width interior sutures;
@@ -51,9 +52,10 @@ The replacement geology core is being developed separately from the current visu
 - deterministic multi-seed evaluation and accepted-only ranking;
 - exact scientific and smoothed presentation atlas renderers;
 - a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, spherical moisture circulation, conservative runoff, hierarchical Priority-Flood drainage, resolved river networks, bounded stream-power incision, and conservative downstream sediment transfer;
+- isotropic domain-warped drainage relief at roughly 150–1,500 km wavelengths, replacing the preferred directions of the former three-wave terrain signal; hydrology and erosion retain the full field while fine climate meshes use a fixed ~220 km subgrid-orography footprint;
 - land-to-land drainage inheritance across nested grids, with a refined-strait fallback only when no fine land crossing exists, so coastline detail cannot silently capture or discard an entire canonical watershed;
 - a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
-- shared-junction river relaxation plus basin-coherent 110-650 km bend wavelengths integrated along each receiver chain, so channel curves no longer force one synthetic oscillation into every triangular process edge while receiver topology and water/sediment budgets remain unchanged;
+- shared-junction river relaxation plus basin-coherent 110–650 km bend wavelengths integrated along each receiver chain, with stronger kilometre-preserving lowland bends that no longer force one synthetic oscillation into every triangular process edge while receiver topology and water/sediment budgets remain unchanged;
 - basin-aware continuous lake contours that remove most process-cell facets without changing canonical lake area or water budgets;
 - annual-equilibrium lake area, open-water evaporation, closed/overflowing lake classification, water-budget closure, and resolution-stable inherited lake levels;
 - deterministic monthly runoff, lake temperature, ice, storage, evaporation, and overflow cycles with perennial/ephemeral and tectonic-persistence diagnostics while the annual atmosphere remains the conserved climate backbone;

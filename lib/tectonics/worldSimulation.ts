@@ -937,6 +937,92 @@ function baseElevation(cell: MutableCell): number {
   return -2.45 - cooling + plateau + cell.tectonicReliefKm + cell.roughnessKm;
 }
 
+function physicalShorelineNoise(point: Vec3, seed: number, radiusKm: number): number {
+  const [x, y, z] = point;
+  const physicalScale = Math.max(0.2, Math.min(7.85, radiusKm / 6_371));
+  return (
+    Math.sin((x * 5.31 + y * 2.17 - z * 3.73) * physicalScale + seed * 0.011) * 0.42
+    + Math.sin((x * 11.7 - y * 7.13 + z * 4.91) * physicalScale + seed * 0.027) * 0.29
+    + Math.cos((x * 23.1 + y * 17.3 - z * 13.1) * physicalScale + seed * 0.043) * 0.19
+    + Math.sin((x * 41.3 - y * 31.7 + z * 29.9) * physicalScale + seed * 0.071) * 0.1
+  );
+}
+
+/**
+ * Adds tectonically inherited, intermediate-scale shoreline structure before
+ * the target ocean quantile is solved. Only the first few cells beside the
+ * preliminary coast participate, so this can form broad bays, capes, and rift
+ * reentrants without punching arbitrary inland seas through a continent.
+ */
+function shapeCanonicalShoreline(
+  structuralElevations: readonly number[],
+  cells: readonly MutableCell[],
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  recipe: TectonicWorldRecipe,
+): number[] {
+  const preliminarySeaLevelKm = areaWeightedQuantile(
+    structuralElevations,
+    sphere,
+    recipe.oceanFraction,
+  );
+  const preliminaryLand = Uint8Array.from(
+    structuralElevations,
+    (elevationKm) => elevationKm >= preliminarySeaLevelKm ? 1 : 0,
+  );
+  const coastRings = new Int8Array(cells.length).fill(-1);
+  const queue: number[] = [];
+  for (const face of sphere.faces) {
+    if (!adjacency[face.id].some((neighborId) => (
+      preliminaryLand[neighborId] !== preliminaryLand[face.id]
+    ))) continue;
+    coastRings[face.id] = 0;
+    queue.push(face.id);
+  }
+  for (let cursor = 0; cursor < queue.length; cursor += 1) {
+    const faceId = queue[cursor];
+    const nextRing = coastRings[faceId] + 1;
+    if (nextRing > 4) continue;
+    for (const neighborId of adjacency[faceId]) {
+      if (coastRings[neighborId] >= 0
+        || preliminaryLand[neighborId] !== preliminaryLand[faceId]) continue;
+      coastRings[neighborId] = nextRing;
+      queue.push(neighborId);
+    }
+  }
+
+  const seed = seedHashNumber(`${recipe.seed}:canonical-shoreline`);
+  // At subdivision 3 an 800 km cape is only a couple of control cells wide;
+  // applying the full spectrum there creates one-cell necks rather than
+  // resolved morphology. Ramp to full strength at subdivision 4, the current
+  // production tectonic tier.
+  const resolutionSupport = Math.max(0, Math.min(1, sphere.subdivisions - 3));
+  return structuralElevations.map((elevationKm, faceId) => {
+    const ring = coastRings[faceId];
+    if (ring < 0 || ring > 4) return elevationKm;
+    const cell = cells[faceId];
+    const continentalSupport = Math.max(0, Math.min(1, cell.continentalFraction));
+    if (continentalSupport < 0.08) return elevationKm;
+    const distanceFade = (1 - ring / 5) ** 1.35;
+    const seaLevelDistanceKm = Math.abs(elevationKm - preliminarySeaLevelKm);
+    const verticalSupport = Math.exp(-((seaLevelDistanceKm / 1.15) ** 2));
+    const point = sphere.faces[faceId].center;
+    const broad = physicalShorelineNoise(point, seed, recipe.radiusKm);
+    const detail = physicalShorelineNoise(point, seed + 91_127, recipe.radiusKm);
+    const rift = Math.max(0, Math.min(1, cell.riftExposureMyr / 115));
+    const collision = Math.max(0, Math.min(1, cell.convergenceExposureMyr / 190));
+    const riftEmbayment = rift * (0.08 + Math.max(0, -detail) * 0.13);
+    const collisionalPromontory = collision * Math.max(0, broad) * 0.08;
+    const morphologyKm = (
+      broad * 0.34
+      + detail * 0.13
+      - riftEmbayment
+      + collisionalPromontory
+    ) * distanceFade * verticalSupport * (0.55 + continentalSupport * 0.45);
+    return elevationKm + morphologyKm * resolutionSupport;
+  });
+}
+
 function areaWeightedQuantile(
   values: readonly number[],
   sphere: GeodesicSphere,
@@ -1537,7 +1623,13 @@ export function simulateTectonicWorld(
     elapsedMyr += timestepMyr;
   }
 
-  const rawElevations = cells.map(baseElevation);
+  const rawElevations = shapeCanonicalShoreline(
+    cells.map(baseElevation),
+    cells,
+    sphere,
+    adjacency,
+    recipe,
+  );
   const seaLevelKm = areaWeightedQuantile(rawElevations, sphere, recipe.oceanFraction);
   const elevations = resolveSubgridBasins(rawElevations, seaLevelKm, sphere, adjacency);
   const finalCells: WorldCellState[] = cells.map((cell, faceId) => {
@@ -1808,7 +1900,13 @@ export function simulateCoupledTectonicWorld(
     completedSteps += 1;
   }
 
-  const rawElevations = cells.map(baseElevation);
+  const rawElevations = shapeCanonicalShoreline(
+    cells.map(baseElevation),
+    cells,
+    sphere,
+    adjacency,
+    recipe,
+  );
   const seaLevelKm = areaWeightedQuantile(rawElevations, sphere, recipe.oceanFraction);
   const elevations = resolveSubgridBasins(rawElevations, seaLevelKm, sphere, adjacency);
   const finalCells: WorldCellState[] = cells.map((cell, faceId) => {
