@@ -1451,7 +1451,13 @@ function simulateSurfaceClimate(
     temperatureAreaSum += cell.temperatureC * area;
     seasonalRangeAreaSum += cell.seasonalTemperatureRangeC * area;
     precipitationAreaSum += precipitation * area;
-    if (cell.aridityIndex < 0.75) aridArea += area;
+    // Report threshold cover with a narrow fractional transition. The physical
+    // aridity field and biome thresholds remain unchanged, but a cell moving
+    // from 0.749 to 0.751 under refinement no longer flips its entire area in
+    // this resolution-convergence diagnostic.
+    const aridMembershipLinear = clamp((0.82 - cell.aridityIndex) / 0.14);
+    const aridMembership = aridMembershipLinear ** 2 * (3 - 2 * aridMembershipLinear);
+    aridArea += area * aridMembership;
     if (cell.aridityIndex > 1.4) humidArea += area;
   }
   return {
@@ -1521,15 +1527,17 @@ function routeSurfaceHydrology(
     for (const cell of cells) {
       const anchorId = anchorIdOf(cell.faceId);
       membersByAnchor[anchorId].push(cell.faceId);
-      if (!cell.isLand) freeAnchor[anchorId] = 1;
     }
     for (const anchorCell of hierarchyAnchor.cells) {
       if (!anchorCell.isLand) freeAnchor[anchorCell.faceId] = 1;
     }
 
-    // Coastal and ocean-parent detail is allowed to find the nearest resolved
-    // ocean freely. Inland parent faces are handled below against the stable
-    // anchor receiver graph.
+    // Only canonical ocean parents route freely. A refined ocean child inside
+    // a canonical land parent must not release the parent's remaining land
+    // children from the inherited basin: doing so lets coastline detail capture
+    // an entire major watershed and makes basin area resolution-dependent.
+    // Canonical land parents, including coastal ones, are handled below against
+    // the stable anchor receiver graph.
     for (let entry = heap.pop(); entry; entry = heap.pop()) {
       for (const neighborId of adjacency[entry.faceId]) {
         if (visited[neighborId] !== 0 || freeAnchor[anchorIdOf(neighborId)] === 0) continue;
@@ -1578,8 +1586,11 @@ function routeSurfaceHydrology(
       let exitPriority = Infinity;
       for (const faceId of membersByAnchor[anchorCell.faceId]) {
         const source = cells[faceId];
+        if (!source.isLand || visited[faceId] !== 0) continue;
         for (const neighborId of adjacency[faceId]) {
-          if (anchorIdOf(neighborId) !== receiverAnchorId || visited[neighborId] === 0) continue;
+          if (anchorIdOf(neighborId) !== receiverAnchorId
+            || visited[neighborId] === 0
+            || (hierarchyAnchor.cells[receiverAnchorId].isLand && !cells[neighborId].isLand)) continue;
           const priority = Math.max(source.elevationKm, cells[neighborId].filledElevationKm + epsilonKm);
           if (priority < exitPriority
             || (priority === exitPriority && (faceId < exitFaceId
@@ -1587,6 +1598,50 @@ function routeSurfaceHydrology(
             exitFaceId = faceId;
             exitReceiverId = neighborId;
             exitPriority = priority;
+          }
+        }
+      }
+      if (exitFaceId < 0 && hierarchyAnchor.cells[receiverAnchorId].isLand) {
+        // A refined strait can remove every land-to-land descendant crossing
+        // along an edge that was land-connected on the coarser anchor. Only in
+        // that geometric case may the inherited reach terminate on the newly
+        // resolved water instead of making the hierarchy unsatisfiable.
+        for (const faceId of membersByAnchor[anchorCell.faceId]) {
+          const source = cells[faceId];
+          if (!source.isLand || visited[faceId] !== 0) continue;
+          for (const neighborId of adjacency[faceId]) {
+            if (anchorIdOf(neighborId) !== receiverAnchorId || visited[neighborId] === 0) continue;
+            const priority = Math.max(source.elevationKm, cells[neighborId].filledElevationKm + epsilonKm);
+            if (priority < exitPriority
+              || (priority === exitPriority && (faceId < exitFaceId
+                || (faceId === exitFaceId && neighborId < exitReceiverId)))) {
+              exitFaceId = faceId;
+              exitReceiverId = neighborId;
+              exitPriority = priority;
+            }
+          }
+        }
+      }
+      if (exitFaceId < 0) {
+        // The source coarse cell itself can be split by a finer strait, leaving
+        // no land descendant on its inherited receiver edge. Route the stranded
+        // fine land component to adjacent resolved water inside that source
+        // parent; this is the fine-grid expression of the severed coarse reach.
+        for (const faceId of membersByAnchor[anchorCell.faceId]) {
+          const source = cells[faceId];
+          if (!source.isLand || visited[faceId] !== 0) continue;
+          for (const neighborId of adjacency[faceId]) {
+            if (anchorIdOf(neighborId) !== anchorCell.faceId
+              || visited[neighborId] === 0
+              || cells[neighborId].isLand) continue;
+            const priority = Math.max(source.elevationKm, cells[neighborId].filledElevationKm + epsilonKm);
+            if (priority < exitPriority
+              || (priority === exitPriority && (faceId < exitFaceId
+                || (faceId === exitFaceId && neighborId < exitReceiverId)))) {
+              exitFaceId = faceId;
+              exitReceiverId = neighborId;
+              exitPriority = priority;
+            }
           }
         }
       }
@@ -2832,12 +2887,34 @@ function diffuseHillslopes(
   };
 }
 
+interface RiverBendWave {
+  /** Coherent phase measured from this node downstream through its basin. */
+  readonly phaseRadians: number;
+  /** Local downstream phase change per kilometre. */
+  readonly radiansPerKm: number;
+  /** Basin-specific offsets keep bends from repeating as a regular sine. */
+  readonly secondaryPhaseRadians: number;
+  readonly tertiaryPhaseRadians: number;
+}
+
+function riverBendValue(wave: RiverBendWave, phaseRadians: number): number {
+  return (
+    Math.sin(phaseRadians)
+      + Math.sin(phaseRadians * 0.57 + wave.secondaryPhaseRadians) * 0.34
+      + Math.sin(phaseRadians * 0.23 + wave.tertiaryPhaseRadians) * 0.16
+  ) / 1.5;
+}
+
 function createRiverPresentationPoints(
   cells: readonly MutableSurfaceCell[],
   sphere: GeodesicSphere,
   adjacency: readonly number[][],
   riverFaceIds: ReadonlySet<number>,
   seed: number,
+  bendWaves: ReadonlyMap<number, RiverBendWave>,
+  minimumRiverAreaKm2: number,
+  maximumRiverAreaKm2: number,
+  isLandAt: (point: Vec3) => boolean,
 ): ReadonlyMap<number, Vec3> {
   const nodeIds = new Set<number>();
   const dominantIncoming = new Map<number, number>();
@@ -2903,9 +2980,17 @@ function createRiverPresentationPoints(
             minimum,
             Math.acos(clamp(dot3(center, sphere.faces[neighborId].center), -1, 1)),
           ), Infinity);
-          const meander = sphericalNoise(center, seed + 18_821)
-            * localStep * 0.11
-            * (1 - cells[faceId].orogenStrength * 0.45);
+          const hierarchy = Math.max(0, Math.min(1,
+            Math.log(Math.max(1, cells[faceId].drainageAreaKm2 / minimumRiverAreaKm2))
+              / Math.log(Math.max(2, maximumRiverAreaKm2 / minimumRiverAreaKm2)),
+          ));
+          const bendWave = bendWaves.get(faceId);
+          const coherentBend = bendWave
+            ? riverBendValue(bendWave, bendWave.phaseRadians)
+            : sphericalNoise(center, seed + 18_821);
+          const meander = coherentBend
+            * localStep * (0.065 + hierarchy * 0.12)
+            * (1 - cells[faceId].orogenStrength * 0.62);
           smoothed = normalize3([
             smoothed[0] + lateral[0] / lateralLength * meander,
             smoothed[1] + lateral[1] / lateralLength * meander,
@@ -2926,6 +3011,25 @@ function createRiverPresentationPoints(
           center[1] * (1 - amount) + smoothed[1] * amount,
           center[2] * (1 - amount) + smoothed[2] * amount,
         ]);
+      }
+      if (cells[faceId].isLand && !cells[faceId].isLake && !isLandAt(smoothed)) {
+        // A strongly displaced shared junction can cross a refined coastline
+        // even while its canonical face remains land. Back it toward the face
+        // center so every adjoining reach inherits the same valid land node.
+        let amount = 0.5;
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          const candidate = normalize3([
+            center[0] * (1 - amount) + smoothed[0] * amount,
+            center[1] * (1 - amount) + smoothed[1] * amount,
+            center[2] * (1 - amount) + smoothed[2] * amount,
+          ]);
+          if (isLandAt(candidate)) {
+            smoothed = candidate;
+            break;
+          }
+          amount *= 0.5;
+        }
+        if (!isLandAt(smoothed)) smoothed = center;
       }
       next.set(faceId, smoothed);
     }
@@ -3003,7 +3107,7 @@ function createRiverPresentationPath(
   radiusKm: number,
   minimumRiverAreaKm2: number,
   maximumRiverAreaKm2: number,
-  channelPhase: number,
+  bendWave: RiverBendWave,
   refinementScale: number,
   isLandAt: (point: Vec3) => boolean,
 ): { readonly path: readonly Vec3[]; readonly confinement: number; readonly meanderAmplitudeKm: number } {
@@ -3022,10 +3126,21 @@ function createRiverPresentationPath(
       + source.erosionResistance * 0.11,
   );
   const coastClearance = clamp((Math.min(source.coastDistanceKm, receiver.coastDistanceKm) - 12) / 180);
-  let meanderAmplitudeRadians = segmentRadians
+  const meshRelativeAmplitudeRadians = segmentRadians
     * clamp(0.025 + (1 - confinement) * (0.07 + hierarchy * 0.145), 0, 0.24)
     * (0.38 + coastClearance * 0.62)
     * refinementScale;
+  // A bend envelope tied only to the current process edge shrinks toward zero
+  // as surface resolution increases. Preserve a modest physical cartographic
+  // scale, still bounded by this reach and backed down by the land predicate.
+  const physicalAmplitudeKm = (7 + hierarchy * 31)
+    * (0.28 + (1 - confinement) * 0.72)
+    * (0.42 + coastClearance * 0.58)
+    * refinementScale;
+  let meanderAmplitudeRadians = Math.min(
+    segmentRadians * 0.42,
+    Math.max(meshRelativeAmplitudeRadians, physicalAmplitudeKm / radiusKm),
+  );
   if (meanderAmplitudeRadians <= 1e-12 || segmentRadians <= 1e-10) {
     return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
   }
@@ -3034,7 +3149,14 @@ function createRiverPresentationPath(
     return { path: [fromPoint, toPoint], confinement, meanderAmplitudeKm: 0 };
   }
   const lateral = normalize3(lateralRaw);
-  const pointCount = hierarchy > 0.62 ? 11 : 7;
+  const phaseAdvance = Math.min(Math.PI * 2.5, segmentKm * bendWave.radiansPerKm);
+  const pointCount = Math.min(17, Math.max(
+    7,
+    7 + Math.ceil(phaseAdvance / Math.PI) * 2 + (hierarchy > 0.62 ? 2 : 0),
+  ));
+  const waveAt = (phase: number): number => riverBendValue(bendWave, phase);
+  const startWave = waveAt(bendWave.phaseRadians);
+  const endWave = waveAt(bendWave.phaseRadians - phaseAdvance);
   const buildPath = (amplitudeRadians: number, tangentScale: number): Vec3[] => {
     const path: Vec3[] = [];
     for (let index = 0; index < pointCount; index += 1) {
@@ -3062,10 +3184,15 @@ function createRiverPresentationPath(
         fromPoint[2] * h00 + (fromTangent?.[2] ?? 0) * tangentLength * h10
           + toPoint[2] * h01 + (toTangent?.[2] ?? 0) * tangentLength * h11,
       ]);
-      const envelope = Math.sin(Math.PI * progress) ** 2;
-      const bend = Math.sin(Math.PI * 2 * progress + channelPhase)
-        + Math.sin(Math.PI * 4 * progress - channelPhase * 0.47) * 0.28;
-      const offset = amplitudeRadians * envelope * bend / 1.28;
+      // Evaluate a physical-distance wavelength shared by the whole drainage
+      // chain. Removing the linear endpoint chord keeps adjacent segments
+      // joined at exactly the same node without forcing one oscillation into
+      // every triangular process edge.
+      const wave = waveAt(bendWave.phaseRadians - phaseAdvance * progress);
+      const endpointChord = startWave * (1 - progress) + endWave * progress;
+      const bend = wave - endpointChord;
+      const envelope = Math.sin(Math.PI * progress) ** 0.55;
+      const offset = amplitudeRadians * envelope * bend * 1.45;
       path.push(normalize3([
         base[0] + lateral[0] * offset,
         base[1] + lateral[1] * offset,
@@ -3076,7 +3203,7 @@ function createRiverPresentationPath(
   };
   let tangentScale = 0.46;
   let path = buildPath(meanderAmplitudeRadians, tangentScale);
-  for (let attempt = 0; attempt < 4 && path.slice(1, -1).some((point) => !isLandAt(point)); attempt += 1) {
+  for (let attempt = 0; attempt < 8 && path.slice(1, -1).some((point) => !isLandAt(point)); attempt += 1) {
     meanderAmplitudeRadians *= 0.5;
     tangentScale *= 0.7;
     path = buildPath(meanderAmplitudeRadians, tangentScale);
@@ -3088,44 +3215,87 @@ function createRiverPresentationPath(
   };
 }
 
-function createRiverBasinPhases(
+function createRiverBendWaves(
   cells: readonly MutableSurfaceCell[],
+  sphere: GeodesicSphere,
   riverCells: readonly MutableSurfaceCell[],
   minimumRiverAreaKm2: number,
+  maximumRiverAreaKm2: number,
+  radiusKm: number,
   seed: number,
-): ReadonlyMap<number, number> {
+): ReadonlyMap<number, RiverBendWave> {
   const terminalByFaceId = new Map<number, number>();
-  const terminalFor = (startFaceId: number): number => {
-    const visited: number[] = [];
+  const phaseToOutletByFaceId = new Map<number, number>();
+  const wavenumberFor = (faceId: number): number => {
+    const cell = cells[faceId];
+    const hierarchy = Math.max(0, Math.min(1,
+      Math.log(Math.max(1, cell.drainageAreaKm2 / minimumRiverAreaKm2))
+        / Math.log(Math.max(2, maximumRiverAreaKm2 / minimumRiverAreaKm2)),
+    ));
+    // Wavelength grows continuously from tributaries to trunk rivers instead
+    // of inheriting the icosphere edge length. The values are cartographic
+    // centerline scales; canonical discharge and receivers remain unchanged.
+    const wavelengthKm = 110 + hierarchy * 540;
+    return Math.PI * 2 / wavelengthKm;
+  };
+  const resolve = (startFaceId: number): { terminalId: number; phaseToOutlet: number } => {
+    const path: Array<{ faceId: number; phaseAdvance: number }> = [];
     let faceId = startFaceId;
     const seen = new Set<number>();
+    let terminalId = faceId;
+    let phaseToOutlet = 0;
     while (true) {
-      const memoized = terminalByFaceId.get(faceId);
-      if (memoized !== undefined) {
-        for (const visitedId of visited) terminalByFaceId.set(visitedId, memoized);
-        return memoized;
+      const memoizedTerminal = terminalByFaceId.get(faceId);
+      const memoizedPhase = phaseToOutletByFaceId.get(faceId);
+      if (memoizedTerminal !== undefined && memoizedPhase !== undefined) {
+        terminalId = memoizedTerminal;
+        phaseToOutlet = memoizedPhase;
+        break;
       }
       if (seen.has(faceId)) {
-        for (const visitedId of visited) terminalByFaceId.set(visitedId, faceId);
-        return faceId;
+        terminalId = faceId;
+        phaseToOutlet = 0;
+        break;
       }
       seen.add(faceId);
-      visited.push(faceId);
       const receiverId = cells[faceId].receiverFaceId;
+      if (receiverId !== null) {
+        const segmentKm = Math.acos(Math.max(-1, Math.min(1,
+          dot3(sphere.faces[faceId].center, sphere.faces[receiverId].center),
+        ))) * radiusKm;
+        path.push({ faceId, phaseAdvance: segmentKm * wavenumberFor(faceId) });
+      }
       if (receiverId === null || !cells[receiverId].isLand || cells[receiverId].isLake) {
-        const terminalId = receiverId ?? faceId;
-        for (const visitedId of visited) terminalByFaceId.set(visitedId, terminalId);
-        return terminalId;
+        terminalId = receiverId ?? faceId;
+        phaseToOutlet = 0;
+        break;
       }
       faceId = receiverId;
     }
+    for (let index = path.length - 1; index >= 0; index -= 1) {
+      phaseToOutlet += path[index].phaseAdvance;
+      terminalByFaceId.set(path[index].faceId, terminalId);
+      phaseToOutletByFaceId.set(path[index].faceId, phaseToOutlet);
+    }
+    return {
+      terminalId: terminalByFaceId.get(startFaceId) ?? terminalId,
+      phaseToOutlet: phaseToOutletByFaceId.get(startFaceId) ?? phaseToOutlet,
+    };
   };
   return new Map(riverCells.map((cell) => {
-    const terminalId = terminalFor(cell.faceId);
-    const basinPhase = seedHash(`${seed}:channel-basin:${terminalId}`)
+    const resolved = resolve(cell.faceId);
+    const basinPhase = seedHash(`${seed}:channel-basin:${resolved.terminalId}`)
       / 0x1_0000_0000 * Math.PI * 2;
-    const downstreamProgress = Math.log1p(cell.drainageAreaKm2 / minimumRiverAreaKm2) * 0.73;
-    return [cell.faceId, basinPhase + downstreamProgress] as const;
+    const secondaryPhaseRadians = seedHash(`${seed}:channel-secondary:${resolved.terminalId}`)
+      / 0x1_0000_0000 * Math.PI * 2;
+    const tertiaryPhaseRadians = seedHash(`${seed}:channel-tertiary:${resolved.terminalId}`)
+      / 0x1_0000_0000 * Math.PI * 2;
+    return [cell.faceId, {
+      phaseRadians: basinPhase + resolved.phaseToOutlet,
+      radiansPerKm: wavenumberFor(cell.faceId),
+      secondaryPhaseRadians,
+      tertiaryPhaseRadians,
+    }] as const;
   }));
 }
 
@@ -3588,28 +3758,35 @@ export function createSurfaceProcessWorld(
     && cell.dischargeKm3PerYear > 1e-12
     && (!cell.isLake || lakeBalance.overflowOutletFaceIds.has(cell.faceId)));
   const riverFaceIds = new Set(riverCells.map((cell) => cell.faceId));
+  const maximumResolvedRiverAreaKm2 = riverCells.reduce(
+    (maximum, cell) => Math.max(maximum, cell.drainageAreaKm2),
+    minimumRiverAreaKm2,
+  );
+  const riverBendWaves = createRiverBendWaves(
+    cells,
+    sphere,
+    riverCells,
+    minimumRiverAreaKm2,
+    maximumResolvedRiverAreaKm2,
+    tectonicWorld.recipe.radiusKm,
+    hashedSeed,
+  );
   const riverPresentationPoints = createRiverPresentationPoints(
     cells,
     sphere,
     adjacency,
     riverFaceIds,
     hashedSeed,
+    riverBendWaves,
+    minimumRiverAreaKm2,
+    maximumResolvedRiverAreaKm2,
+    (point) => refinement.sample(point).isLand,
   );
   const riverPresentationTangents = createRiverPresentationTangents(
     cells,
     sphere,
     riverFaceIds,
     riverPresentationPoints,
-  );
-  const maximumResolvedRiverAreaKm2 = riverCells.reduce(
-    (maximum, cell) => Math.max(maximum, cell.drainageAreaKm2),
-    minimumRiverAreaKm2,
-  );
-  const riverBasinPhases = createRiverBasinPhases(
-    cells,
-    riverCells,
-    minimumRiverAreaKm2,
-    hashedSeed,
   );
   const boundaryVerticesByPair = new Map<string, readonly [Vec3, Vec3]>();
   for (const edge of sphere.edges) {
@@ -3645,7 +3822,12 @@ export function createSurfaceProcessWorld(
       tectonicWorld.recipe.radiusKm,
       minimumRiverAreaKm2,
       maximumResolvedRiverAreaKm2,
-      riverBasinPhases.get(cell.faceId) ?? 0,
+      riverBendWaves.get(cell.faceId) ?? {
+        phaseRadians: 0,
+        radiansPerKm: 0,
+        secondaryPhaseRadians: 0,
+        tertiaryPhaseRadians: 0,
+      },
       channelRefinementScale,
       (point) => refinement.sample(point).isLand,
     );

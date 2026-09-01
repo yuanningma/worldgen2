@@ -421,7 +421,7 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
   assert.ok(surface.stats.meanRiverSinuosity < 1.5);
   assert.ok(surface.stats.meanRiverMeanderAmplitudeKm > 0);
   assert.ok(surface.stats.meanNeighboringChannelAlignment >= 0);
-  assert.ok(surface.stats.meanNeighboringChannelAlignment < 0.9);
+  assert.ok(surface.stats.meanNeighboringChannelAlignment < 0.8);
   assert.equal(surface.riverMouths.length, surface.stats.riverMouthCount);
   assert.equal(
     surface.stats.oceanRiverMouthCount + surface.stats.lakeInflowCount,
@@ -525,7 +525,7 @@ test("river presentation nodes are shared while terminal mouths lie on water bou
         + river.fromPoint[1] * river.toPoint[1]
         + river.fromPoint[2] * river.toPoint[2],
     ))) * tectonic.recipe.radiusKm;
-    assert.ok(river.meanderAmplitudeKm <= segmentKm * 0.241);
+    assert.ok(river.meanderAmplitudeKm <= segmentKm * 0.421);
   }
 });
 

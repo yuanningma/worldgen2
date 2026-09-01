@@ -7,6 +7,7 @@ import {
 } from "../lib/evaluation/index.ts";
 import {
   createGeodesicSphere,
+  simulateCoupledTectonicWorld,
   simulateMovingCrustSnapshot,
   simulateTectonicWorld,
 } from "../lib/tectonics/index.ts";
@@ -83,6 +84,27 @@ test("multi-seed acceptance reports and ranking are deterministic", () => {
   for (let index = 1; index < first.length; index += 1) {
     assert.ok(first[index - 1].selectionScore >= first[index].selectionScore);
   }
+});
+
+test("coupled reference ensemble retains multiple compact continental systems", () => {
+  const reports = ["primeval-atlas-7", "EPOCH-11", "ATLAS-A"].map((seed) =>
+    evaluateTectonicWorld(simulateCoupledTectonicWorld({
+      seed,
+      subdivisions: 3,
+      plateCount: 14,
+      historyMyr: 120,
+      timestepMyr: 2,
+      oceanFraction: 0.68,
+    }), {
+      width: 240,
+      height: 120,
+      morphology: { scalesKm: [800, 1_200, 1_800] },
+    }));
+  assert.ok(reports.every((report) => report.accepted), reports
+    .flatMap((report) => report.hardFailures.map((failure) => `${report.seed}: ${failure}`))
+    .join("\n"));
+  assert.ok(reports.every((report) => report.morphology.majorComponentCount >= 3));
+  assert.ok(reports.every((report) => report.morphology.maximumMajorElongation < 3));
 });
 
 test("evaluation rejects incomplete or duplicate canonical face data", () => {

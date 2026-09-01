@@ -166,6 +166,23 @@ test("coupled finite-volume transport is local, closed, and preserves fractional
   }
 });
 
+test("persistent connected extension produces failed rifts before mature breakup", () => {
+  const recipe = { ...RECIPE, timestepMyr: 2 };
+  const young = simulateCoupledTectonicWorld({ ...recipe, historyMyr: 18 });
+  const mature = simulateCoupledTectonicWorld({ ...recipe, historyMyr: 180 });
+  const youngMaximumExposure = Math.max(...young.cells.map((cell) => cell.riftExposureMyr));
+  const matureMaximumExposure = Math.max(...mature.cells.map((cell) => cell.riftExposureMyr));
+  const matureRiftCells = mature.cells.filter((cell) => cell.riftExposureMyr >= 56);
+  const brokenRiftCells = matureRiftCells.filter((cell) => cell.continentalFraction < 0.5);
+  const failedRiftCells = mature.cells.filter((cell) =>
+    cell.riftExposureMyr >= 18 && cell.continentalFraction >= 0.5);
+  assert.ok(youngMaximumExposure < 18);
+  assert.ok(matureMaximumExposure > youngMaximumExposure * 5);
+  assert.ok(matureRiftCells.length > 0);
+  assert.ok(brokenRiftCells.length > 0);
+  assert.ok(failedRiftCells.length > 0);
+});
+
 test("coupled history rejects timesteps too long for its explicit transport scheme", () => {
   assert.throws(
     () => simulateCoupledTectonicWorld({ ...RECIPE, timestepMyr: 5 }),

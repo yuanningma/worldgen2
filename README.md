@@ -36,7 +36,8 @@ The replacement geology core is being developed separately from the current visu
 - persistent continental and oceanic crust state with age, thickness, density, provenance, uplift, rifting, and arc accretion;
 - persistent Lagrangian parcel IDs, exact Euler advection, and conservative local capacitated-flow remapping with explicit gap/overlap and transport-distance diagnostics;
 - an opt-in coupled finite-volume history where plate mixtures, fractional continental material, provenance, relief, and deformation memory cross only adjacent geodesic edges and feed back into the next tectonic step;
-- several widely separated initial crustal communities, each assembled from unequal competing terrane lobes with reserve growth capacity, so overlap no longer forces a smooth union-hull fallback and final landmass count still emerges from tectonics and flooding;
+- five to seven irregularly spaced primordial crustal communities, each assembled from unequal competing terrane lobes; fronts from one community may suture while fronts from different communities retain oceanic separators, so the initializer neither packs identical continents nor welds every source into one union hull;
+- persistence-, speed-, continuity-, and ocean-connection-gated rifting that distinguishes shallow failed rifts from mature breakup corridors while retaining old-craton resistance;
 - isostatic elevation, age-dependent ocean depth, and one area-weighted canonical sea level shared by every projection;
 - plate-aware irregular continental graph growth without a user-facing continent-count control;
 - persistent subordinate accreted terranes with unequal area hierarchy, provenance, shelf tapering, and finite-width interior sutures;
@@ -50,8 +51,9 @@ The replacement geology core is being developed separately from the current visu
 - deterministic multi-seed evaluation and accepted-only ranking;
 - exact scientific and smoothed presentation atlas renderers;
 - a persistent nested geodesic surface-process grid with topology-safe coast refinement, geology-conditioned relief, spherical moisture circulation, conservative runoff, hierarchical Priority-Flood drainage, resolved river networks, bounded stream-power incision, and conservative downstream sediment transfer;
+- land-to-land drainage inheritance across nested grids, with a refined-strait fallback only when no fine land crossing exists, so coastline detail cannot silently capture or discard an entire canonical watershed;
 - a resolution-independent presentation sampler that continuously blends same-surface elevation, climate, bathymetry, and terrain gradients while preserving the canonical spherical coast at every raster size;
-- five-pass basin-spine river relaxation, multi-step shared junction tangents, and denser sub-cell channel curves that suppress triangular receiver-grid directions without changing receiver topology, runoff, or sediment budgets;
+- shared-junction river relaxation plus basin-coherent 110-650 km bend wavelengths integrated along each receiver chain, so channel curves no longer force one synthetic oscillation into every triangular process edge while receiver topology and water/sediment budgets remain unchanged;
 - basin-aware continuous lake contours that remove most process-cell facets without changing canonical lake area or water budgets;
 - annual-equilibrium lake area, open-water evaporation, closed/overflowing lake classification, water-budget closure, and resolution-stable inherited lake levels;
 - deterministic monthly runoff, lake temperature, ice, storage, evaporation, and overflow cycles with perennial/ephemeral and tectonic-persistence diagnostics while the annual atmosphere remains the conserved climate backbone;

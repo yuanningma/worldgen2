@@ -340,30 +340,48 @@ function continentalGraphRegions(
     }
   }
 
-  // Seed several widely separated crustal communities, then let subordinate
-  // terranes cluster around them. These are initial material provinces rather
-  // than requested final continents; rifting, collision, and flooding remain
-  // free to merge or split them during the simulated history.
-  const communityCount = 3 + random.integer(0, 3);
+  // Seed several crustal communities around a deliberately uneven primordial
+  // assembly. A weak open-ocean pole leaves one broad hemisphere underseeded,
+  // while a sampled preferred separation avoids both a regular spherical
+  // packing and a single supercontinent. These are material provinces rather
+  // than requested final continents; rifting, collision, and flooding still
+  // determine the emerged components.
+  const communityCount = Math.min(plates.length, 5 + random.integer(0, 3));
+  const openOceanPole = randomUnitVector(random);
   const roots: number[] = [];
   while (roots.length < communityCount) {
+    const preferredSeparation = random.range(0.27, 0.54);
     const candidates = plates
       .filter((plate) => !roots.includes(plate.id))
       .map((plate) => {
         const separation = roots.length === 0 ? 1 : Math.min(...roots.map((root) => (
           angleBetweenUnitVectors(plate.initialSeed, plates[root].initialSeed)
         ))) / Math.PI;
+        const spacingFitness = roots.length === 0
+          ? 1
+          : Math.exp(-1 * ((separation - preferredSeparation) / 0.14) ** 2);
+        const openOceanClearance = (1 - dot3(plate.initialSeed, openOceanPole)) * 0.5;
+        const crowdingPenalty = separation < 0.2 ? (0.2 - separation) * 10 : 0;
         return {
           id: plate.id,
-          score: plate.buoyancyBias * 0.34 + separation * 0.9 + random.next() * 0.16
-            - Math.abs(plate.initialSeed[2]) * 0.65,
+          score: plate.buoyancyBias * 0.26
+            + spacingFitness * 0.62
+            + openOceanClearance * 0.2
+            + separation * 0.3
+            + random.next() * 0.18
+            - crowdingPenalty
+            - Math.abs(plate.initialSeed[2]) * 0.42,
         };
       })
       .sort((a, b) => b.score - a.score || a.id - b.id);
     roots.push(candidates[0].id);
   }
 
-  const nucleusCount = Math.min(8, Math.max(5, Math.round(Math.sqrt(plates.length)) + random.integer(1, 4)));
+  const nucleusCount = Math.min(
+    plates.length,
+    13,
+    Math.max(9, Math.round(Math.sqrt(plates.length)) + random.integer(5, 9)),
+  );
   const nucleusPlates = [...roots];
   while (nucleusPlates.length < nucleusCount) {
     const candidates = plates
@@ -379,6 +397,15 @@ function continentalGraphRegions(
       .sort((a, b) => b.score - a.score || a.id - b.id);
     nucleusPlates.push(candidates[0].id);
   }
+  const nucleusCommunities = nucleusPlates.map((plateId) => roots
+    .map((rootId, communityId) => ({
+      communityId,
+      distance: angleBetweenUnitVectors(
+        plates[plateId].initialSeed,
+        plates[rootId].initialSeed,
+      ),
+    }))
+    .sort((a, b) => a.distance - b.distance || a.communityId - b.communityId)[0].communityId);
 
   const nucleusFaces = nucleusPlates.map((plateId) => {
     let selected = 0;
@@ -422,7 +449,7 @@ function continentalGraphRegions(
     const lobeWeightTotal = lobeWeights.reduce((sum, weight) => sum + weight, 0);
     for (let index = 0; index < lobeFaces.length; index += 1) {
       frontFaces.push(lobeFaces[index]);
-      frontRegions.push(regionId);
+      frontRegions.push(nucleusCommunities[regionId]);
       frontRawWeights.push(groupBudgetShare * lobeWeights[index] / lobeWeightTotal);
     }
   }
@@ -438,6 +465,7 @@ function continentalGraphRegions(
   const frontAreas = new Float64Array(frontFaces.length);
   const regions = new Int32Array(sphere.faces.length).fill(-1);
   const terranes = new Int32Array(sphere.faces.length).fill(-1);
+  const protectedOcean = new Uint8Array(sphere.faces.length);
   const costs = frontFaces.map(() => new Float64Array(sphere.faces.length).fill(Infinity));
   const heap = new GrowthHeap();
   for (let frontId = 0; frontId < frontFaces.length; frontId += 1) {
@@ -448,9 +476,21 @@ function continentalGraphRegions(
   let claimedArea = 0;
   while (heap.length > 0 && claimedArea < targetArea) {
     const entry = heap.pop() as GrowthEntry;
-    if (entry.cost !== costs[entry.regionId][entry.faceId] || regions[entry.faceId] !== -1) continue;
+    if (entry.cost !== costs[entry.regionId][entry.faceId]
+      || regions[entry.faceId] !== -1
+      || protectedOcean[entry.faceId] !== 0) continue;
     if (frontAreas[entry.regionId] >= budgets[entry.regionId]) continue;
-    regions[entry.faceId] = frontRegions[entry.regionId];
+    const communityId = frontRegions[entry.regionId];
+    if (adjacency[entry.faceId].some((neighborId) => (
+      regions[neighborId] >= 0 && regions[neighborId] !== communityId
+    ))) {
+      // Competing terranes in one community may suture. Competing primordial
+      // communities retain a resolved oceanic separator, preventing the global
+      // area budget from welding every source province into one continent.
+      protectedOcean[entry.faceId] = 1;
+      continue;
+    }
+    regions[entry.faceId] = communityId;
     terranes[entry.faceId] = entry.regionId;
     const faceArea = sphere.faces[entry.faceId].areaSteradians;
     frontAreas[entry.regionId] += faceArea;
@@ -497,8 +537,14 @@ function continentalGraphRegions(
     const fallbackRegions = new Int32Array(sphere.faces.length).fill(-1);
     const fallbackTerranes = new Int32Array(sphere.faces.length).fill(-1);
     const enqueue = (fromId: number, neighborId: number, baseCost: number): void => {
-      if (regions[neighborId] !== -1) return;
+      if (regions[neighborId] !== -1 || protectedOcean[neighborId] !== 0) return;
       const regionId = regions[fromId];
+      if (adjacency[neighborId].some((candidateId) => (
+        regions[candidateId] >= 0 && regions[candidateId] !== regionId
+      ))) {
+        protectedOcean[neighborId] = 1;
+        return;
+      }
       const noise = mixedNoise(sphere.faces[neighborId].center, seedHash + regionId * 7_919 + 313);
       const low = Math.min(fromId, neighborId);
       const high = Math.max(fromId, neighborId);
@@ -620,15 +666,20 @@ function createInitialCells(
       ? (terraneHash / 0xffff_ffff - 0.5) * (provinces.primaryTerranes.has(terraneId) ? 0.2 : 0.6)
       : 0;
     const coastRing = provinces.coastDistanceRings[face.id];
+    const marginTexture = continental
+      ? mixedNoise(face.center, hash + regionId * 1_237 + terraneId * 61 + 4_099)
+      : 0;
     const shelfTaper = !continental
       ? 0
       : coastRing <= 0
-        ? -0.35
+        ? -2.15 + marginTexture * 1.05
         : coastRing === 1
-          ? -0.12
+          ? -0.72 + marginTexture * 0.42
           : coastRing === 2
-            ? -0.02
-            : 0;
+            ? -0.18 + marginTexture * 0.14
+            : coastRing === 3
+              ? -0.04
+              : 0;
     const suture = provinces.sutureStrength[face.id];
     const provinceTexture = continental
       ? mixedNoise(face.center, hash + terraneId * 503 + 17)
@@ -678,21 +729,34 @@ function applyDivergence(
   timestepMyr: number,
   speed: number,
   fractionalRifting = false,
+  breakupSupport = 1,
 ): void {
   const intensity = Math.min(1, Math.abs(speed) / 70);
   const lithosphereWeakness = cell.crustType === "oceanic"
     ? 1
     : cell.crustAgeMyr > 1_650 ? 0.22 : cell.crustAgeMyr > 1_050 ? 0.46 : 0.76;
-  cell.riftExposureMyr += timestepMyr * intensity * lithosphereWeakness;
+  const boundedBreakupSupport = Math.max(0, Math.min(1, breakupSupport));
+  cell.riftExposureMyr += timestepMyr * intensity * lithosphereWeakness
+    * (0.55 + boundedBreakupSupport * 0.45);
+  const breakupExposureMyr = cell.crustAgeMyr > 1_650
+    ? 96
+    : cell.crustAgeMyr > 1_050
+      ? 72
+      : 56;
+  const canBreakUp = boundedBreakupSupport >= 0.38
+    && cell.riftExposureMyr >= breakupExposureMyr;
   if (fractionalRifting && cell.continentalFraction > 0) {
-    if (cell.riftExposureMyr < 150) {
-      cell.crustThicknessKm = Math.max(22, cell.crustThicknessKm - intensity * 0.45 * timestepMyr);
-      cell.tectonicReliefKm = Math.max(-1.1, cell.tectonicReliefKm - intensity * 0.055 * timestepMyr);
+    if (!canBreakUp) {
+      // Immature or landlocked extension remains a failed rift: it may thin
+      // crust and form basins, but cannot draw a cell-scale inland ocean merely
+      // because a plate boundary happens to cross a continent.
+      cell.crustThicknessKm = Math.max(24, cell.crustThicknessKm - intensity * 0.38 * timestepMyr);
+      cell.tectonicReliefKm = Math.max(-0.82, cell.tectonicReliefKm - intensity * 0.038 * timestepMyr);
       return;
     }
     cell.continentalFraction = Math.max(
       0,
-      cell.continentalFraction - timestepMyr * intensity / 240,
+      cell.continentalFraction - timestepMyr * intensity * boundedBreakupSupport / 85,
     );
     if (cell.continentalFraction > 0) {
       cell.crustType = cell.continentalFraction >= 0.5 ? "continental" : "oceanic";
@@ -709,9 +773,9 @@ function applyDivergence(
       return;
     }
   }
-  if (cell.crustType === "continental" && cell.riftExposureMyr < 150) {
-    cell.crustThicknessKm = Math.max(22, cell.crustThicknessKm - intensity * 0.45 * timestepMyr);
-    cell.tectonicReliefKm = Math.max(-1.1, cell.tectonicReliefKm - intensity * 0.055 * timestepMyr);
+  if (cell.crustType === "continental" && !canBreakUp) {
+    cell.crustThicknessKm = Math.max(24, cell.crustThicknessKm - intensity * 0.38 * timestepMyr);
+    cell.tectonicReliefKm = Math.max(-0.82, cell.tectonicReliefKm - intensity * 0.038 * timestepMyr);
     return;
   }
   cell.crustType = "oceanic";
@@ -800,6 +864,65 @@ function applyFiniteWidthDeformation(
       cell.tectonicReliefKm = Math.min(1.8, cell.tectonicReliefKm + strength * 0.004 * timestepMyr);
     }
   });
+}
+
+/**
+ * Estimates whether a divergent boundary is a coherent breakup corridor or a
+ * failed intracontinental rift. Persistence and opening speed are necessary,
+ * but mature breakup is much easier where a connected segment reaches
+ * existing oceanic crust. Long landlocked systems can still succeed after
+ * inheriting substantial extensional damage; short isolated grooves cannot.
+ */
+function riftBreakupSupport(
+  cells: readonly MutableCell[],
+  adjacency: readonly number[][],
+  divergentSpeed: Float64Array,
+  divergentAgeMyr: Float64Array,
+): Float64Array {
+  const support = new Float64Array(cells.length);
+  const visited = new Uint8Array(cells.length);
+  for (let start = 0; start < cells.length; start += 1) {
+    if (visited[start] !== 0 || divergentSpeed[start] <= 0) continue;
+    const component: number[] = [];
+    const queue = [start];
+    visited[start] = 1;
+    let touchesOceanicCrust = false;
+    let meanSpeed = 0;
+    let meanAgeMyr = 0;
+    let meanInheritedExposureMyr = 0;
+    for (let cursor = 0; cursor < queue.length; cursor += 1) {
+      const faceId = queue[cursor];
+      component.push(faceId);
+      meanSpeed += divergentSpeed[faceId];
+      meanAgeMyr += divergentAgeMyr[faceId];
+      meanInheritedExposureMyr += cells[faceId].riftExposureMyr;
+      if (cells[faceId].continentalFraction < 0.35
+        || adjacency[faceId].some((neighbor) => cells[neighbor].continentalFraction < 0.2)) {
+        touchesOceanicCrust = true;
+      }
+      for (const neighbor of adjacency[faceId]) {
+        if (visited[neighbor] !== 0 || divergentSpeed[neighbor] <= 0) continue;
+        visited[neighbor] = 1;
+        queue.push(neighbor);
+      }
+    }
+    meanSpeed /= component.length;
+    meanAgeMyr /= component.length;
+    meanInheritedExposureMyr /= component.length;
+    const persistence = Math.max(0, Math.min(1, (meanAgeMyr - 16) / 54));
+    const velocity = Math.max(0, Math.min(1, (meanSpeed - 5) / 34));
+    const continuity = Math.max(0, Math.min(1, (component.length - 2) / 10));
+    const inheritedDamage = Math.max(0, Math.min(1, meanInheritedExposureMyr / 90));
+    const oceanConnection = touchesOceanicCrust
+      ? 0.72 + continuity * 0.28
+      : continuity * inheritedDamage * 0.56;
+    const componentSupport = Math.max(0, Math.min(
+      1,
+      persistence * velocity * oceanConnection,
+    ));
+    for (const faceId of component) support[faceId] = componentSupport;
+  }
+  return support;
 }
 
 function baseElevation(cell: MutableCell): number {
@@ -959,6 +1082,7 @@ function applyTectonicStep(
   const divergentFaces = new Set<number>();
   const convergentFaces = new Set<number>();
   const divergentSpeed = new Float64Array(cells.length);
+  const divergentAgeMyr = new Float64Array(cells.length);
   const divergentPair = new Int32Array(cells.length);
   const convergentSpeed = new Float64Array(cells.length);
   const convergentNeighbor = new Int32Array(cells.length).fill(-1);
@@ -984,9 +1108,10 @@ function applyTectonicStep(
       },
     );
     const previous = boundaryAges.get(edge.id);
+    const boundaryAgeMyr = previous?.kind === motion.kind ? previous.ageMyr + timestepMyr : timestepMyr;
     boundaryAges.set(edge.id, {
       kind: motion.kind,
-      ageMyr: previous?.kind === motion.kind ? previous.ageMyr + timestepMyr : timestepMyr,
+      ageMyr: boundaryAgeMyr,
     });
     const pairId = 100_000
       + Math.min(first.plateId, second.plateId) * recipe.plateCount
@@ -998,6 +1123,7 @@ function applyTectonicStep(
           divergentSpeed[faceId] = speed;
           divergentPair[faceId] = pairId;
         }
+        divergentAgeMyr[faceId] = Math.max(divergentAgeMyr[faceId], boundaryAgeMyr);
       }
     } else if (motion.kind === "convergent") {
       for (const [faceId, neighborId] of [
@@ -1018,6 +1144,7 @@ function applyTectonicStep(
       }
     }
   }
+  const breakupSupport = riftBreakupSupport(cells, adjacency, divergentSpeed, divergentAgeMyr);
   for (const face of sphere.faces) {
     const faceId = face.id;
     if (divergentSpeed[faceId] >= convergentSpeed[faceId] && divergentSpeed[faceId] > 0) {
@@ -1027,6 +1154,7 @@ function applyTectonicStep(
         timestepMyr,
         divergentSpeed[faceId],
         fractionalRifting,
+        breakupSupport[faceId],
       );
       divergentFaces.add(faceId);
     } else if (convergentSpeed[faceId] > 0) {
@@ -1324,6 +1452,7 @@ export function simulateTectonicWorld(
     const divergentFaces = new Set<number>();
     const convergentFaces = new Set<number>();
     const divergentSpeed = new Float64Array(cells.length);
+    const divergentAgeMyr = new Float64Array(cells.length);
     const divergentPair = new Int32Array(cells.length);
     const convergentSpeed = new Float64Array(cells.length);
     const convergentNeighbor = new Int32Array(cells.length).fill(-1);
@@ -1349,9 +1478,10 @@ export function simulateTectonicWorld(
         },
       );
       const previous = boundaryAges.get(edge.id);
+      const boundaryAgeMyr = previous?.kind === motion.kind ? previous.ageMyr + timestepMyr : timestepMyr;
       boundaryAges.set(edge.id, {
         kind: motion.kind,
-        ageMyr: previous?.kind === motion.kind ? previous.ageMyr + timestepMyr : timestepMyr,
+        ageMyr: boundaryAgeMyr,
       });
       const pairId = 100_000 + Math.min(first.plateId, second.plateId) * recipe.plateCount + Math.max(first.plateId, second.plateId);
       if (motion.kind === "divergent") {
@@ -1361,6 +1491,7 @@ export function simulateTectonicWorld(
             divergentSpeed[faceId] = speed;
             divergentPair[faceId] = pairId;
           }
+          divergentAgeMyr[faceId] = Math.max(divergentAgeMyr[faceId], boundaryAgeMyr);
         }
       } else if (motion.kind === "convergent") {
         for (const [faceId, neighborId] of [[edge.faces[0], edge.faces[1]], [edge.faces[1], edge.faces[0]]] as const) {
@@ -1378,13 +1509,21 @@ export function simulateTectonicWorld(
         }
       }
     }
+    const breakupSupport = riftBreakupSupport(cells, adjacency, divergentSpeed, divergentAgeMyr);
     for (const face of sphere.faces) {
       const faceId = face.id;
       // One canonical forcing per face and regime per timestep prevents a
       // three-edge triangle from accumulating three million years of strain in
       // one million years. The strongest normal regime wins locally.
       if (divergentSpeed[faceId] >= convergentSpeed[faceId] && divergentSpeed[faceId] > 0) {
-        applyDivergence(cells[faceId], divergentPair[faceId], timestepMyr, divergentSpeed[faceId]);
+        applyDivergence(
+          cells[faceId],
+          divergentPair[faceId],
+          timestepMyr,
+          divergentSpeed[faceId],
+          false,
+          breakupSupport[faceId],
+        );
         divergentFaces.add(faceId);
       } else if (convergentSpeed[faceId] > 0) {
         const neighborId = convergentNeighbor[faceId];
