@@ -140,6 +140,8 @@ interface MutableCell {
   provenanceId: number;
   tectonicReliefKm: number;
   roughnessKm: number;
+  /** Dimensionless inherited lithospheric weakness; not elapsed rift time. */
+  riftWeakness: number;
   riftExposureMyr: number;
   convergenceExposureMyr: number;
 }
@@ -303,6 +305,10 @@ interface ContinentalGrowthResult {
   readonly regions: Int32Array;
   /** Subordinate accretion fronts retained as persistent crust provenance. */
   readonly terranes: Int32Array;
+  /** Inherited weak belts that later divergence can reactivate. */
+  readonly riftInheritance: Float64Array;
+  /** Sutures and active-margin terranes inherited from primordial assembly. */
+  readonly accretionInheritance: Float64Array;
 }
 
 function continentalGraphRegions(
@@ -342,11 +348,21 @@ function continentalGraphRegions(
 
   // Seed several crustal communities around a deliberately uneven primordial
   // assembly. A weak open-ocean pole leaves one broad hemisphere underseeded,
-  // while a sampled preferred separation avoids both a regular spherical
-  // packing and a single supercontinent. These are material provinces rather
-  // than requested final continents; rifting, collision, and flooding still
-  // determine the emerged components.
-  const communityCount = Math.min(plates.length, 5 + random.integer(0, 3));
+  // while a sampled preferred separation avoids both regular spherical packing
+  // and a single supercontinent. These are material provinces rather than
+  // requested final continents.
+  // Keep a roughly physical, rather than angular, density of primordial
+  // continental systems. A larger mobile-lid planet has room for more
+  // independently evolving cratons instead of merely stretching the same
+  // handful of sources across a larger globe. The count is still only an
+  // initialization capacity: later transport can join, split, drown, or expose
+  // these communities, so it is not a requested final continent count.
+  const relativeSurfaceArea = (radiusKm / 6_371) ** 2;
+  const additionalCommunities = Math.max(0, Math.round((relativeSurfaceArea - 1) * 2.5));
+  const communityCount = Math.min(
+    plates.length,
+    5 + random.integer(0, 3) + additionalCommunities,
+  );
   const openOceanPole = randomUnitVector(random);
   const roots: number[] = [];
   while (roots.length < communityCount) {
@@ -377,13 +393,14 @@ function continentalGraphRegions(
     roots.push(candidates[0].id);
   }
 
-  const nucleusCount = Math.min(
-    plates.length,
+  const additionalTerranes = Math.max(0, Math.round((relativeSurfaceArea - 1) * 4));
+  const baseNucleusCount = Math.min(
     13,
     Math.max(9, Math.round(Math.sqrt(plates.length)) + random.integer(5, 9)),
   );
+  const nucleusCount = Math.min(sphere.faces.length, baseNucleusCount + additionalTerranes);
   const nucleusPlates = [...roots];
-  while (nucleusPlates.length < nucleusCount) {
+  while (nucleusPlates.length < Math.min(plates.length, nucleusCount)) {
     const candidates = plates
       .filter((plate) => !nucleusPlates.includes(plate.id))
       .map((plate) => {
@@ -397,16 +414,6 @@ function continentalGraphRegions(
       .sort((a, b) => b.score - a.score || a.id - b.id);
     nucleusPlates.push(candidates[0].id);
   }
-  const nucleusCommunities = nucleusPlates.map((plateId) => roots
-    .map((rootId, communityId) => ({
-      communityId,
-      distance: angleBetweenUnitVectors(
-        plates[plateId].initialSeed,
-        plates[rootId].initialSeed,
-      ),
-    }))
-    .sort((a, b) => a.distance - b.distance || a.communityId - b.communityId)[0].communityId);
-
   const nucleusFaces = nucleusPlates.map((plateId) => {
     let selected = 0;
     let best = -Infinity;
@@ -420,7 +427,52 @@ function continentalGraphRegions(
     }
     return selected;
   });
-  const rawWeights = nucleusFaces.map((_, index) => Math.exp(random.range(-0.72, 0.72)) * (index === 0 ? 1.45 : 1));
+  const distinctPlateNucleusCount = nucleusFaces.length;
+  while (nucleusFaces.length < nucleusCount) {
+    let selectedFaceId = -1;
+    let selectedPlateId = -1;
+    let best = -Infinity;
+    for (const face of sphere.faces) {
+      if (nucleusFaces.includes(face.id)) continue;
+      const plateId = plateByFace[face.id];
+      const samePlateNuclei = nucleusFaces.filter((nucleusFaceId) => (
+        plateByFace[nucleusFaceId] === plateId
+      ));
+      if (samePlateNuclei.length === 0) continue;
+      const separation = Math.min(...samePlateNuclei.map((nucleusFaceId) => (
+        angleBetweenUnitVectors(face.center, sphere.faces[nucleusFaceId].center)
+      )));
+      const score = separation
+        + mixedNoise(face.center, seedHash + nucleusFaces.length * 2_003) * 0.08
+        - Math.abs(face.center[2]) * 0.025;
+      if (score > best) {
+        best = score;
+        selectedFaceId = face.id;
+        selectedPlateId = plateId;
+      }
+    }
+    if (selectedFaceId < 0) break;
+    nucleusFaces.push(selectedFaceId);
+    nucleusPlates.push(selectedPlateId);
+  }
+  const nucleusCommunities = nucleusPlates.map((plateId, index) => {
+    const center = index < distinctPlateNucleusCount
+      ? plates[plateId].initialSeed
+      : sphere.faces[nucleusFaces[index]].center;
+    return roots
+      .map((rootId, communityId) => ({
+        communityId,
+        distance: angleBetweenUnitVectors(center, plates[rootId].initialSeed),
+      }))
+      .sort((a, b) => a.distance - b.distance || a.communityId - b.communityId)[0].communityId;
+  });
+  const rawWeights = nucleusFaces.map((_, index) => Math.exp(random.range(-0.72, 0.72)) * (
+    index === 0
+      ? 1.45
+      : index >= distinctPlateNucleusCount
+        ? 0.58
+        : 1
+  ));
   const totalWeight = rawWeights.reduce((sum, weight) => sum + weight, 0);
   const targetArea = sphere.totalAreaSteradians * 0.38;
   const frontFaces: number[] = [];
@@ -432,7 +484,19 @@ function continentalGraphRegions(
     const lobeFaces = [nucleusFaces[regionId]];
     for (let lobe = 0; lobe < subordinateCount; lobe += 1) {
       let faceId = nucleusFaces[regionId];
-      const walkSteps = 3 + random.integer(0, 5 + sphere.subdivisions * 2);
+      // Each geodesic refinement approximately halves cell width. Preserve the
+      // physical terrane/lobe wavelength at production subdivision 5 instead
+      // of squeezing the same three-to-fifteen-cell walk into half the angular
+      // footprint and making higher-resolution continents rounder and simpler.
+      const refinementWalkScale = sphere.subdivisions <= 4
+        ? 1
+        : Math.max(
+          1,
+          2 ** (sphere.subdivisions - 4) * 6_371 / radiusKm,
+        );
+      const walkSteps = Math.round(
+        (3 + random.integer(0, 5 + sphere.subdivisions * 2)) * refinementWalkScale,
+      );
       for (let step = 0; step < walkSteps; step += 1) {
         const candidates = adjacency[faceId]
           .slice()
@@ -571,7 +635,54 @@ function continentalGraphRegions(
       for (const neighborId of adjacency[entry.faceId]) enqueue(entry.faceId, neighborId, entry.cost);
     }
   }
-  return { regions, terranes };
+
+  const riftSeeds = new Float64Array(sphere.faces.length);
+  const accretionSeeds = new Float64Array(sphere.faces.length);
+  for (const edge of sphere.edges) {
+    const [firstId, secondId] = edge.faces;
+    const firstRegion = regions[firstId];
+    const secondRegion = regions[secondId];
+    const firstContinental = firstRegion >= 0;
+    const secondContinental = secondRegion >= 0;
+    if (!firstContinental && !secondContinental) continue;
+    const low = Math.min(firstId, secondId);
+    const high = Math.max(firstId, secondId);
+    const regime = boundaryRegimes.get(low * sphere.faces.length + high);
+    if (regime === "divergent") {
+      if (firstContinental) riftSeeds[firstId] = Math.max(riftSeeds[firstId], secondContinental ? 1 : 0.72);
+      if (secondContinental) riftSeeds[secondId] = Math.max(riftSeeds[secondId], firstContinental ? 1 : 0.72);
+    }
+    const inheritedSuture = firstContinental && secondContinental
+      && (firstRegion !== secondRegion || terranes[firstId] !== terranes[secondId]);
+    if (inheritedSuture || regime === "convergent") {
+      if (firstContinental) accretionSeeds[firstId] = Math.max(
+        accretionSeeds[firstId],
+        inheritedSuture ? 1 : 0.68,
+      );
+      if (secondContinental) accretionSeeds[secondId] = Math.max(
+        accretionSeeds[secondId],
+        inheritedSuture ? 1 : 0.68,
+      );
+    }
+  }
+  const spreadInheritance = (source: Float64Array, decay: number): Float64Array => {
+    let current = source;
+    for (let pass = 0; pass < 3; pass += 1) {
+      const next = new Float64Array(current);
+      for (const face of sphere.faces) {
+        if (regions[face.id] < 0) continue;
+        for (const neighborId of adjacency[face.id]) {
+          if (regions[neighborId] < 0) continue;
+          next[face.id] = Math.max(next[face.id], current[neighborId] * decay);
+        }
+      }
+      current = next;
+    }
+    return current;
+  };
+  const riftInheritance = spreadInheritance(riftSeeds, 0.57);
+  const accretionInheritance = spreadInheritance(accretionSeeds, 0.6);
+  return { regions, terranes, riftInheritance, accretionInheritance };
 }
 
 function continentalProvinceFields(
@@ -649,11 +760,20 @@ function createInitialCells(
   random: RandomSource,
   seed: string | number,
   radiusKm: number,
+  inheritanceEnabled = false,
 ): MutableCell[] {
   const hash = seedHashNumber(seed);
   const adjacency = buildAdjacency(sphere);
   const plateByFace = sphere.faces.map((face) => nearestPlate(face.center, plates));
-  const continentalGrowth = continentalGraphRegions(sphere, plates, plateByFace, adjacency, random, hash, radiusKm);
+  const continentalGrowth = continentalGraphRegions(
+    sphere,
+    plates,
+    plateByFace,
+    adjacency,
+    random,
+    hash,
+    radiusKm,
+  );
   const provinces = continentalProvinceFields(sphere, continentalGrowth, adjacency);
   return sphere.faces.map((face) => {
     const plateId = plateByFace[face.id];
@@ -681,6 +801,12 @@ function createInitialCells(
               ? -0.04
               : 0;
     const suture = provinces.sutureStrength[face.id];
+    const inheritedRift = inheritanceEnabled
+      ? continentalGrowth.riftInheritance[face.id]
+      : 0;
+    const inheritedAccretion = inheritanceEnabled
+      ? continentalGrowth.accretionInheritance[face.id]
+      : 0;
     const provinceTexture = continental
       ? mixedNoise(face.center, hash + terraneId * 503 + 17)
       : 0;
@@ -694,16 +820,20 @@ function createInitialCells(
       continentalFraction: continental ? 1 : 0,
       crustAgeMyr: age,
       crustThicknessKm: continental
-        ? 36.5 + texture * 4.2 + provinceTexture * 0.3 + terraneBias + shelfTaper + suture * 0.6
+        ? 36.5 + texture * 4.2 + provinceTexture * 0.3 + terraneBias + shelfTaper
+          + suture * 0.6 + inheritedAccretion * 0.85 - inheritedRift * 0.55
         : 7 + texture * 0.75,
       densityKgM3: continental ? 2_745 - texture * 28 : 2_985 + texture * 38,
       provenanceId: continental ? 10_000 + terraneId : plateId,
-      tectonicReliefKm: continental ? suture * 0.04 : 0,
+      tectonicReliefKm: continental
+        ? suture * 0.04 + inheritedAccretion * 0.18 - inheritedRift * 0.12
+        : 0,
       roughnessKm: continental
-        ? texture * 0.12 + provinceTexture * 0.01
+        ? texture * 0.12 + provinceTexture * 0.01 + inheritedAccretion * 0.025
         : texture * 0.07,
+      riftWeakness: continental ? inheritedRift : 0,
       riftExposureMyr: 0,
-      convergenceExposureMyr: 0,
+      convergenceExposureMyr: continental ? inheritedAccretion * 32 : 0,
     };
   });
 }
@@ -732,17 +862,22 @@ function applyDivergence(
   breakupSupport = 1,
 ): void {
   const intensity = Math.min(1, Math.abs(speed) / 70);
-  const lithosphereWeakness = cell.crustType === "oceanic"
+  const ageWeakness = cell.crustType === "oceanic"
     ? 1
     : cell.crustAgeMyr > 1_650 ? 0.22 : cell.crustAgeMyr > 1_050 ? 0.46 : 0.76;
+  const lithosphereWeakness = Math.max(
+    ageWeakness,
+    cell.crustType === "continental" ? 0.18 + cell.riftWeakness * 0.58 : 1,
+  );
   const boundedBreakupSupport = Math.max(0, Math.min(1, breakupSupport));
   cell.riftExposureMyr += timestepMyr * intensity * lithosphereWeakness
     * (0.55 + boundedBreakupSupport * 0.45);
-  const breakupExposureMyr = cell.crustAgeMyr > 1_650
+  const unmodifiedBreakupExposureMyr = cell.crustAgeMyr > 1_650
     ? 96
     : cell.crustAgeMyr > 1_050
       ? 72
       : 56;
+  const breakupExposureMyr = unmodifiedBreakupExposureMyr * (1 - cell.riftWeakness * 0.24);
   const canBreakUp = boundedBreakupSupport >= 0.38
     && cell.riftExposureMyr >= breakupExposureMyr;
   if (fractionalRifting && cell.continentalFraction > 0) {
@@ -890,12 +1025,14 @@ function riftBreakupSupport(
     let meanSpeed = 0;
     let meanAgeMyr = 0;
     let meanInheritedExposureMyr = 0;
+    let meanInheritedWeakness = 0;
     for (let cursor = 0; cursor < queue.length; cursor += 1) {
       const faceId = queue[cursor];
       component.push(faceId);
       meanSpeed += divergentSpeed[faceId];
       meanAgeMyr += divergentAgeMyr[faceId];
       meanInheritedExposureMyr += cells[faceId].riftExposureMyr;
+      meanInheritedWeakness += cells[faceId].riftWeakness;
       if (cells[faceId].continentalFraction < 0.35
         || adjacency[faceId].some((neighbor) => cells[neighbor].continentalFraction < 0.2)) {
         touchesOceanicCrust = true;
@@ -909,10 +1046,14 @@ function riftBreakupSupport(
     meanSpeed /= component.length;
     meanAgeMyr /= component.length;
     meanInheritedExposureMyr /= component.length;
+    meanInheritedWeakness /= component.length;
     const persistence = Math.max(0, Math.min(1, (meanAgeMyr - 16) / 54));
     const velocity = Math.max(0, Math.min(1, (meanSpeed - 5) / 34));
     const continuity = Math.max(0, Math.min(1, (component.length - 2) / 10));
-    const inheritedDamage = Math.max(0, Math.min(1, meanInheritedExposureMyr / 90));
+    const inheritedDamage = Math.max(0, Math.min(
+      1,
+      meanInheritedExposureMyr / 90 + meanInheritedWeakness * 0.72,
+    ));
     const oceanConnection = touchesOceanicCrust
       ? 0.72 + continuity * 0.28
       : continuity * inheritedDamage * 0.56;
@@ -1009,7 +1150,10 @@ function shapeCanonicalShoreline(
     const point = sphere.faces[faceId].center;
     const broad = physicalShorelineNoise(point, seed, recipe.radiusKm);
     const detail = physicalShorelineNoise(point, seed + 91_127, recipe.radiusKm);
-    const rift = Math.max(0, Math.min(1, cell.riftExposureMyr / 115));
+    const rift = Math.max(0, Math.min(
+      1,
+      cell.riftExposureMyr / 115 + cell.riftWeakness * 0.32,
+    ));
     const collision = Math.max(0, Math.min(1, cell.convergenceExposureMyr / 190));
     const riftEmbayment = rift * (0.08 + Math.max(0, -detail) * 0.13);
     const collisionalPromontory = collision * Math.max(0, broad) * 0.08;
@@ -1362,6 +1506,7 @@ function transportCellsFiniteVolume(
     let densityKgM3 = 0;
     let tectonicReliefKm = 0;
     let roughnessKm = 0;
+    let riftWeakness = 0;
     let riftExposureMyr = 0;
     let convergenceExposureMyr = 0;
     const plateFractions = plates.map(() => 0);
@@ -1375,6 +1520,7 @@ function transportCellsFiniteVolume(
       densityKgM3 += source.densityKgM3 * weight;
       tectonicReliefKm += source.tectonicReliefKm * weight;
       roughnessKm += source.roughnessKm * weight;
+      riftWeakness += source.riftWeakness * weight;
       riftExposureMyr += source.riftExposureMyr * weight;
       convergenceExposureMyr += source.convergenceExposureMyr * weight;
       const materialArea = contribution.area * normalization;
@@ -1435,6 +1581,7 @@ function transportCellsFiniteVolume(
       provenanceId: dominant(provenanceArea),
       tectonicReliefKm,
       roughnessKm,
+      riftWeakness,
       riftExposureMyr,
       convergenceExposureMyr,
     };
@@ -1514,6 +1661,7 @@ export function simulateTectonicWorld(
   const random = createRandom(recipe.seed);
   const sphere = createGeodesicSphere(recipe.subdivisions);
   const plateSeeds = createPlateSeeds(random, recipe.plateCount);
+  const angularSpeedScale = 6_371 / recipe.radiusKm;
   const plates: TectonicPlateState[] = plateSeeds.map((initialSeed, id) => ({
     id,
     name: `Plate ${id + 1}`,
@@ -1521,11 +1669,18 @@ export function simulateTectonicWorld(
     seed: initialSeed,
     pole: {
       axis: randomUnitVector(random),
-      angularSpeedRadPerMyr: random.range(0.0028, 0.0085) * (random.next() < 0.5 ? -1 : 1),
+      angularSpeedRadPerMyr: random.range(0.0028, 0.0085) * angularSpeedScale
+        * (random.next() < 0.5 ? -1 : 1),
     },
     buoyancyBias: random.range(-1, 1),
   }));
-  const cells = createInitialCells(sphere, plates, random, recipe.seed, recipe.radiusKm);
+  const cells = createInitialCells(
+    sphere,
+    plates,
+    random,
+    recipe.seed,
+    recipe.radiusKm,
+  );
   const adjacency = buildAdjacency(sphere);
   const boundaryAges = new Map<number, MutableBoundaryAge>();
   const steps = Math.ceil(recipe.historyMyr / recipe.timestepMyr);
@@ -1830,6 +1985,7 @@ export function simulateCoupledTectonicWorld(
   const random = createRandom(recipe.seed);
   const sphere = createGeodesicSphere(recipe.subdivisions);
   const plateSeeds = createPlateSeeds(random, recipe.plateCount);
+  const angularSpeedScale = 6_371 / recipe.radiusKm;
   const plates: TectonicPlateState[] = plateSeeds.map((initialSeed, id) => ({
     id,
     name: `Plate ${id + 1}`,
@@ -1837,11 +1993,19 @@ export function simulateCoupledTectonicWorld(
     seed: initialSeed,
     pole: {
       axis: randomUnitVector(random),
-      angularSpeedRadPerMyr: random.range(0.0028, 0.0085) * (random.next() < 0.5 ? -1 : 1),
+      angularSpeedRadPerMyr: random.range(0.0028, 0.0085) * angularSpeedScale
+        * (random.next() < 0.5 ? -1 : 1),
     },
     buoyancyBias: random.range(-1, 1),
   }));
-  let cells = createInitialCells(sphere, plates, random, recipe.seed, recipe.radiusKm);
+  let cells = createInitialCells(
+    sphere,
+    plates,
+    random,
+    recipe.seed,
+    recipe.radiusKm,
+    true,
+  );
   const adjacency = buildAdjacency(sphere);
   const boundaryAges = new Map<number, MutableBoundaryAge>();
   const steps = Math.ceil(recipe.historyMyr / recipe.timestepMyr);

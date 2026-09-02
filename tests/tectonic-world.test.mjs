@@ -112,6 +112,31 @@ test("continental growth preserves a hierarchy of adjacent accreted terranes", (
   assert.ok(sutureEdges.length >= 20);
 });
 
+test("planet radius preserves physical plate speed and expands terrane capacity", () => {
+  const recipe = {
+    seed: "PLANET-SCALE-CAPACITY",
+    subdivisions: 3,
+    plateCount: 20,
+    historyMyr: 3,
+    timestepMyr: 3,
+    oceanFraction: 0.68,
+  };
+  const earthScale = simulateTectonicWorld({ ...recipe, radiusKm: 6_371 });
+  const large = simulateTectonicWorld({ ...recipe, radiusKm: 9_500 });
+  for (let plateId = 0; plateId < recipe.plateCount; plateId += 1) {
+    const earthLinearSpeed = Math.abs(earthScale.plates[plateId].pole.angularSpeedRadPerMyr)
+      * earthScale.recipe.radiusKm;
+    const largeLinearSpeed = Math.abs(large.plates[plateId].pole.angularSpeedRadPerMyr)
+      * large.recipe.radiusKm;
+    assert.ok(Math.abs(earthLinearSpeed - largeLinearSpeed) < 1e-12);
+  }
+  assert.ok(
+    large.stats.continentalTerraneCount > earthScale.stats.continentalTerraneCount,
+    "large planet retained " + large.stats.continentalTerraneCount
+      + " terranes; Earth scale retained " + earthScale.stats.continentalTerraneCount,
+  );
+});
+
 test("moving-crust snapshot is conservative and remains the canonical land authority", () => {
   const fixed = simulateTectonicWorld(RECIPE);
   const first = simulateMovingCrustSnapshot(RECIPE, 30);
