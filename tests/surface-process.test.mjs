@@ -547,6 +547,11 @@ test("channel refinement and coastal landforms are causal presentation geometry"
     refined.rivers.map((river) => [river.fromFaceId, river.toFaceId, river.drainageAreaKm2]),
     straight.rivers.map((river) => [river.fromFaceId, river.toFaceId, river.drainageAreaKm2]),
   );
+  assert.ok(refined.stats.meanRiverSinuosity > straight.stats.meanRiverSinuosity + 0.03);
+  assert.ok(
+    refined.stats.meanNeighboringChannelAlignment
+      < straight.stats.meanNeighboringChannelAlignment,
+  );
   assert.equal(
     Object.values(refined.stats.coastalLandformCounts).reduce((sum, count) => sum + count, 0),
     refined.riverMouths.length,

@@ -3109,7 +3109,7 @@ function createRiverPresentationPoints(
             ? riverBendValue(bendWave, bendWave.phaseRadians)
             : sphericalNoise(center, seed + 18_821);
           const meander = coherentBend
-            * localStep * (0.08 + hierarchy * 0.17)
+            * localStep * (0.11 + hierarchy * 0.22)
             * (1 - cells[faceId].orogenStrength * 0.62);
           smoothed = normalize3([
             smoothed[0] + lateral[0] / lateralLength * meander,
@@ -3247,13 +3247,13 @@ function createRiverPresentationPath(
   );
   const coastClearance = clamp((Math.min(source.coastDistanceKm, receiver.coastDistanceKm) - 12) / 180);
   const meshRelativeAmplitudeRadians = segmentRadians
-    * clamp(0.025 + (1 - confinement) * (0.07 + hierarchy * 0.145), 0, 0.24)
+    * clamp(0.035 + (1 - confinement) * (0.09 + hierarchy * 0.18), 0, 0.31)
     * (0.38 + coastClearance * 0.62)
     * refinementScale;
   // A bend envelope tied only to the current process edge shrinks toward zero
   // as surface resolution increases. Preserve a modest physical cartographic
   // scale, still bounded by this reach and backed down by the land predicate.
-  const physicalAmplitudeKm = (10 + hierarchy * 44)
+  const physicalAmplitudeKm = (14 + hierarchy * 62)
     * (0.28 + (1 - confinement) * 0.72)
     * (0.42 + coastClearance * 0.58)
     * refinementScale;
@@ -3270,9 +3270,9 @@ function createRiverPresentationPath(
   }
   const lateral = normalize3(lateralRaw);
   const phaseAdvance = Math.min(Math.PI * 2.5, segmentKm * bendWave.radiansPerKm);
-  const pointCount = Math.min(17, Math.max(
-    7,
-    7 + Math.ceil(phaseAdvance / Math.PI) * 2 + (hierarchy > 0.62 ? 2 : 0),
+  const pointCount = Math.min(21, Math.max(
+    9,
+    9 + Math.ceil(phaseAdvance / Math.PI) * 2 + (hierarchy > 0.62 ? 2 : 0),
   ));
   const waveAt = (phase: number): number => riverBendValue(bendWave, phase);
   const startWave = waveAt(bendWave.phaseRadians);
@@ -3312,7 +3312,7 @@ function createRiverPresentationPath(
       const endpointChord = startWave * (1 - progress) + endWave * progress;
       const bend = wave - endpointChord;
       const envelope = Math.sin(Math.PI * progress) ** 0.55;
-      const offset = amplitudeRadians * envelope * bend * 1.45;
+      const offset = amplitudeRadians * envelope * bend * 1.65;
       path.push(normalize3([
         base[0] + lateral[0] * offset,
         base[1] + lateral[1] * offset,
@@ -3346,6 +3346,18 @@ function createRiverBendWaves(
 ): ReadonlyMap<number, RiverBendWave> {
   const terminalByFaceId = new Map<number, number>();
   const phaseToOutletByFaceId = new Map<number, number>();
+  const dominantIncoming = new Map<number, number>();
+  for (const cell of riverCells) {
+    const receiverId = cell.receiverFaceId;
+    if (receiverId === null) continue;
+    const incumbent = dominantIncoming.get(receiverId);
+    if (incumbent === undefined
+      || cells[cell.faceId].drainageAreaKm2 > cells[incumbent].drainageAreaKm2
+      || (cells[cell.faceId].drainageAreaKm2 === cells[incumbent].drainageAreaKm2
+        && cell.faceId < incumbent)) {
+      dominantIncoming.set(receiverId, cell.faceId);
+    }
+  }
   const wavenumberFor = (faceId: number): number => {
     const cell = cells[faceId];
     const hierarchy = Math.max(0, Math.min(1,
@@ -3355,7 +3367,7 @@ function createRiverBendWaves(
     // Wavelength grows continuously from tributaries to trunk rivers instead
     // of inheriting the icosphere edge length. The values are cartographic
     // centerline scales; canonical discharge and receivers remain unchanged.
-    const wavelengthKm = 110 + hierarchy * 540;
+    const wavelengthKm = 95 + hierarchy * 505;
     return Math.PI * 2 / wavelengthKm;
   };
   const resolve = (startFaceId: number): { terminalId: number; phaseToOutlet: number } => {
@@ -3402,16 +3414,38 @@ function createRiverBendWaves(
       phaseToOutlet: phaseToOutletByFaceId.get(startFaceId) ?? phaseToOutlet,
     };
   };
+  // Keep the dominant trunk phase continuous, but give each tributary lineage
+  // a stable identity at its confluence. A basin-wide phase made neighboring
+  // tributaries repeat the same lateral bends and read as parallel graph rows.
+  const branchRootByFaceId = new Map<number, number>();
+  for (const cell of [...riverCells]
+    .sort((a, b) => a.floodOrder - b.floodOrder || a.faceId - b.faceId)) {
+    const receiverId = cell.receiverFaceId;
+    const resolved = resolve(cell.faceId);
+    const followsDominantTrunk = receiverId !== null
+      && dominantIncoming.get(receiverId) === cell.faceId;
+    branchRootByFaceId.set(
+      cell.faceId,
+      followsDominantTrunk
+        ? branchRootByFaceId.get(receiverId) ?? resolved.terminalId
+        : cell.faceId,
+    );
+  }
   return new Map(riverCells.map((cell) => {
     const resolved = resolve(cell.faceId);
+    const branchRoot = branchRootByFaceId.get(cell.faceId) ?? resolved.terminalId;
     const basinPhase = seedHash(`${seed}:channel-basin:${resolved.terminalId}`)
       / 0x1_0000_0000 * Math.PI * 2;
-    const secondaryPhaseRadians = seedHash(`${seed}:channel-secondary:${resolved.terminalId}`)
+    const branchPhaseOffset = (
+      seedHash(`${seed}:channel-branch:${resolved.terminalId}:${branchRoot}`)
+        / 0x1_0000_0000 - 0.5
+    ) * 1.4;
+    const secondaryPhaseRadians = seedHash(`${seed}:channel-secondary:${resolved.terminalId}:${branchRoot}`)
       / 0x1_0000_0000 * Math.PI * 2;
-    const tertiaryPhaseRadians = seedHash(`${seed}:channel-tertiary:${resolved.terminalId}`)
+    const tertiaryPhaseRadians = seedHash(`${seed}:channel-tertiary:${resolved.terminalId}:${branchRoot}`)
       / 0x1_0000_0000 * Math.PI * 2;
     return [cell.faceId, {
-      phaseRadians: basinPhase + resolved.phaseToOutlet,
+      phaseRadians: basinPhase + resolved.phaseToOutlet + branchPhaseOffset,
       radiansPerKm: wavenumberFor(cell.faceId),
       secondaryPhaseRadians,
       tertiaryPhaseRadians,
