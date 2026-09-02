@@ -107,6 +107,26 @@ test("coupled reference ensemble retains multiple compact continental systems", 
   assert.ok(reports.every((report) => report.morphology.maximumMajorElongation < 3));
 });
 
+test("resolved production tier retains complex deformation-guided terrane fronts", () => {
+  const report = evaluateTectonicWorld(simulateCoupledTectonicWorld({
+    seed: "EPOCH-11",
+    subdivisions: 4,
+    plateCount: 14,
+    historyMyr: 120,
+    timestepMyr: 2,
+    oceanFraction: 0.67,
+  }), {
+    width: 240,
+    height: 120,
+    morphology: { scalesKm: [800, 1_200, 1_800] },
+  });
+  assert.equal(report.accepted, true, report.hardFailures.join("\n"));
+  assert.ok(report.morphology.majorComponentCount >= 4);
+  assert.ok(report.morphology.maximumMajorElongation < 3);
+  assert.ok(report.morphology.openGulfSeverity < 6);
+  assert.ok(report.morphology.coastlineRichness > 0.5);
+});
+
 test("evaluation rejects incomplete or duplicate canonical face data", () => {
   const world = simulateTectonicWorld({ subdivisions: 1, plateCount: 5, historyMyr: 20 });
   assert.throws(

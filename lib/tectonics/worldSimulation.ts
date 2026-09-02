@@ -13,8 +13,11 @@ import {
 import { createRandom, type RandomSource } from "./random.ts";
 import {
   angleBetweenUnitVectors,
+  cross3,
   dot3,
+  length3,
   normalize3,
+  scale3,
   subtract3,
   type Vec3,
 } from "./vector.ts";
@@ -204,6 +207,13 @@ function mixedNoise(point: Vec3, seed: number): number {
   );
 }
 
+function tangentUnitVector(direction: Vec3, point: Vec3): Vec3 {
+  const projected = subtract3(direction, scale3(point, dot3(direction, point)));
+  if (length3(projected) > 1e-10) return normalize3(projected);
+  const reference: Vec3 = Math.abs(point[2]) < 0.88 ? [0, 0, 1] : [0, 1, 0];
+  return normalize3(cross3(reference, point));
+}
+
 function createPlateSeeds(random: RandomSource, plateCount: number): Vec3[] {
   const seeds: Vec3[] = [];
   const minimumSeparation = Math.min(0.72, 2.25 / Math.sqrt(plateCount));
@@ -311,6 +321,17 @@ interface ContinentalGrowthResult {
   readonly accretionInheritance: Float64Array;
 }
 
+interface TerraneDeformationGuide {
+  readonly origin: Vec3;
+  /** Locally projected material grain inherited from primordial plate motion. */
+  readonly axis: Vec3;
+  readonly transverseAxis: Vec3;
+  readonly phase: number;
+  readonly fieldSeed: number;
+  readonly aspectStrength: number;
+  readonly equivalentRadiusRadians: number;
+}
+
 function continentalGraphRegions(
   sphere: GeodesicSphere,
   plates: readonly TectonicPlateState[],
@@ -319,9 +340,14 @@ function continentalGraphRegions(
   random: RandomSource,
   seedHash: number,
   radiusKm: number,
+  deformationGuided = false,
 ): ContinentalGrowthResult {
   const plateNeighbors = plates.map(() => new Set<number>());
   const boundaryRegimes = new Map<number, BoundaryKind>();
+  // Subdivision 3 cannot resolve a deformation belt and ocean on both sides;
+  // applying the field there aliases folds into one-cell bridges. Production
+  // subdivision 4+ has enough control volumes for this geometry.
+  const resolvedDeformation = deformationGuided && sphere.subdivisions >= 4;
   for (const edge of sphere.edges) {
     const first = plateByFace[edge.faces[0]];
     const second = plateByFace[edge.faces[1]];
@@ -526,6 +552,75 @@ function continentalGraphRegions(
   // peninsulas without prescribing a final continent count.
   const frontBudgetReserve = 1.2;
   const budgets = frontRawWeights.map((weight) => targetArea * weight * frontBudgetReserve);
+  const deformationGuides: readonly TerraneDeformationGuide[] = resolvedDeformation
+    ? frontFaces.map((faceId, frontId) => {
+      const origin = sphere.faces[faceId].center;
+      const plateVelocity = surfaceVelocityKmPerMyr(
+        plates[plateByFace[faceId]].pole,
+        origin,
+        radiusKm,
+      );
+      const motionAxis = length3(plateVelocity) > 1e-9
+        ? normalize3(plateVelocity)
+        : tangentUnitVector(directions[frontId], origin);
+      const perturbation = tangentUnitVector(directions[frontId], origin);
+      // Neighboring terranes share only part of the plate-wide velocity grain;
+      // local inherited fabric supplies the rest. Strongly aligning every
+      // front to present motion makes whole communities bridge in parallel.
+      const motionWeight = random.range(0.24, 0.46);
+      const axis = tangentUnitVector([
+        motionAxis[0] * motionWeight + perturbation[0] * (1 - motionWeight),
+        motionAxis[1] * motionWeight + perturbation[1] * (1 - motionWeight),
+        motionAxis[2] * motionWeight + perturbation[2] * (1 - motionWeight),
+      ], origin);
+      return {
+        origin,
+        axis,
+        transverseAxis: normalize3(cross3(origin, axis)),
+        phase: random.range(-Math.PI, Math.PI),
+        fieldSeed: seedHash + frontId * 7_919 + 61_003,
+        // A modest aspect ratio reads as deformed crust without recreating the
+        // long ribbon continents rejected by the morphology gate.
+        aspectStrength: random.range(0.1, 0.2),
+        equivalentRadiusRadians: Math.sqrt(Math.max(1e-12, budgets[frontId]) / Math.PI),
+      };
+    })
+    : [];
+  const guidedResistance = (
+    frontId: number,
+    currentId: number,
+    neighborId: number,
+  ): number => {
+    const guide = deformationGuides[frontId];
+    if (!guide) return 0;
+    const current = sphere.faces[currentId].center;
+    const neighbor = sphere.faces[neighborId].center;
+    const edgeAxis = tangentUnitVector(subtract3(neighbor, current), current);
+    const localGrain = tangentUnitVector(guide.axis, current);
+    const alignment = Math.abs(dot3(edgeAxis, localGrain));
+    const anisotropy = 1 + guide.aspectStrength * (0.55 - alignment);
+
+    // Coherent resistant belts survive path integration, unlike white noise.
+    // They leave broad reentrants between accreted blocks; the lower-amplitude
+    // negative half of the field permits capes without drawing thin tendrils.
+    const physicalScale = Math.max(0.55, Math.min(2.25, radiusKm / 6_371));
+    const foldedPhase = (
+      dot3(neighbor, guide.axis) * 8.3
+      + dot3(neighbor, guide.transverseAxis) * 3.7
+    ) * physicalScale + guide.phase;
+    const folded = Math.sin(foldedPhase) * 0.58
+      + physicalShorelineNoise(neighbor, guide.fieldSeed, radiusKm) * 0.42;
+    const resistantBelt = Math.max(0, folded - 0.42) ** 1.65 * 0.55;
+    const promontoryCorridor = Math.max(0, -folded - 0.62) * 0.07;
+
+    // A soft physical reach limit keeps difficult belts from diverting a front
+    // into a continent-scale filament. It does not prescribe the outline: the
+    // budget and competition still decide where the shoreline closes.
+    const reach = angleBetweenUnitVectors(guide.origin, neighbor)
+      / Math.max(1e-6, guide.equivalentRadiusRadians);
+    const reachPenalty = Math.max(0, reach - 1.34) ** 2 * 0.84;
+    return Math.max(0.42, anisotropy + resistantBelt - promontoryCorridor + reachPenalty);
+  };
   const frontAreas = new Float64Array(frontFaces.length);
   const regions = new Int32Array(sphere.faces.length).fill(-1);
   const terranes = new Int32Array(sphere.faces.length).fill(-1);
@@ -582,8 +677,12 @@ function continentalGraphRegions(
             ? -0.08
             : 0.2;
       const polarResistance = Math.max(0, Math.abs(neighbor.center[2]) - 0.76) * 2.2;
+      const structuralResistance = resolvedDeformation
+        ? Math.exp(noise * 0.82 - directionGain * 0.32)
+          * guidedResistance(entry.regionId, entry.faceId, neighborId)
+        : Math.exp(noise * 0.82 - directionGain * 0.32);
       const resistance = Math.max(0.18,
-        Math.exp(noise * 0.82 - directionGain * 0.32) + polarResistance
+        structuralResistance + polarResistance
         + (crossesPlate ? tectonicCrossingCost - neighborBuoyancy * 0.06 : -0.05));
       const cost = entry.cost + distance * resistance;
       if (cost < costs[entry.regionId][neighborId]) {
@@ -614,7 +713,11 @@ function continentalGraphRegions(
       const high = Math.max(fromId, neighborId);
       const crossingKind = boundaryRegimes.get(low * sphere.faces.length + high);
       const crossing = crossingKind === "divergent" ? 1.2 : crossingKind === "transform" ? 0.3 : 0;
-      const cost = baseCost + Math.max(0.12, Math.exp(noise * 0.9) + crossing);
+      const frontId = terranes[fromId];
+      const structuralResistance = resolvedDeformation && frontId >= 0
+        ? Math.exp(noise * 0.9) * guidedResistance(frontId, fromId, neighborId)
+        : Math.exp(noise * 0.9);
+      const cost = baseCost + Math.max(0.12, structuralResistance + crossing);
       if (cost < fallbackCosts[neighborId]) {
         fallbackCosts[neighborId] = cost;
         fallbackRegions[neighborId] = regionId;
@@ -773,6 +876,7 @@ function createInitialCells(
     random,
     hash,
     radiusKm,
+    inheritanceEnabled,
   );
   const provinces = continentalProvinceFields(sphere, continentalGrowth, adjacency);
   return sphere.faces.map((face) => {
