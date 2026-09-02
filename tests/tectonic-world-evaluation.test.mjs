@@ -127,6 +127,27 @@ test("resolved production tier retains complex deformation-guided terrane fronts
   assert.ok(report.morphology.coastlineRichness > 0.5);
 });
 
+test("large worlds place supplemental terranes without destabilizing the primary skeleton", () => {
+  const report = evaluateTectonicWorld(simulateCoupledTectonicWorld({
+    seed: "EPOCH-11",
+    subdivisions: 4,
+    radiusKm: 9_500,
+    plateCount: 14,
+    historyMyr: 120,
+    timestepMyr: 2,
+    oceanFraction: 0.67,
+  }), {
+    width: 240,
+    height: 120,
+    morphology: { scalesKm: [800, 1_200, 1_800] },
+  });
+  assert.equal(report.accepted, true, report.hardFailures.join("\n"));
+  assert.ok(report.morphology.majorComponentCount >= 8);
+  assert.ok(report.morphology.openGulfSeverity < 8);
+  assert.ok(report.morphology.neckSplitPersistence < 0.75);
+  assert.ok(report.morphology.coastlineRichness > 0.5);
+});
+
 test("evaluation rejects incomplete or duplicate canonical face data", () => {
   const world = simulateTectonicWorld({ subdivisions: 1, plateCount: 5, historyMyr: 20 });
   assert.throws(

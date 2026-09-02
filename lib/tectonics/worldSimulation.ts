@@ -384,6 +384,7 @@ function continentalGraphRegions(
   // initialization capacity: later transport can join, split, drown, or expose
   // these communities, so it is not a requested final continent count.
   const relativeSurfaceArea = (radiusKm / 6_371) ** 2;
+  const regionalPlacementEnabled = resolvedDeformation && relativeSurfaceArea >= 1.35;
   const additionalCommunities = Math.max(0, Math.round((relativeSurfaceArea - 1) * 2.5));
   const communityCount = Math.min(
     plates.length,
@@ -501,6 +502,7 @@ function continentalGraphRegions(
   ));
   const totalWeight = rawWeights.reduce((sum, weight) => sum + weight, 0);
   const targetArea = sphere.totalAreaSteradians * 0.38;
+  const meanControlCellRadians = Math.sqrt(sphere.totalAreaSteradians / sphere.faces.length);
   const frontFaces: number[] = [];
   const frontRegions: number[] = [];
   const frontRawWeights: number[] = [];
@@ -536,6 +538,68 @@ function continentalGraphRegions(
       if (!lobeFaces.includes(faceId)) lobeFaces.push(faceId);
     }
     const lobeWeights = lobeFaces.map((_, index) => index === 0 ? 1.7 : random.range(0.34, 1.08));
+    if (regionalPlacementEnabled && regionId >= distinctPlateNucleusCount) {
+      // The legacy walks above still consume the historical random stream so
+      // budgets and later dynamics remain directly comparable. Large-world
+      // supplemental placement itself is selected from a bounded regional
+      // annulus using a private stream. Primary plate nuclei retain their
+      // proven assembly; weight-aware reach keeps new accreted blocks attached
+      // while allowing the larger ones to shape a broad cape or embayment.
+      const nucleus = sphere.faces[nucleusFaces[regionId]].center;
+      const regionalRadius = Math.max(
+        meanControlCellRadians * 4,
+        Math.sqrt(targetArea * groupBudgetShare / Math.PI),
+      );
+      const placedFaces = [nucleusFaces[regionId]];
+      for (let index = 1; index < lobeFaces.length; index += 1) {
+        const lobe = index - 1;
+        const placementRandom = createRandom(`${seedHash}:regional-lobe:${regionId}:${lobe}`);
+        const guide = tangentUnitVector(randomUnitVector(placementRandom), nucleus);
+        const weightScale = Math.sqrt(Math.max(0, Math.min(1, lobeWeights[index] / 1.08)));
+        const desiredDistance = regionalRadius * (
+          0.12 + weightScale * placementRandom.range(0.12, 0.24)
+        );
+        const maximumDistance = regionalRadius * (0.24 + weightScale * 0.2);
+        let regionalFaceId = lobeFaces[index];
+        let regionalScore = -Infinity;
+        for (const candidate of sphere.faces) {
+          if (placedFaces.includes(candidate.id)) continue;
+          const distance = angleBetweenUnitVectors(nucleus, candidate.center);
+          if (distance < meanControlCellRadians * 1.65 || distance > maximumDistance) continue;
+          const candidatePlateId = plateByFace[candidate.id];
+          const nucleusPlateId = nucleusPlates[regionId];
+          const samePlate = candidatePlateId === nucleusPlateId;
+          const neighboringPlate = plateNeighbors[nucleusPlateId].has(candidatePlateId);
+          if (!samePlate && !neighboringPlate) continue;
+          const candidateDirection = tangentUnitVector(subtract3(candidate.center, nucleus), nucleus);
+          const directionFit = dot3(candidateDirection, guide);
+          const radialError = Math.abs(distance - desiredDistance)
+            / Math.max(meanControlCellRadians, regionalRadius * 0.16);
+          const separation = Math.min(...placedFaces.map((existingId) => (
+            angleBetweenUnitVectors(candidate.center, sphere.faces[existingId].center)
+          )));
+          const normalizedSeparation = separation / regionalRadius;
+          const crowdingPenalty = Math.max(0, 0.16 - normalizedSeparation) * 3.2;
+          const plateAffinity = samePlate ? 0.08 : 0.025;
+          const texture = mixedNoise(
+            candidate.center,
+            seedHash + regionId * 1_009 + lobe * 97 + 29_003,
+          );
+          const score = directionFit * 0.28
+            - radialError * 0.62
+            + Math.min(0.5, normalizedSeparation) * 0.18
+            + plateAffinity
+            + texture * 0.06
+            - crowdingPenalty;
+          if (score > regionalScore || (score === regionalScore && candidate.id < regionalFaceId)) {
+            regionalScore = score;
+            regionalFaceId = candidate.id;
+          }
+        }
+        lobeFaces[index] = regionalFaceId;
+        placedFaces.push(regionalFaceId);
+      }
+    }
     const lobeWeightTotal = lobeWeights.reduce((sum, weight) => sum + weight, 0);
     for (let index = 0; index < lobeFaces.length; index += 1) {
       frontFaces.push(lobeFaces[index]);
