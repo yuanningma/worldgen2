@@ -389,6 +389,12 @@ export interface SurfaceProcessStats {
   readonly aridLandFraction: number;
   readonly humidLandFraction: number;
   readonly maximumOrographicLiftKm: number;
+  /** Fine surface-edge segments carrying an active or inherited orogenic source. */
+  readonly orogenicSourceSegmentCount: number;
+  /** Cells inside a resolved collision, arc, subduction, or suture core. */
+  readonly orogenicCoreCellCount: number;
+  /** Largest adjacent change in the resolved orogenic support field. */
+  readonly maximumNeighborOrogenStrengthJump: number;
   /** Naturally selected broad continental-interior uplift centers. */
   readonly continentalReliefCenterCount: number;
   readonly maximumContinentalReliefKm: number;
@@ -545,9 +551,11 @@ interface KdNode {
 interface PresentationDetailBand {
   readonly directionA: Vec3;
   readonly directionB: Vec3;
+  readonly directionC: Vec3;
   readonly frequency: number;
   readonly phaseA: number;
   readonly phaseB: number;
+  readonly phaseC: number;
   readonly weight: number;
 }
 
@@ -560,6 +568,21 @@ interface PhysicalReliefBand {
   readonly phaseB: number;
   readonly phaseC: number;
   readonly weight: number;
+}
+
+interface SurfaceOrogenySource {
+  collisionStrength: number;
+  subductionStrength: number;
+  subductionLandwardFaceId: number | null;
+  islandArcStrength: number;
+  sutureStrength: number;
+}
+
+interface SurfaceOrogenyField {
+  readonly cells: readonly CanonicalOrogenyCell[];
+  readonly sourceSegmentCount: number;
+  readonly coreCellCount: number;
+  readonly maximumNeighborStrengthJump: number;
 }
 
 class ElevationHeap {
@@ -659,9 +682,11 @@ function createPresentationDetailBands(seed: number): readonly PresentationDetai
     return {
       directionA: direction(0),
       directionB: direction(1),
+      directionC: direction(2),
       frequency,
       phaseA: phase(0),
       phaseB: phase(1),
+      phaseC: phase(2),
       weight: weights[octave],
     };
   });
@@ -673,11 +698,19 @@ function samplePresentationDetail(
 ): number {
   let value = 0;
   for (const band of bands) {
-    const argumentA = dot3(point, band.directionA) * band.frequency + band.phaseA;
     const argumentB = dot3(point, band.directionB) * band.frequency * 0.79 + band.phaseB;
-    const sineA = Math.sin(argumentA);
-    const sineB = Math.sin(argumentB);
-    value += sineA * sineB * band.weight;
+    const argumentC = dot3(point, band.directionC) * band.frequency * 0.61 + band.phaseC;
+    const waveB = Math.sin(argumentB);
+    const waveC = Math.sin(argumentC);
+    const argumentA = dot3(point, band.directionA) * band.frequency
+      + band.phaseA
+      + waveB * 0.91
+      + waveC * 0.44;
+    const waveA = Math.sin(argumentA);
+    const cellularCross = Math.sin(argumentB + waveC * 0.69)
+      * Math.cos(argumentC - waveA * 0.41);
+    value += (waveA * 0.57 + waveB * 0.17 + waveC * 0.11 + cellularCross * 0.15)
+      * band.weight;
   }
   return value;
 }
@@ -935,6 +968,389 @@ function createContinentalReliefStructure(
     maximumSupportKm = Math.max(maximumSupportKm, supportKm[face.id]);
   }
   return { supportKm, centers, centerCount: centers.length, maximumSupportKm };
+}
+
+function canonicalPairKey(firstFaceId: number, secondFaceId: number): string {
+  return firstFaceId < secondFaceId
+    ? `${firstFaceId}:${secondFaceId}`
+    : `${secondFaceId}:${firstFaceId}`;
+}
+
+function surfaceSourceDistance(
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  isLand: readonly boolean[],
+  seedDistanceKm: Float64Array,
+  seedStrength: Float64Array,
+  radiusKm: number,
+): { readonly distanceKm: Float64Array; readonly sourceStrength: Float64Array } {
+  const distanceKm = new Float64Array(seedDistanceKm);
+  const sourceStrength = new Float64Array(seedStrength);
+  const heap = new ElevationHeap();
+  for (let faceId = 0; faceId < distanceKm.length; faceId += 1) {
+    if (!isLand[faceId] || !Number.isFinite(distanceKm[faceId]) || sourceStrength[faceId] <= 0) {
+      distanceKm[faceId] = Infinity;
+      sourceStrength[faceId] = 0;
+      continue;
+    }
+    heap.push({ faceId, priority: distanceKm[faceId] });
+  }
+  for (let entry = heap.pop(); entry; entry = heap.pop()) {
+    if (entry.priority > distanceKm[entry.faceId] + 1e-9) continue;
+    const center = sphere.faces[entry.faceId].center;
+    for (const neighborId of adjacency[entry.faceId]) {
+      if (!isLand[neighborId]) continue;
+      const stepKm = Math.acos(clamp(
+        dot3(center, sphere.faces[neighborId].center),
+        -1,
+        1,
+      )) * radiusKm;
+      const candidateDistance = entry.priority + stepKm;
+      const improvesDistance = candidateDistance + 1e-9 < distanceKm[neighborId];
+      const tiesWithStrongerSource = Math.abs(candidateDistance - distanceKm[neighborId]) <= 1e-9
+        && sourceStrength[entry.faceId] > sourceStrength[neighborId];
+      if (!improvesDistance && !tiesWithStrongerSource) continue;
+      distanceKm[neighborId] = candidateDistance;
+      sourceStrength[neighborId] = sourceStrength[entry.faceId];
+      heap.push({ faceId: neighborId, priority: candidateDistance });
+    }
+  }
+  return { distanceKm, sourceStrength };
+}
+
+function orogenicCoreProfile(
+  distanceKm: number,
+  sourceStrength: number,
+  widthKm: number,
+): number {
+  if (!Number.isFinite(distanceKm) || sourceStrength <= 0) return 0;
+  return clamp(sourceStrength * Math.exp(-0.5 * (distanceKm / widthKm) ** 2));
+}
+
+function orogenicBandProfile(
+  distanceKm: number,
+  sourceStrength: number,
+  peakKm: number,
+  widthKm: number,
+): number {
+  if (!Number.isFinite(distanceKm) || sourceStrength <= 0) return 0;
+  return sourceStrength * Math.exp(-0.5 * ((distanceKm - peakKm) / widthKm) ** 2);
+}
+
+/**
+ * Lift canonical tectonic edges onto the nested process mesh before deriving
+ * mountain profiles. Canonical orogeny remains the causal source, while
+ * physical-distance propagation on the finer mesh removes face-sized sheets
+ * and resolves finite-width, along-strike-varying ranges.
+ */
+function createSurfaceOrogenyField(
+  world: TectonicWorldModel,
+  sphere: GeodesicSphere,
+  adjacency: readonly number[][],
+  isLand: readonly boolean[],
+  canonicalOrogeny: readonly CanonicalOrogenyCell[],
+  seed: number,
+): SurfaceOrogenyField {
+  const descendantsPerCanonical = 4 ** (sphere.subdivisions - world.sphere.subdivisions);
+  const sourceByCanonicalPair = new Map<string, SurfaceOrogenySource>();
+  const sourceFor = (firstFaceId: number, secondFaceId: number): SurfaceOrogenySource => {
+    const key = canonicalPairKey(firstFaceId, secondFaceId);
+    const existing = sourceByCanonicalPair.get(key);
+    if (existing) return existing;
+    const source: SurfaceOrogenySource = {
+      collisionStrength: 0,
+      subductionStrength: 0,
+      subductionLandwardFaceId: null,
+      islandArcStrength: 0,
+      sutureStrength: 0,
+    };
+    sourceByCanonicalPair.set(key, source);
+    return source;
+  };
+  const continentalFraction = (faceId: number): number => {
+    const cell = world.cells[faceId];
+    return clamp(cell.continentalFraction ?? (cell.crustType === "continental" ? 1 : 0));
+  };
+
+  for (const boundary of world.boundaries) {
+    if (boundary.kind !== "convergent") continue;
+    const edge = world.sphere.edges[boundary.edgeId];
+    const [firstFaceId, secondFaceId] = edge.faces;
+    const firstContinental = continentalFraction(firstFaceId) >= 0.48;
+    const secondContinental = continentalFraction(secondFaceId) >= 0.48;
+    const source = sourceFor(firstFaceId, secondFaceId);
+    if (firstContinental && secondContinental) {
+      source.collisionStrength = Math.max(
+        source.collisionStrength,
+        canonicalOrogeny[firstFaceId].collisionCore,
+        canonicalOrogeny[secondFaceId].collisionCore,
+      );
+    } else if (firstContinental !== secondContinental) {
+      const landwardFaceId = firstContinental ? firstFaceId : secondFaceId;
+      source.subductionStrength = Math.max(
+        source.subductionStrength,
+        canonicalOrogeny[landwardFaceId].subductionCore,
+      );
+      source.subductionLandwardFaceId = landwardFaceId;
+    } else {
+      source.islandArcStrength = Math.max(
+        source.islandArcStrength,
+        canonicalOrogeny[firstFaceId].islandArcCore,
+        canonicalOrogeny[secondFaceId].islandArcCore,
+      );
+    }
+  }
+  for (const edge of world.sphere.edges) {
+    const [firstFaceId, secondFaceId] = edge.faces;
+    if (continentalFraction(firstFaceId) < 0.48
+      || continentalFraction(secondFaceId) < 0.48
+      || world.cells[firstFaceId].provenanceId === world.cells[secondFaceId].provenanceId) {
+      continue;
+    }
+    const source = sourceFor(firstFaceId, secondFaceId);
+    source.sutureStrength = Math.max(
+      source.sutureStrength,
+      canonicalOrogeny[firstFaceId].sutureCore,
+      canonicalOrogeny[secondFaceId].sutureCore,
+    );
+  }
+
+  const createSeedField = (): {
+    readonly distanceKm: Float64Array;
+    readonly strength: Float64Array;
+  } => ({
+    distanceKm: new Float64Array(sphere.faces.length).fill(Infinity),
+    strength: new Float64Array(sphere.faces.length),
+  });
+  const collisionSeeds = createSeedField();
+  const subductionSeeds = createSeedField();
+  const islandArcSeeds = createSeedField();
+  const sutureSeeds = createSeedField();
+  let sourceSegmentCount = 0;
+  const applySeed = (
+    field: { readonly distanceKm: Float64Array; readonly strength: Float64Array },
+    faceId: number,
+    distanceKm: number,
+    strength: number,
+  ): void => {
+    if (!isLand[faceId] || strength <= 0) return;
+    if (distanceKm + 1e-9 < field.distanceKm[faceId]
+      || (Math.abs(distanceKm - field.distanceKm[faceId]) <= 1e-9
+        && strength > field.strength[faceId])) {
+      field.distanceKm[faceId] = distanceKm;
+      field.strength[faceId] = strength;
+    }
+  };
+
+  for (const edge of sphere.edges) {
+    const [firstFaceId, secondFaceId] = edge.faces;
+    const firstCanonicalFaceId = Math.floor(firstFaceId / descendantsPerCanonical);
+    const secondCanonicalFaceId = Math.floor(secondFaceId / descendantsPerCanonical);
+    if (firstCanonicalFaceId === secondCanonicalFaceId) continue;
+    const source = sourceByCanonicalPair.get(canonicalPairKey(
+      firstCanonicalFaceId,
+      secondCanonicalFaceId,
+    ));
+    if (!source) continue;
+    const hasSource = source.collisionStrength > 0
+      || source.subductionStrength > 0
+      || source.islandArcStrength > 0
+      || source.sutureStrength > 0;
+    if (!hasSource) continue;
+    sourceSegmentCount += 1;
+    const firstCenter = sphere.faces[firstFaceId].center;
+    const secondCenter = sphere.faces[secondFaceId].center;
+    const boundaryDistanceKm = Math.acos(clamp(dot3(firstCenter, secondCenter), -1, 1))
+      * world.recipe.radiusKm * 0.5;
+    const midpoint = normalize3([
+      firstCenter[0] + secondCenter[0],
+      firstCenter[1] + secondCenter[1],
+      firstCenter[2] + secondCenter[2],
+    ]);
+    const segmentVariation = 0.72 + clamp(
+      sphericalNoise(midpoint, seed + 48_211) * 0.5 + 0.5,
+    ) * 0.34;
+    for (const faceId of edge.faces) {
+      const canonicalFaceId = Math.floor(faceId / descendantsPerCanonical);
+      applySeed(
+        collisionSeeds,
+        faceId,
+        boundaryDistanceKm,
+        source.collisionStrength * segmentVariation,
+      );
+      if (source.subductionLandwardFaceId === canonicalFaceId) {
+        applySeed(
+          subductionSeeds,
+          faceId,
+          boundaryDistanceKm,
+          source.subductionStrength * segmentVariation,
+        );
+      }
+      applySeed(
+        islandArcSeeds,
+        faceId,
+        boundaryDistanceKm,
+        source.islandArcStrength * segmentVariation,
+      );
+      applySeed(
+        sutureSeeds,
+        faceId,
+        boundaryDistanceKm,
+        source.sutureStrength * (0.78 + (segmentVariation - 0.72) * 0.65),
+      );
+    }
+  }
+
+  const distanceField = (
+    field: { readonly distanceKm: Float64Array; readonly strength: Float64Array },
+  ): { readonly distanceKm: Float64Array; readonly sourceStrength: Float64Array } => (
+    surfaceSourceDistance(
+      sphere,
+      adjacency,
+      isLand,
+      field.distanceKm,
+      field.strength,
+      world.recipe.radiusKm,
+    )
+  );
+  const collision = distanceField(collisionSeeds);
+  const subduction = distanceField(subductionSeeds);
+  const islandArc = distanceField(islandArcSeeds);
+  const suture = distanceField(sutureSeeds);
+  const cells = sphere.faces.map((face): CanonicalOrogenyCell => {
+    if (!isLand[face.id]) {
+      return {
+        faceId: face.id,
+        regime: "none",
+        collisionCore: 0,
+        subductionCore: 0,
+        islandArcCore: 0,
+        sutureCore: 0,
+        foothillStrength: 0,
+        forelandBasinStrength: 0,
+        flexuralBulgeStrength: 0,
+        strength: 0,
+      };
+    }
+    const collisionCore = orogenicCoreProfile(
+      collision.distanceKm[face.id],
+      collision.sourceStrength[face.id],
+      410,
+    );
+    const subductionCore = orogenicCoreProfile(
+      subduction.distanceKm[face.id],
+      subduction.sourceStrength[face.id],
+      340,
+    );
+    const islandArcCore = orogenicCoreProfile(
+      islandArc.distanceKm[face.id],
+      islandArc.sourceStrength[face.id],
+      250,
+    );
+    const sutureCore = orogenicCoreProfile(
+      suture.distanceKm[face.id],
+      suture.sourceStrength[face.id],
+      310,
+    );
+    const core = Math.max(collisionCore, subductionCore, islandArcCore, sutureCore * 0.72);
+    const broadEnvelope = Math.max(
+      orogenicCoreProfile(
+        collision.distanceKm[face.id],
+        collision.sourceStrength[face.id],
+        980,
+      ),
+      orogenicCoreProfile(
+        subduction.distanceKm[face.id],
+        subduction.sourceStrength[face.id],
+        820,
+      ),
+      orogenicCoreProfile(
+        islandArc.distanceKm[face.id],
+        islandArc.sourceStrength[face.id],
+        560,
+      ),
+      orogenicCoreProfile(
+        suture.distanceKm[face.id],
+        suture.sourceStrength[face.id],
+        720,
+      ) * 0.72,
+    );
+    const foothillStrength = clamp(broadEnvelope - core * 0.42);
+    const collisionForeland = orogenicBandProfile(
+      collision.distanceKm[face.id],
+      collision.sourceStrength[face.id],
+      720,
+      340,
+    );
+    const subductionForeland = orogenicBandProfile(
+      subduction.distanceKm[face.id],
+      subduction.sourceStrength[face.id],
+      790,
+      360,
+    );
+    const forelandBasinStrength = clamp(
+      Math.max(collisionForeland, subductionForeland) * (1 - core * 0.78),
+    );
+    const collisionBulge = orogenicBandProfile(
+      collision.distanceKm[face.id],
+      collision.sourceStrength[face.id],
+      1_460,
+      430,
+    );
+    const subductionBulge = orogenicBandProfile(
+      subduction.distanceKm[face.id],
+      subduction.sourceStrength[face.id],
+      1_580,
+      450,
+    );
+    const flexuralBulgeStrength = clamp(
+      Math.max(collisionBulge, subductionBulge)
+        * (1 - forelandBasinStrength * 0.62)
+        * (1 - core * 0.88),
+    );
+    const strengths: readonly [OrogenRegime, number][] = [
+      ["collision", collisionCore],
+      ["subduction", subductionCore],
+      ["island-arc", islandArcCore],
+      ["suture", sutureCore * 0.72],
+    ];
+    const [regime, dominant] = strengths.reduce(
+      (best, candidate) => candidate[1] > best[1] ? candidate : best,
+      ["none", 0] as readonly [OrogenRegime, number],
+    );
+    return {
+      faceId: face.id,
+      regime: dominant >= 0.08 ? regime : "none",
+      collisionCore,
+      subductionCore,
+      islandArcCore,
+      sutureCore,
+      foothillStrength,
+      forelandBasinStrength,
+      flexuralBulgeStrength,
+      strength: clamp(core + foothillStrength * 0.34),
+    };
+  });
+  const coreCellCount = cells.filter((cell) => Math.max(
+    cell.collisionCore,
+    cell.subductionCore,
+    cell.islandArcCore,
+    cell.sutureCore * 0.72,
+  ) >= 0.25).length;
+  let maximumNeighborStrengthJump = 0;
+  for (const edge of sphere.edges) {
+    if (!isLand[edge.faces[0]] || !isLand[edge.faces[1]]) continue;
+    maximumNeighborStrengthJump = Math.max(
+      maximumNeighborStrengthJump,
+      Math.abs(cells[edge.faces[0]].strength - cells[edge.faces[1]].strength),
+    );
+  }
+  return {
+    cells,
+    sourceSegmentCount,
+    coreCellCount,
+    maximumNeighborStrengthJump,
+  };
 }
 
 function canonicalGeologyContext(world: TectonicWorldModel): {
@@ -1394,8 +1810,6 @@ function climateScaleElevation(
   const rawElevation = Float64Array.from(cells.map((cell) => (
     cell.isLand ? Math.max(0, cell.elevationKm - seaLevelKm) : 0
   )));
-  if (sphere.subdivisions <= 4) return rawElevation;
-  let elevation = new Float64Array(rawElevation);
   const characteristicStepKm = sphere.edges.reduce(
     (sum, edge) => sum + edge.arcLengthRadians * radiusKm,
     0,
@@ -1404,7 +1818,18 @@ function climateScaleElevation(
   // newly resolved drainage wrinkle. This is a compact subgrid-orography
   // model: hydrology retains the full terrain, while lapse rate and moisture
   // transport sample approximately 220 km support at every mesh density.
-  const diffusionAmount = (220 / Math.max(1, characteristicStepKm)) ** 2;
+  // The mesh cell already supplies part of that footprint, so only diffuse
+  // the unresolved remainder. Applying the entire 220 km kernel as soon as
+  // subdivisions crossed an integer boundary created a false climate jump
+  // between otherwise converging process meshes.
+  const climateSupportKm = 220;
+  const unresolvedSupportKm = Math.sqrt(Math.max(
+    0,
+    climateSupportKm ** 2 - characteristicStepKm ** 2,
+  ));
+  if (unresolvedSupportKm <= 1) return rawElevation;
+  let elevation = new Float64Array(rawElevation);
+  const diffusionAmount = (unresolvedSupportKm / Math.max(1, characteristicStepKm)) ** 2;
   const passes = Math.max(1, Math.ceil(diffusionAmount / 0.45));
   const blend = Math.min(0.45, diffusionAmount / passes);
   for (let pass = 0; pass < passes; pass += 1) {
@@ -1505,7 +1930,10 @@ function simulateSurfaceClimate(
       : 0;
   }
 
-  const transportPasses = Math.max(12, Math.round(36 / Math.max(0.1, distanceScale)));
+  // Relax across a fixed ~5,760 km annual moisture horizon. The former
+  // ~4,320 km horizon stopped before continental interiors equilibrated, so
+  // coarse-grid numerical mixing made the same world spuriously wetter.
+  const transportPasses = Math.max(15, Math.round(48 / Math.max(0.1, distanceScale)));
   for (let pass = 0; pass < transportPasses; pass += 1) {
     const next = new Float64Array(cells.length);
     for (const cell of cells) {
@@ -3348,6 +3776,35 @@ function createRiverPresentationPath(
     tangentScale *= 0.7;
     path = buildPath(meanderAmplitudeRadians, tangentScale);
   }
+  if (path.slice(1, -1).some((point) => !isLandAt(point))) {
+    // A newly selected drainage reach can run beside a deeply indented coast,
+    // where even a zero-amplitude Hermite tangent briefly leaves land. Pull
+    // only offending presentation samples back to their nearest valid reach
+    // endpoint. The receiver graph and process elevations remain unchanged.
+    path = path.map((point, index) => {
+      if (index === 0 || index === path.length - 1 || isLandAt(point)) return point;
+      const anchors = [fromPoint, ...(isLandAt(toPoint) ? [toPoint] : [])];
+      let best = fromPoint;
+      let bestAlignment = -Infinity;
+      for (const anchor of anchors) {
+        let landAmount = 0;
+        let waterAmount = 1;
+        for (let iteration = 0; iteration < 24; iteration += 1) {
+          const amount = (landAmount + waterAmount) * 0.5;
+          const candidate = sphericalMix(anchor, point, amount);
+          if (isLandAt(candidate)) landAmount = amount;
+          else waterAmount = amount;
+        }
+        const candidate = sphericalMix(anchor, point, landAmount * 0.995);
+        const alignment = dot3(candidate, point);
+        if (alignment > bestAlignment) {
+          best = candidate;
+          bestAlignment = alignment;
+        }
+      }
+      return best;
+    });
+  }
   return {
     path,
     confinement,
@@ -3687,6 +4144,15 @@ export function createSurfaceProcessWorld(
   const coastalPlainScale = clamp(options.coastalPlainScale ?? 1, 0, 2);
   const hashedSeed = seedHash(tectonicWorld.recipe.seed);
   const geologyContext = canonicalGeologyContext(tectonicWorld);
+  const refinedSamples = sphere.faces.map((face) => refinement.sample(face.center));
+  const surfaceOrogeny = createSurfaceOrogenyField(
+    tectonicWorld,
+    sphere,
+    adjacency,
+    refinedSamples.map((sample) => sample.isLand),
+    geologyContext.orogeny,
+    hashedSeed,
+  );
   const presentationDetailBands = createPresentationDetailBands(hashedSeed);
   const physicalReliefBands = createPhysicalReliefBands(
     hashedSeed + 23_911,
@@ -3698,11 +4164,11 @@ export function createSurfaceProcessWorld(
     : 0;
   const inheritedDescendantsPerAnchor = 4 ** inheritedDetailLevels;
   const cells: MutableSurfaceCell[] = sphere.faces.map((face) => {
-    const refined = refinement.sample(face.center);
+    const refined = refinedSamples[face.id];
     const canonicalFaceId = Math.floor(face.id / 4 ** detailLevels);
     const canonical = tectonicWorld.cells[canonicalFaceId];
     const rawAboveSea = refined.elevationKm - tectonicWorld.seaLevelKm;
-    const orogeny = geologyContext.orogeny[canonicalFaceId];
+    const orogeny = surfaceOrogeny.cells[face.id];
     const canonicalMargin = geologyContext.margins[canonicalFaceId];
     const orogenicAboveSea = refined.isLand
       ? shapedOrogenicHeight(rawAboveSea, orogeny, face.center, hashedSeed)
@@ -3728,7 +4194,7 @@ export function createSurfaceProcessWorld(
       aboveSea,
       canonicalFaceId,
       tectonicWorld,
-      geologyContext.sutureStrength[canonicalFaceId],
+      orogeny.sutureCore,
       canonicalMargin.activeBoundaryStrength,
       orogeny.forelandBasinStrength,
       hashedSeed,
@@ -4544,14 +5010,15 @@ export function createSurfaceProcessWorld(
     gradient[2] += valleyGradient[2];
     const surfaceTexture = samplePresentationDetail(point, presentationDetailBands);
     const elevationAboveSeaKm = elevationKm - tectonicWorld.seaLevelKm;
+    const highlandSupport = clamp((elevationAboveSeaKm - 0.45) / 3.8);
     const detailAmplitudeKm = reliefAmplitudeKm * (refined.isLand
-      ? (0.055 + clamp(elevationAboveSeaKm / 5, 0, 1) * 0.075)
+      ? (0.07 + highlandSupport * 0.14 + orogenStrength * 0.12)
         * (0.72 + erosionResistance * 0.42)
       : 0.018);
     const fineRelief = surfaceTexture * detailAmplitudeKm;
-    // Keep analytical lighting on the resolved process relief. The finer
-    // bands remain in elevation/albedo, but shading them directly at world
-    // scale creates directional aliasing before a tiled normal map exists.
+    // Fine octaves alter the sampled heightmap and albedo. A future tiled
+    // normal-map pass should shade them at the requested output scale; doing
+    // so analytically here exposes individual spectral directions as hatching.
     elevationKm = refined.isLand
       ? Math.max(
         tectonicWorld.seaLevelKm + 0.001,
@@ -4687,6 +5154,9 @@ export function createSurfaceProcessWorld(
         return areas;
       }, emptyBiomeRecord()),
       ...climateStats,
+      orogenicSourceSegmentCount: surfaceOrogeny.sourceSegmentCount,
+      orogenicCoreCellCount: surfaceOrogeny.coreCellCount,
+      maximumNeighborOrogenStrengthJump: surfaceOrogeny.maximumNeighborStrengthJump,
       continentalReliefCenterCount: geologyContext.continentalRelief.centerCount,
       maximumContinentalReliefKm: geologyContext.continentalRelief.maximumSupportKm
         * continentalReliefScale,

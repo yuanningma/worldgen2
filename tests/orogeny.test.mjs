@@ -84,6 +84,62 @@ test("boundary-supported relief narrows mountains without changing canonical lan
     && cell.elevationKm - tectonic.seaLevelKm > 3).length, 0);
 });
 
+test("nested orogenic profiles resolve within canonical faces without broad sheets", () => {
+  const surface = createSurfaceProcessWorld(tectonic, {
+    subdivisions: 4,
+    erosionStrengthKm: 0,
+  });
+  assert.ok(surface.stats.orogenicSourceSegmentCount > 0);
+  assert.ok(surface.stats.orogenicCoreCellCount > 0);
+  assert.ok(surface.stats.orogenicCoreCellCount / surface.stats.landCellCount < 0.45);
+  assert.ok(surface.stats.maximumNeighborOrogenStrengthJump < 0.65);
+
+  const strengthsByCanonicalFace = new Map();
+  for (const cell of surface.cells) {
+    if (!cell.isLand) continue;
+    const strengths = strengthsByCanonicalFace.get(cell.canonicalFaceId) ?? new Set();
+    strengths.add(Math.round(cell.orogenStrength * 10_000));
+    strengthsByCanonicalFace.set(cell.canonicalFaceId, strengths);
+  }
+  assert.ok([...strengthsByCanonicalFace.values()].some((strengths) => strengths.size >= 3));
+
+  const quietWorld = {
+    ...tectonic,
+    boundaries: [],
+    cells: tectonic.cells.map((cell) => ({ ...cell, provenanceId: 1 })),
+  };
+  const quiet = createSurfaceProcessWorld(quietWorld, {
+    subdivisions: 4,
+    erosionStrengthKm: 0,
+  });
+  assert.equal(quiet.stats.orogenicSourceSegmentCount, 0);
+  assert.equal(quiet.stats.orogenicCoreCellCount, 0);
+  assert.equal(quiet.stats.maximumNeighborOrogenStrengthJump, 0);
+});
+
+test("finite-width mountain belts remain bounded across deterministic worlds", () => {
+  for (const seed of ["RANGE-GATE-A", "RANGE-GATE-B", "RANGE-GATE-C"]) {
+    const world = simulateTectonicWorld({
+      seed,
+      subdivisions: 3,
+      plateCount: 10,
+      historyMyr: 150,
+      timestepMyr: 3,
+      oceanFraction: 0.68,
+    });
+    const surface = createSurfaceProcessWorld(world, {
+      subdivisions: 4,
+      erosionStrengthKm: 0,
+    });
+    const coreLandFraction = surface.stats.orogenicCoreCellCount
+      / surface.stats.landCellCount;
+    assert.ok(surface.stats.orogenicSourceSegmentCount > 0);
+    assert.ok(coreLandFraction > 0.05 && coreLandFraction < 0.45);
+    assert.ok(surface.stats.maximumNeighborOrogenStrengthJump < 0.65);
+    assert.equal(surface.stats.canonicalAnchorMismatches, 0);
+  }
+});
+
 test("flexural loading creates bounded sedimentary forelands without moving the coast", () => {
   const flexed = createSurfaceProcessWorld(tectonic, {
     subdivisions: 3,
