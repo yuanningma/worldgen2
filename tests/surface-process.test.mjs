@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createSurfaceProcessWorld } from "../lib/tectonics/surfaceProcess.ts";
+import { normalize3 } from "../lib/tectonics/vector.ts";
 import { simulateTectonicWorld } from "../lib/tectonics/worldSimulation.ts";
 
 const tectonic = simulateTectonicWorld({
@@ -16,6 +17,11 @@ test("nested surface grid retains canonical ancestry and topology anchors", () =
   const surface = createSurfaceProcessWorld(tectonic, { subdivisions: 4 });
   assert.equal(surface.sphere.faces.length, tectonic.sphere.faces.length * 4);
   assert.equal(surface.stats.canonicalAnchorMismatches, 0);
+  const coastalFaceIds = new Set(surface.sphere.edges.flatMap((edge) => (
+    surface.cells[edge.faces[0]].isLand !== surface.cells[edge.faces[1]].isLand
+      ? edge.faces
+      : []
+  )));
   for (const cell of surface.cells) {
     assert.equal(cell.canonicalFaceId, Math.floor(cell.faceId / 4));
     assert.ok(Number.isFinite(cell.coastDistanceKm));
@@ -23,6 +29,9 @@ test("nested surface grid retains canonical ancestry and topology anchors", () =
     assert.ok(Number.isFinite(cell.erosionResistance));
     assert.ok(cell.erosionResistance >= 0 && cell.erosionResistance <= 1);
   }
+  const coastalCells = surface.cells.filter((cell) => coastalFaceIds.has(cell.faceId));
+  assert.ok(coastalCells.length > 0);
+  assert.ok(coastalCells.every((cell) => cell.coastDistanceKm > 0));
   for (const face of surface.sphere.faces.filter((_, index) => index % 97 === 0)) {
     assert.equal(surface.sample(face.center).faceId, face.id);
   }
@@ -428,6 +437,8 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
     surface.stats.riverMouthCount,
   );
   assert.ok(surface.stats.oceanRiverMouthCount > 0);
+  assert.equal(surface.stats.oceanMouthBoundaryMismatches, 0);
+  assert.ok(surface.stats.maximumOceanMouthBoundaryErrorKm <= 0.01);
   assert.ok(surface.stats.maximumDrainageAreaKm2 > 20_000);
   const edgeByFaces = new Map(surface.sphere.edges.map((edge) => {
     const low = Math.min(...edge.faces);
@@ -454,23 +465,21 @@ test("surface runoff closes at ocean outlets and produces resolved rivers", () =
     }
     const low = Math.min(mouth.fromFaceId, mouth.toFaceId);
     const high = Math.max(mouth.fromFaceId, mouth.toFaceId);
-    const edge = edgeByFaces.get(`${low}:${high}`);
-    assert.ok(edge);
-    const vertices = edge.vertices.map((vertexId) => surface.sphere.vertices[vertexId].position);
-    const midpointLength = Math.hypot(
-      vertices[0][0] + vertices[1][0],
-      vertices[0][1] + vertices[1][1],
-      vertices[0][2] + vertices[1][2],
-    );
-    const midpoint = [
-      (vertices[0][0] + vertices[1][0]) / midpointLength,
-      (vertices[0][1] + vertices[1][1]) / midpointLength,
-      (vertices[0][2] + vertices[1][2]) / midpointLength,
-    ];
-    const alignment = midpoint[0] * mouth.point[0]
-      + midpoint[1] * mouth.point[1]
-      + midpoint[2] * mouth.point[2];
-    assert.ok(alignment > 1 - 1e-12);
+    assert.ok(edgeByFaces.has(`${low}:${high}`));
+    if (mouth.receivingWater === "ocean") {
+      assert.ok(surface.sampleContinuous(mouth.point).coastDistanceKm <= 0.01);
+      const upstream = surface.rivers.find((river) => river.fromFaceId === mouth.fromFaceId
+        && river.toFaceId === mouth.toFaceId)?.path.at(-2);
+      assert.ok(upstream);
+      assert.equal(surface.sampleContinuous(upstream).isLand, true);
+      const receiverCenter = surface.sphere.faces[mouth.toFaceId].center;
+      const justOffshore = normalize3([
+        mouth.point[0] * 0.995 + receiverCenter[0] * 0.005,
+        mouth.point[1] * 0.995 + receiverCenter[1] * 0.005,
+        mouth.point[2] * 0.995 + receiverCenter[2] * 0.005,
+      ]);
+      assert.equal(surface.sampleContinuous(justOffshore).isLand, false);
+    }
   }
 });
 
@@ -509,7 +518,9 @@ test("river presentation nodes are shared while terminal mouths lie on water bou
           center[0] * neighbor[0] + center[1] * neighbor[1] + center[2] * neighbor[2],
         )));
       }));
-      assert.ok(displacement <= localStep * (terminal ? 0.72 : 0.681));
+      // Refined mouths may move anywhere between the two preserved process
+      // face-center anchors, rather than remaining on their coarse midpoint.
+      assert.ok(displacement <= localStep * (terminal ? 1.001 : 0.681));
     }
     assert.deepEqual(river.path[0], river.fromPoint);
     assert.deepEqual(river.path.at(-1), river.toPoint);
@@ -526,6 +537,29 @@ test("river presentation nodes are shared while terminal mouths lie on water bou
         + river.fromPoint[2] * river.toPoint[2],
     ))) * tectonic.recipe.radiusKm;
     assert.ok(river.meanderAmplitudeKm <= segmentKm * 0.421);
+  }
+});
+
+test("ocean mouths resolve onto the same refined coast across deterministic worlds", () => {
+  for (const seed of ["COAST-GATE-A", "COAST-GATE-B", "COAST-GATE-C"]) {
+    const world = simulateTectonicWorld({
+      seed,
+      subdivisions: 2,
+      plateCount: 7,
+      historyMyr: 72,
+      timestepMyr: 3,
+      oceanFraction: 0.68,
+    });
+    const surface = createSurfaceProcessWorld(world, {
+      subdivisions: 3,
+      minimumRiverAreaKm2: 20_000,
+    });
+    assert.ok(surface.stats.oceanRiverMouthCount > 0);
+    assert.equal(surface.stats.oceanMouthBoundaryMismatches, 0);
+    assert.ok(surface.stats.maximumOceanMouthBoundaryErrorKm <= 0.01);
+    assert.ok(surface.riverMouths
+      .filter((mouth) => mouth.receivingWater === "ocean")
+      .every((mouth) => surface.sampleContinuous(mouth.point).coastDistanceKm <= 0.01));
   }
 });
 
@@ -765,6 +799,7 @@ test("continuous presentation sampling preserves anchors and removes cell-edge j
   assert.equal(first.isLand, true);
   assert.equal(second.isLand, true);
   assert.ok(Math.abs(first.elevationKm - second.elevationKm) < 1e-4);
+  assert.ok(Math.abs(first.coastDistanceKm - second.coastDistanceKm) < 1e-3);
   assert.ok(first.terrainGradient.every(Number.isFinite));
   assert.ok(second.terrainGradient.every(Number.isFinite));
   assert.ok(first.prevailingWind.every(Number.isFinite));

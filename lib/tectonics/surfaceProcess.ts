@@ -346,6 +346,10 @@ export interface SurfaceProcessStats {
   readonly meanNeighboringChannelAlignment: number;
   readonly riverMouthCount: number;
   readonly oceanRiverMouthCount: number;
+  /** Ocean mouths that do not resolve onto the continuous presentation coast. */
+  readonly oceanMouthBoundaryMismatches: number;
+  /** Largest residual between an ocean mouth and the refined coast. */
+  readonly maximumOceanMouthBoundaryErrorKm: number;
   readonly lakeInflowCount: number;
   readonly coastalLandformCounts: Readonly<Record<SurfaceCoastalLandform, number>>;
   readonly maximumDrainageAreaKm2: number;
@@ -1265,9 +1269,25 @@ function computeCoastDistances(
   const coastHeap = new ElevationHeap();
   for (const cell of cells) {
     cell.coastDistanceKm = Infinity;
-    if (!adjacency[cell.faceId].some((neighbor) => cells[neighbor].isLand !== cell.isLand)) continue;
-    cell.coastDistanceKm = 0;
-    coastHeap.push({ faceId: cell.faceId, priority: 0 });
+    const center = sphere.faces[cell.faceId].center;
+    // A coastal cell center is not itself the coast. Seeding the whole cell at
+    // zero produced triangular/radial margin bands in continuous renders and
+    // made coastal relief masks disagree with the displaced shoreline. The
+    // half center-to-center distance is the dual-grid estimate of the shared
+    // boundary; the continuous refinement supplies the exact local zero near
+    // the rendered coast.
+    let boundaryDistanceKm = Infinity;
+    for (const neighborId of adjacency[cell.faceId]) {
+      if (cells[neighborId].isLand === cell.isLand) continue;
+      const neighborCenter = sphere.faces[neighborId].center;
+      boundaryDistanceKm = Math.min(
+        boundaryDistanceKm,
+        Math.acos(clamp(dot3(center, neighborCenter), -1, 1)) * radiusKm * 0.5,
+      );
+    }
+    if (!Number.isFinite(boundaryDistanceKm)) continue;
+    cell.coastDistanceKm = boundaryDistanceKm;
+    coastHeap.push({ faceId: cell.faceId, priority: boundaryDistanceKm });
   }
   for (let entry = coastHeap.pop(); entry; entry = coastHeap.pop()) {
     if (entry.priority > cells[entry.faceId].coastDistanceKm + 1e-9) continue;
@@ -3335,6 +3355,63 @@ function createRiverPresentationPath(
   };
 }
 
+function sphericalMix(from: Vec3, to: Vec3, amount: number): Vec3 {
+  const t = clamp(amount);
+  return normalize3([
+    from[0] * (1 - t) + to[0] * t,
+    from[1] * (1 - t) + to[1] * t,
+    from[2] * (1 - t) + to[2] * t,
+  ]);
+}
+
+function sphericalEdgeDistanceRadians(point: Vec3, from: Vec3, to: Vec3): number {
+  const edgeNormalRaw = cross3(from, to);
+  if (dot3(edgeNormalRaw, edgeNormalRaw) <= 1e-18) {
+    return Math.acos(clamp(dot3(point, from), -1, 1));
+  }
+  const edgeNormal = normalize3(edgeNormalRaw);
+  const normalComponent = dot3(point, edgeNormal);
+  const projectedRaw: Vec3 = [
+    point[0] - edgeNormal[0] * normalComponent,
+    point[1] - edgeNormal[1] * normalComponent,
+    point[2] - edgeNormal[2] * normalComponent,
+  ];
+  if (dot3(projectedRaw, projectedRaw) > 1e-18) {
+    const projected = normalize3(projectedRaw);
+    const edgeLength = Math.acos(clamp(dot3(from, to), -1, 1));
+    const firstLeg = Math.acos(clamp(dot3(from, projected), -1, 1));
+    const secondLeg = Math.acos(clamp(dot3(projected, to), -1, 1));
+    if (Math.abs(firstLeg + secondLeg - edgeLength) < 1e-6) {
+      return Math.abs(Math.asin(clamp(normalComponent, -1, 1)));
+    }
+  }
+  return Math.min(
+    Math.acos(clamp(dot3(point, from), -1, 1)),
+    Math.acos(clamp(dot3(point, to), -1, 1)),
+  );
+}
+
+/**
+ * Resolve the actual presentation coastline between a known land and water
+ * sample. The process-grid receiver graph remains canonical; only renderer
+ * geometry moves onto the same continuous boundary used by the land mask.
+ */
+function findRefinedCoastPoint(
+  landGuide: Vec3,
+  waterGuide: Vec3,
+  isLandAt: (point: Vec3) => boolean,
+): Vec3 | null {
+  if (!isLandAt(landGuide) || isLandAt(waterGuide)) return null;
+  let land = landGuide;
+  let water = waterGuide;
+  for (let iteration = 0; iteration < 36; iteration += 1) {
+    const middle = sphericalMix(land, water, 0.5);
+    if (isLandAt(middle)) land = middle;
+    else water = middle;
+  }
+  return sphericalMix(land, water, 0.5);
+}
+
 function createRiverBendWaves(
   cells: readonly MutableSurfaceCell[],
   sphere: GeodesicSphere,
@@ -3523,7 +3600,10 @@ function createMouthDistributaries(
   landform: SurfaceCoastalLandform,
   mainPath: readonly Vec3[],
   coastVertices: readonly [Vec3, Vec3] | undefined,
+  landCenter: Vec3,
+  waterCenter: Vec3,
   sedimentSupplyIndex: number,
+  isLandAt: (point: Vec3) => boolean,
 ): readonly (readonly Vec3[])[] {
   if (!coastVertices || (landform !== "delta" && landform !== "alluvial-fan")) return [];
   const branchCount = landform === "delta" && sedimentSupplyIndex > 0.72 ? 3 : 2;
@@ -3533,11 +3613,22 @@ function createMouthDistributaries(
   return Array.from({ length: branchCount }, (_, index) => {
     const normalizedIndex = index / (branchCount - 1);
     const along = 0.5 - span * 0.5 + span * normalizedIndex;
-    const endpoint = normalize3([
+    const canonicalEndpoint = normalize3([
       coastA[0] * (1 - along) + coastB[0] * along,
       coastA[1] * (1 - along) + coastB[1] * along,
       coastA[2] * (1 - along) + coastB[2] * along,
     ]);
+    // Resolve each branch independently onto the displaced shoreline. Guides
+    // retain the along-coast location while canonical face centers guarantee
+    // one point on either side of the topology-preserving boundary.
+    let endpoint: Vec3 | null = null;
+    for (const guideWeight of [0.18, 0.32, 0.5]) {
+      const landGuide = sphericalMix(canonicalEndpoint, landCenter, guideWeight);
+      const waterGuide = sphericalMix(canonicalEndpoint, waterCenter, guideWeight);
+      endpoint = findRefinedCoastPoint(landGuide, waterGuide, isLandAt);
+      if (endpoint) break;
+    }
+    endpoint ??= mainPath[mainPath.length - 1];
     const middle = normalize3([
       branchSource[0] * 0.55 + endpoint[0] * 0.45,
       branchSource[1] * 0.55 + endpoint[1] * 0.45,
@@ -3964,13 +4055,20 @@ export function createSurfaceProcessWorld(
     const coastVertices = boundaryVerticesByPair.get(`${low}:${high}`);
     const terminalWater = !receiver.isLand || (receiver.isLake && !cell.isLake);
     const fromPoint = riverPresentationPoints.get(cell.faceId) ?? sphere.faces[cell.faceId].center;
-    const toPoint = terminalWater && coastVertices
+    const canonicalBoundaryPoint = terminalWater && coastVertices
       ? normalize3([
         coastVertices[0][0] + coastVertices[1][0],
         coastVertices[0][1] + coastVertices[1][1],
         coastVertices[0][2] + coastVertices[1][2],
       ])
       : riverPresentationPoints.get(receiverFaceId) ?? sphere.faces[receiverFaceId].center;
+    const toPoint = !receiver.isLand
+      ? findRefinedCoastPoint(
+        fromPoint,
+        sphere.faces[receiverFaceId].center,
+        (point) => refinement.sample(point).isLand,
+      ) ?? canonicalBoundaryPoint
+      : canonicalBoundaryPoint;
     const channel = createRiverPresentationPath(
       fromPoint,
       toPoint,
@@ -4055,7 +4153,10 @@ export function createSurfaceProcessWorld(
       landform,
       river.path,
       boundaryVerticesByPair.get(`${low}:${high}`),
+      sphere.faces[river.fromFaceId].center,
+      sphere.faces[river.toFaceId].center,
       sedimentSupplyIndex,
+      (point) => refinement.sample(point).isLand,
     );
     const deltaPlainRadiusKm = landform === "delta"
       ? 16 + sedimentSupplyIndex * 58 + hierarchy * 30
@@ -4084,6 +4185,17 @@ export function createSurfaceProcessWorld(
   });
   const coastalLandformCounts = emptyCoastalLandformRecord();
   for (const mouth of riverMouths) coastalLandformCounts[mouth.landform] += 1;
+  let oceanMouthBoundaryMismatches = 0;
+  let maximumOceanMouthBoundaryErrorKm = 0;
+  for (const mouth of riverMouths) {
+    if (mouth.receivingWater !== "ocean") continue;
+    const signedDistance = refinement.sample(mouth.point).signedCoastDistanceRadians;
+    const errorKm = signedDistance === null
+      ? Infinity
+      : Math.abs(signedDistance) * tectonicWorld.recipe.radiusKm;
+    maximumOceanMouthBoundaryErrorKm = Math.max(maximumOceanMouthBoundaryErrorKm, errorKm);
+    if (!Number.isFinite(errorKm) || errorKm > 0.01) oceanMouthBoundaryMismatches += 1;
+  }
   const riverDiagnostics = riverPresentationDiagnostics(rivers, sphere);
 
   const totalRunoff = cells.reduce((sum, cell) => sum + cell.localRunoffKm3PerYear, 0);
@@ -4140,6 +4252,25 @@ export function createSurfaceProcessWorld(
   const centers = sphere.faces.map((face) => face.center);
   const root = buildKdTree(sphere.faces.map((face) => face.id), centers);
   if (!root) throw new Error("surface process grid must contain faces");
+  // The process-grid Dijkstra distance is appropriate for causal margin
+  // evolution but its triangular graph norm is visible in broad presentation
+  // bands. Index canonical land/water segments and use exact spherical
+  // point-to-segment distance for rendering; the refined signed distance below
+  // restores the displaced shoreline within its local band.
+  const presentationCoastEdges: Array<readonly [Vec3, Vec3]> = [];
+  const presentationCoastCenters: Vec3[] = [];
+  for (const edge of sphere.edges) {
+    if (immutableCells[edge.faces[0]].isLand === immutableCells[edge.faces[1]].isLand) continue;
+    const vertices = edge.vertices.map(
+      (vertexId) => sphere.vertices[vertexId].position,
+    ) as unknown as readonly [Vec3, Vec3];
+    presentationCoastEdges.push(vertices);
+    presentationCoastCenters.push(sphericalMix(vertices[0], vertices[1], 0.5));
+  }
+  const presentationCoastRoot = buildKdTree(
+    presentationCoastCenters.map((_, index) => index),
+    presentationCoastCenters,
+  );
   const requestedPresentationSampleCount = Math.round(clamp(
     options.presentationSampleCount ?? 12,
     6,
@@ -4165,9 +4296,9 @@ export function createSurfaceProcessWorld(
     const point = normalize3(direction);
     const refined = refinement.sample(point);
     const candidateIds = nearestFaces(root, centers, point, presentationCandidateCount);
-    const candidates = candidateIds
-      .filter((faceId) => immutableCells[faceId].isLand === refined.isLand)
-      .slice(0, presentationSampleCount);
+    const continuousTerrainCandidates = candidateIds
+      .filter((faceId) => immutableCells[faceId].isLand === refined.isLand);
+    const candidates = continuousTerrainCandidates.slice(0, presentationSampleCount);
     const fallbackId = exactFaceAtPoint(sphere, root, centers, adjacency, point);
     if (candidates.length === 0) candidates.push(fallbackId);
     let totalWeight = 0;
@@ -4249,6 +4380,49 @@ export function createSurfaceProcessWorld(
     passiveMarginStrength /= totalWeight;
     coastalPlainStrength /= totalWeight;
     coastalPlainReliefKm /= totalWeight;
+    // Relief tiers and broad coast bands are visible categorical boundaries,
+    // so they must not inherit the hard membership edge of a compact nearest-
+    // neighbor set. Re-evaluate only these fields over the wider Gaussian
+    // support whose omitted tail is effectively zero. Other process fields
+    // retain the calibrated compact neighborhood for render speed.
+    let continuousTerrainWeight = 0;
+    let continuousElevationKm = 0;
+    let continuousCoastDistanceKm = 0;
+    for (const faceId of continuousTerrainCandidates) {
+      const weight = Math.exp((dot3(centers[faceId], point) - 1) * kernelSharpness);
+      const cell = immutableCells[faceId];
+      continuousTerrainWeight += weight;
+      continuousElevationKm += cell.elevationKm * weight;
+      continuousCoastDistanceKm += (Number.isFinite(cell.coastDistanceKm)
+        ? cell.coastDistanceKm
+        : 0) * weight;
+    }
+    if (continuousTerrainWeight > 0) {
+      elevationKm = continuousElevationKm / continuousTerrainWeight;
+      coastDistanceKm = continuousCoastDistanceKm / continuousTerrainWeight;
+    }
+    if (presentationCoastRoot) {
+      const nearbyCoastEdges = nearestFaces(
+        presentationCoastRoot,
+        presentationCoastCenters,
+        point,
+        Math.min(16, presentationCoastEdges.length),
+      );
+      coastDistanceKm = nearbyCoastEdges.reduce((minimum, coastEdgeId) => Math.min(
+        minimum,
+        sphericalEdgeDistanceRadians(
+          point,
+          presentationCoastEdges[coastEdgeId][0],
+          presentationCoastEdges[coastEdgeId][1],
+        ) * tectonicWorld.recipe.radiusKm,
+      ), Infinity);
+    }
+    if (refined.signedCoastDistanceRadians !== null) {
+      coastDistanceKm = Math.min(
+        coastDistanceKm,
+        Math.abs(refined.signedCoastDistanceRadians) * tectonicWorld.recipe.radiusKm,
+      );
+    }
     if (refined.isLand) {
       let lakePotential = 0;
       let basinWeight = 0;
@@ -4277,7 +4451,7 @@ export function createSurfaceProcessWorld(
       }
     }
     const gradient: [number, number, number] = [0, 0, 0];
-    for (const faceId of candidates) {
+    for (const faceId of continuousTerrainCandidates) {
       const center = centers[faceId];
       const cosine = clamp(dot3(center, point), -1, 1);
       const distanceRadians = Math.acos(cosine);
@@ -4296,9 +4470,10 @@ export function createSurfaceProcessWorld(
       gradient[1] += tangent[1] * riseOverRun * weight;
       gradient[2] += tangent[2] * riseOverRun * weight;
     }
-    gradient[0] /= totalWeight;
-    gradient[1] /= totalWeight;
-    gradient[2] /= totalWeight;
+    const gradientWeight = Math.max(continuousTerrainWeight, Number.EPSILON);
+    gradient[0] /= gradientWeight;
+    gradient[1] /= gradientWeight;
+    gradient[2] /= gradientWeight;
     let valleyIncisionKm = 0;
     let valleyGradient: Vec3 = [0, 0, 0];
     if (refined.isLand && valleyReliefScale > 0) {
@@ -4480,6 +4655,8 @@ export function createSurfaceProcessWorld(
       ...riverDiagnostics,
       riverMouthCount: riverMouths.length,
       oceanRiverMouthCount: riverMouths.filter((mouth) => mouth.receivingWater === "ocean").length,
+      oceanMouthBoundaryMismatches,
+      maximumOceanMouthBoundaryErrorKm,
       lakeInflowCount: riverMouths.filter((mouth) => mouth.receivingWater === "lake").length,
       coastalLandformCounts,
       maximumDrainageAreaKm2: cells.reduce((maximum, cell) => Math.max(maximum, cell.drainageAreaKm2), 0),

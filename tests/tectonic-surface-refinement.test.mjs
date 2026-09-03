@@ -59,6 +59,36 @@ test("non-coastal canonical faces are never reclassified", () => {
   }
 });
 
+test("signed coast distance uses the displaced boundary and matches land polarity", () => {
+  const refinement = createSurfaceRefinement(world, {
+    coastAmplitude: 0.21,
+    coastOctaves: 5,
+  });
+  const cells = new Map(world.cells.map((cell) => [cell.faceId, cell]));
+  let checked = 0;
+  for (const edge of world.sphere.edges) {
+    if (cells.get(edge.faces[0]).isLand === cells.get(edge.faces[1]).isLand) continue;
+    const landFaceId = cells.get(edge.faces[0]).isLand ? edge.faces[0] : edge.faces[1];
+    const waterFaceId = landFaceId === edge.faces[0] ? edge.faces[1] : edge.faces[0];
+    const land = world.sphere.faces[landFaceId].center;
+    const water = world.sphere.faces[waterFaceId].center;
+    for (let step = 1; step < 20; step += 1) {
+      const t = step / 20;
+      const point = normalize3([
+        land[0] * (1 - t) + water[0] * t,
+        land[1] * (1 - t) + water[1] * t,
+        land[2] * (1 - t) + water[2] * t,
+      ]);
+      const sample = refinement.sample(point);
+      if (sample.signedCoastDistanceRadians === null) continue;
+      assert.equal(sample.signedCoastDistanceRadians >= 0, sample.isLand);
+      checked += 1;
+    }
+    if (checked > 30) break;
+  }
+  assert.ok(checked > 0);
+});
+
 test("additional coast bands add bounded deterministic detail without moving anchors", () => {
   const cells = new Map(world.cells.map((cell) => [cell.faceId, cell]));
   const coast = world.sphere.edges.find((edge) => cells.get(edge.faces[0]).isLand !== cells.get(edge.faces[1]).isLand);
@@ -121,4 +151,27 @@ test("coastal geomorphology changes edge spectra without changing topology ancho
   assert.ok(difference > 1e-7);
   assert.equal(geomorphic.audit().canonicalAnchorMismatches, 0);
   assert.ok(geomorphic.audit().maximumOffsetRatio <= 0.2400001);
+});
+
+test("coastal attributes taper before leaving the local refinement band", () => {
+  const refinement = createSurfaceRefinement(world, { coastalBand: 0.4 });
+  const cells = new Map(world.cells.map((cell) => [cell.faceId, cell]));
+  const coast = world.sphere.edges.find((edge) => cells.get(edge.faces[0]).isLand !== cells.get(edge.faces[1]).isLand);
+  assert.ok(coast);
+  const landFaceId = cells.get(coast.faces[0]).isLand ? coast.faces[0] : coast.faces[1];
+  const [a, b] = coast.vertices.map((vertexId) => world.sphere.vertices[vertexId].position);
+  const midpoint = normalize3([
+    a[0] + b[0],
+    a[1] + b[1],
+    a[2] + b[2],
+  ]);
+  const landCenter = world.sphere.faces[landFaceId].center;
+  const atCoast = refinement.sample(midpoint);
+  const inland = refinement.sample(normalize3([
+    midpoint[0] * 0.6 + landCenter[0] * 0.4,
+    midpoint[1] * 0.6 + landCenter[1] * 0.4,
+    midpoint[2] * 0.6 + landCenter[2] * 0.4,
+  ]));
+  assert.ok(atCoast.coastalRuggedness >= inland.coastalRuggedness);
+  assert.ok(atCoast.coastalSedimentAffinity >= inland.coastalSedimentAffinity);
 });

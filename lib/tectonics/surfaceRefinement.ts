@@ -27,6 +27,12 @@ export interface RefinedSurfaceSample {
   readonly isLand: boolean;
   readonly elevationKm: number;
   readonly waterDepthKm: number;
+  /**
+   * Approximate signed distance to the displaced presentation coastline.
+   * Positive values are landward, negative values are seaward, and zero is
+   * the same continuous boundary used by `isLand`. Null means the sample is
+   * outside the local refinement band.
+   */
   readonly signedCoastDistanceRadians: number | null;
   readonly coastOffsetRadians: number;
   /** Relief-conditioned rocky-coast support on the nearest canonical coast edge. */
@@ -346,6 +352,7 @@ export function createSurfaceRefinement(
     let nearestEdge: CoastEdge | null = null;
     let nearestDistance = Infinity;
     let nearestAlong = 0;
+    let coastalAttributeSupport = 0;
     for (const edge of coastByFace[faceId]) {
       const closest = closestOnEdge(point, edge);
       if (closest.distance < nearestDistance) {
@@ -355,6 +362,8 @@ export function createSurfaceRefinement(
       }
     }
     if (nearestEdge && nearestDistance <= nearestEdge.length * bandRatio) {
+      const supportProgress = clamp(1 - nearestDistance / (nearestEdge.length * bandRatio));
+      coastalAttributeSupport = supportProgress ** 2 * (3 - 2 * supportProgress);
       offset = edgeOffset(nearestEdge, nearestAlong, amplitude, coastalGeomorphologyScale);
       signedDistance = canonical.isLand ? nearestDistance : -nearestDistance;
       refinedLand = signedDistance + offset >= 0;
@@ -376,12 +385,12 @@ export function createSurfaceRefinement(
       isLand: refinedLand,
       elevationKm,
       waterDepthKm: refinedLand ? 0 : Math.max(0.001, model.seaLevelKm - elevationKm),
-      signedCoastDistanceRadians: signedDistance,
+      signedCoastDistanceRadians: signedDistance === null ? null : signedDistance + offset,
       coastOffsetRadians: offset,
-      coastalRuggedness: nearestEdge?.ruggedness ?? 0,
-      coastalSedimentAffinity: nearestEdge?.sedimentAffinity ?? 0,
-      activeMarginStrength: nearestEdge?.activeMarginStrength ?? 0,
-      passiveMarginStrength: nearestEdge?.passiveMarginStrength ?? 0,
+      coastalRuggedness: (nearestEdge?.ruggedness ?? 0) * coastalAttributeSupport,
+      coastalSedimentAffinity: (nearestEdge?.sedimentAffinity ?? 0) * coastalAttributeSupport,
+      activeMarginStrength: (nearestEdge?.activeMarginStrength ?? 0) * coastalAttributeSupport,
+      passiveMarginStrength: (nearestEdge?.passiveMarginStrength ?? 0) * coastalAttributeSupport,
       presentationOnly: true,
     };
   };
